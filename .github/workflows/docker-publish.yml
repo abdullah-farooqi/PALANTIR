@@ -33,6 +33,9 @@ jobs:
     permissions:
       contents: read
       packages: write
+    env:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
 
     steps:
       - name: Checkout Code
@@ -43,7 +46,7 @@ jobs:
 
       # ── Authenticate Registries ──────────────────────────────────
       - name: Log in to GitHub Container Registry (GHCR)
-        if: ${{ github.event_name != 'workflow_dispatch' || inputs.push_ghcr }}
+        if: github.event_name != 'workflow_dispatch' || inputs.push_ghcr
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -51,11 +54,11 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Log in to Docker Hub
-        if: ${{ (github.event_name != 'workflow_dispatch' || inputs.push_dockerhub) && secrets.DOCKERHUB_USERNAME != '' }}
+        if: (github.event_name != 'workflow_dispatch' || inputs.push_dockerhub) && env.DOCKERHUB_USERNAME != ''
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ env.DOCKERHUB_TOKEN }}
 
       # ── Determine Tags ───────────────────────────────────────────
       - name: Set Image Tag
@@ -80,8 +83,8 @@ jobs:
           tags: |
             ${{ (github.event_name != 'workflow_dispatch' || inputs.push_ghcr) && format('ghcr.io/{0}/palantir-backend:{1}', github.repository_owner, steps.vars.outputs.tag) || '' }}
             ${{ (github.event_name != 'workflow_dispatch' || inputs.push_ghcr) && format('ghcr.io/{0}/palantir-backend:latest', github.repository_owner) || '' }}
-            ${{ (secrets.DOCKERHUB_USERNAME != '' && (github.event_name != 'workflow_dispatch' || inputs.push_dockerhub)) && format('{0}/palantir-backend:{1}', secrets.DOCKERHUB_USERNAME, steps.vars.outputs.tag) || '' }}
-            ${{ (secrets.DOCKERHUB_USERNAME != '' && (github.event_name != 'workflow_dispatch' || inputs.push_dockerhub)) && format('{0}/palantir-backend:latest', secrets.DOCKERHUB_USERNAME) || '' }}
+            ${{ (env.DOCKERHUB_USERNAME != '' && (github.event_name != 'workflow_dispatch' || inputs.push_dockerhub)) && format('{0}/palantir-backend:{1}', env.DOCKERHUB_USERNAME, steps.vars.outputs.tag) || '' }}
+            ${{ (env.DOCKERHUB_USERNAME != '' && (github.event_name != 'workflow_dispatch' || inputs.push_dockerhub)) && format('{0}/palantir-backend:latest', env.DOCKERHUB_USERNAME) || '' }}
 
       # ── Build & Push Netdata Sensor Image ────────────────────────
       - name: Build and Push palantir-netdata
@@ -93,5 +96,5 @@ jobs:
           tags: |
             ${{ (github.event_name != 'workflow_dispatch' || inputs.push_ghcr) && format('ghcr.io/{0}/palantir-netdata:{1}', github.repository_owner, steps.vars.outputs.tag) || '' }}
             ${{ (github.event_name != 'workflow_dispatch' || inputs.push_ghcr) && format('ghcr.io/{0}/palantir-netdata:latest', github.repository_owner) || '' }}
-            ${{ (secrets.DOCKERHUB_USERNAME != '' && (github.event_name != 'workflow_dispatch' || inputs.push_dockerhub)) && format('{0}/palantir-netdata:{1}', secrets.DOCKERHUB_USERNAME, steps.vars.outputs.tag) || '' }}
-            ${{ (secrets.DOCKERHUB_USERNAME != '' && (github.event_name != 'workflow_dispatch' || inputs.push_dockerhub)) && format('{0}/palantir-netdata:latest', secrets.DOCKERHUB_USERNAME) || '' }}
+            ${{ (env.DOCKERHUB_USERNAME != '' && (github.event_name != 'workflow_dispatch' || inputs.push_dockerhub)) && format('{0}/palantir-netdata:{1}', env.DOCKERHUB_USERNAME, steps.vars.outputs.tag) || '' }}
+            ${{ (env.DOCKERHUB_USERNAME != '' && (github.event_name != 'workflow_dispatch' || inputs.push_dockerhub)) && format('{0}/palantir-netdata:latest', env.DOCKERHUB_USERNAME) || '' }}
