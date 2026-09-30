@@ -1,0 +1,95 @@
+name: PALANTIR CI/CD Pipeline
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit-tests:
+    name: Unit Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt
+
+      - name: Run Pytest Test Suite
+        working-directory: backend
+        run: |
+          pytest -v
+
+  docker-smoke-test:
+    name: Docker Stack Build & Smoke Test
+    runs-on: ubuntu-latest
+    needs: unit-tests
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Prepare Environment File
+        run: cp .env.example .env
+
+      - name: Build Docker Stack
+        run: docker compose build
+
+      - name: Start Docker Stack in Background
+        run: docker compose up -d
+
+      - name: Verify PostgreSQL Initialization
+        run: |
+          echo "Waiting for postgres to become healthy..."
+          timeout 60s bash -c 'until docker compose exec -T postgres pg_isready -U palantir -d palantir; do sleep 2; done'
+          docker compose exec -T postgres psql -U palantir -d palantir -c "\dt"
+
+      - name: Verify Backend /healthz Endpoint
+        run: |
+          echo "Testing live backend endpoint..."
+          timeout 60s bash -c 'until curl -sf http://localhost:8000/healthz; do sleep 2; done'
+          echo ""
+
+      - name: Verify Webhook Authentication
+        run: |
+          # Test invalid secret rejection (HTTP 403)
+          STATUS_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://localhost:8000/internal/alert \
+            -H "Content-Type: application/json" \
+            -H "X-PALANTIR-Secret: invalid-key" \
+            -d '{"node":"test","alert":"test","status":"CRITICAL"}')
+          if [ "$STATUS_CODE" -ne 403 ]; then
+            echo "Expected HTTP 403 but got $STATUS_CODE"
+            exit 1
+          fi
+          echo "Webhook authentication rejection verified (HTTP 403)."
+
+      - name: Container Logs on Failure
+        if: failure()
+        run: |
+          docker compose logs
+
+      - name: Clean Up Containers
+        if: always()
+        run: docker compose down -v
