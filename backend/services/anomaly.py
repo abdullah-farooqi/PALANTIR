@@ -42,8 +42,10 @@ class AnomalyService:
             )
             .limit(1)
         )
-        result = session.execute(stmt).scalar_one_or_none()
-        return result is not None
+        res = session.execute(stmt)
+        if hasattr(res, "__await__"):
+            res = await res
+        return res.scalar_one_or_none() is not None
 
     async def evaluate_and_trigger(self, node_id: int, session):
         try:
@@ -73,25 +75,39 @@ class AnomalyService:
             logger.info(f"Node {node_id} anomaly detected but in cooldown. Skipping trigger.")
             return
 
-        event = AnomalyEvent(
-            node_id=node_id,
-            contexts=list(anomalous.keys()),
-            scores=anomalous,
-            max_score=max(anomalous.values()),
-            triggered_agent=False,
-        )
-        session.add(event)
-        session.flush()  # populate event.id
+        try:
+            event = AnomalyEvent(
+                node_id=node_id,
+                contexts=list(anomalous.keys()),
+                scores=anomalous,
+                max_score=max(anomalous.values()),
+                triggered_agent=False,
+            )
+            session.add(event)
+            if hasattr(session, "flush"):
+                res = session.flush()
+                if hasattr(res, "__await__"):
+                    await res
 
-        # ── Extension point: wire your LangGraph agent here ──────────
-        # from workers.agent_tasks import run_investigation
-        # run_investigation.delay(
-        #     node_id=node_id,
-        #     trigger_type="anomaly",
-        #     trigger_id=event.id,
-        #     context_scores=anomalous,
-        # )
-        # ─────────────────────────────────────────────────────────────
+            # ── Extension point: wire your LangGraph agent here ──────────
+            # from workers.agent_tasks import run_investigation
+            # run_investigation.delay(
+            #     node_id=node_id,
+            #     trigger_type="anomaly",
+            #     trigger_id=event.id,
+            #     context_scores=anomalous,
+            # )
+            # ─────────────────────────────────────────────────────────────
 
-        event.triggered_agent = True
-        session.commit()
+            event.triggered_agent = True
+            if hasattr(session, "commit"):
+                res = session.commit()
+                if hasattr(res, "__await__"):
+                    await res
+        except Exception as exc:
+            if hasattr(session, "rollback"):
+                res = session.rollback()
+                if hasattr(res, "__await__"):
+                    await res
+            logger.error(f"Failed to persist anomaly event for node {node_id}: {exc}")
+            raise

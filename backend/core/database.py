@@ -10,6 +10,9 @@ async_engine = create_async_engine(
     settings.DATABASE_URL,
     echo=False,
     future=True,
+    pool_size=20,
+    max_overflow=10,
+    pool_recycle=1800,
     pool_pre_ping=True,
 )
 
@@ -25,6 +28,9 @@ async def get_session() -> AsyncGenerator[AsyncSession, None]:
     async with AsyncSessionLocal() as session:
         try:
             yield session
+        except Exception:
+            await session.rollback()
+            raise
         finally:
             await session.close()
 
@@ -33,6 +39,9 @@ async def get_session() -> AsyncGenerator[AsyncSession, None]:
 sync_engine = create_engine(
     settings.SYNC_DATABASE_URL,
     echo=False,
+    pool_size=10,
+    max_overflow=10,
+    pool_recycle=1800,
     pool_pre_ping=True,
 )
 
@@ -47,5 +56,8 @@ def get_sync_session():
     session = SyncSessionLocal()
     try:
         yield session
+    except Exception:
+        session.rollback()
+        raise
     finally:
         session.close()

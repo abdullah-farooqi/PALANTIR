@@ -104,4 +104,16 @@ class MetricsService:
                 logger.error(
                     f"Unexpected error collecting {category} for node {node_id}: {e}"
                 )
-        session.commit()
+        try:
+            if hasattr(session, "commit"):
+                res = session.commit()
+                if hasattr(res, "__await__"):
+                    await res
+        except Exception as e:
+            if hasattr(session, "rollback"):
+                res = session.rollback()
+                if hasattr(res, "__await__"):
+                    await res
+            logger.error(f"Failed to commit snapshots for node {node_id}: {e}")
+            raise
+

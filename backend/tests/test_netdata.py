@@ -41,6 +41,17 @@ def test_extract_value_scalars():
     assert extract_value("invalid") is None
 
 
+def test_extract_value_nan_inf_resilience():
+    """Verify NaN and Inf values are safely converted to None."""
+    assert extract_value([float("nan"), 0, 0]) is None
+    assert extract_value([float("inf"), 0, 0]) is None
+    assert extract_value([float("-inf"), 0, 0]) is None
+    assert extract_value(float("nan")) is None
+    assert extract_value(float("inf")) is None
+    assert extract_value("nan") is None
+    assert extract_value("Infinity") is None
+
+
 def test_parse_rows():
     """Verify conversion of json2 response into flat row dicts."""
     raw_payload = {
@@ -65,6 +76,26 @@ def test_parse_rows():
     assert parsed[1]["eth0_received"] == 1289.3
 
 
+def test_parse_rows_jagged_or_missing_dimensions():
+    """Verify parse_rows handles jagged rows without crashing."""
+    raw_payload = {
+        "result": {
+            "labels": ["time", "eth0_received", "eth0_sent"],
+            "data": [
+                [1727000000, [100.0, 0, 0]],  # missing eth0_sent column
+                [1727000001],                  # missing all data columns
+            ],
+        }
+    }
+    response = NetdataDataResponse(**raw_payload)
+    parsed = parse_rows(response)
+    assert len(parsed) == 2
+    assert parsed[0]["eth0_received"] == 100.0
+    assert parsed[0]["eth0_sent"] is None
+    assert parsed[1]["eth0_received"] is None
+    assert parsed[1]["eth0_sent"] is None
+
+
 def test_parse_anomaly_rates():
     """Verify anomaly rate parser handles both active and warmup states."""
     active_payload = {
@@ -80,9 +111,34 @@ def test_parse_anomaly_rates():
     assert rates["system.cpu"] == 0.15
     assert rates["system.ram"] == 0.09
 
-    # Warmup scenario (empty result or no anomaly_rate field)
+    # Warmup scenario (empty dict or empty list result)
     warmup_response = NetdataWeightsResponse(result={})
     assert parse_anomaly_rates(warmup_response) == {}
+
+    warmup_list_response = NetdataWeightsResponse(result=[])
+    assert parse_anomaly_rates(warmup_list_response) == {}
+
+
+def test_parse_anomaly_rates_clamping_and_corruption():
+    """Verify anomaly rates clamp to [0, 1] and reject NaN, Inf, and malformed items."""
+    corrupt_payload = {
+        "result": {
+            "ctx.over": {"anomaly_rate": 1.5},       # Should clamp to 1.0
+            "ctx.under": {"anomaly_rate": -0.2},     # Should clamp to 0.0
+            "ctx.nan": {"anomaly_rate": float("nan")},  # Should omit
+            "ctx.inf": {"anomaly_rate": float("inf")},  # Should omit
+            "ctx.bad": {"anomaly_rate": "invalid"},  # Should omit
+            "ctx.empty": {},                         # Should omit
+        }
+    }
+    response = NetdataWeightsResponse(**corrupt_payload)
+    rates = parse_anomaly_rates(response)
+    assert rates["ctx.over"] == 1.0
+    assert rates["ctx.under"] == 0.0
+    assert "ctx.nan" not in rates
+    assert "ctx.inf" not in rates
+    assert "ctx.bad" not in rates
+    assert "ctx.empty" not in rates
 
 
 # =====================================================================

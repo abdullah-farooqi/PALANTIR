@@ -1,20 +1,48 @@
-from typing import List, Dict, Any
-from fastapi import APIRouter, Depends, Query
+from typing import List, Dict, Any, Optional
+from fastapi import APIRouter, Depends, HTTPException, Path, Query
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from core.database import get_session
 from models.alert import AlertEvent
 from models.anomaly import AnomalyEvent
+from services.nodes import NodeService
 
 router = APIRouter(prefix="/nodes/{node_id}", tags=["Alerts & Anomalies"])
 
 
-@router.get("/alerts")
+class AlertResponse(BaseModel):
+    id: int
+    received_at: str
+    alert_name: str
+    chart: str
+    status: str
+    value: Optional[float] = None
+    units: Optional[str] = None
+    triggered_agent: bool
+    investigation_id: Optional[int] = None
+
+
+class AnomalyResponse(BaseModel):
+    id: int
+    detected_at: str
+    contexts: List[str]
+    scores: Dict[str, float]
+    max_score: float
+    triggered_agent: bool
+    investigation_id: Optional[int] = None
+
+
+@router.get("/alerts", response_model=List[AlertResponse])
 async def get_alerts_history(
-    node_id: int,
-    limit: int = Query(default=50, ge=1, le=500),
+    node_id: int = Path(..., ge=1, description="Monitored node ID"),
+    limit: int = Query(default=50, ge=1, le=500, description="Max alerts to retrieve"),
     session: AsyncSession = Depends(get_session),
 ) -> List[Dict[str, Any]]:
+    node = await NodeService.get_node(node_id, session)
+    if not node:
+        raise HTTPException(status_code=404, detail="Node not found")
+
     stmt = (
         select(AlertEvent)
         .where(AlertEvent.node_id == node_id)
@@ -38,12 +66,16 @@ async def get_alerts_history(
     ]
 
 
-@router.get("/alerts/active")
+@router.get("/alerts/active", response_model=List[AlertResponse])
 async def get_active_alerts(
-    node_id: int,
+    node_id: int = Path(..., ge=1, description="Monitored node ID"),
     session: AsyncSession = Depends(get_session),
 ) -> List[Dict[str, Any]]:
     """Returns only WARNING and CRITICAL alerts."""
+    node = await NodeService.get_node(node_id, session)
+    if not node:
+        raise HTTPException(status_code=404, detail="Node not found")
+
     stmt = (
         select(AlertEvent)
         .where(
@@ -69,12 +101,16 @@ async def get_active_alerts(
     ]
 
 
-@router.get("/anomalies")
+@router.get("/anomalies", response_model=List[AnomalyResponse])
 async def get_anomalies_history(
-    node_id: int,
-    limit: int = Query(default=50, ge=1, le=500),
+    node_id: int = Path(..., ge=1, description="Monitored node ID"),
+    limit: int = Query(default=50, ge=1, le=500, description="Max anomalies to retrieve"),
     session: AsyncSession = Depends(get_session),
 ) -> List[Dict[str, Any]]:
+    node = await NodeService.get_node(node_id, session)
+    if not node:
+        raise HTTPException(status_code=404, detail="Node not found")
+
     stmt = (
         select(AnomalyEvent)
         .where(AnomalyEvent.node_id == node_id)

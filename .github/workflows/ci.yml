@@ -2,9 +2,9 @@ name: PALANTIR CI/CD Pipeline
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "main", "initial_project" ]
   pull_request:
-    branches: [ "main" ]
+    branches: [ "main", "initial_project" ]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -17,6 +17,31 @@ jobs:
     strategy:
       matrix:
         python-version: ["3.11", "3.12"]
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: palantir
+          POSTGRES_PASSWORD: palantir
+          POSTGRES_DB: palantir
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
 
     steps:
       - name: Checkout code
@@ -33,6 +58,11 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r backend/requirements.txt
+
+      - name: Initialize Database Schema
+        run: |
+          sudo apt-get update && sudo apt-get install -y postgresql-client
+          PGPASSWORD=palantir psql -h localhost -U palantir -d palantir -f sql/init.sql
 
       - name: Run Pytest Test Suite
         working-directory: backend
@@ -84,6 +114,10 @@ jobs:
             exit 1
           fi
           echo "Webhook authentication rejection verified (HTTP 403)."
+
+      - name: Run Full Pytest Suite in Live Stack
+        run: |
+          docker compose exec -T backend pytest tests/ -v
 
       - name: Container Logs on Failure
         if: failure()

@@ -1,23 +1,44 @@
 from typing import List, Dict, Any, Optional
-from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, status
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from core.database import get_session
 from models.investigation import AgentInvestigation
+from services.nodes import NodeService
 
 router = APIRouter(prefix="/investigations", tags=["Investigations"])
 
 
 class InvestigationCreateRequest(BaseModel):
+    node_id: int = Field(..., ge=1, description="Monitored node ID")
+    trigger_type: str = Field(default="manual", pattern=r"^(manual|alert|anomaly)$")
+    trigger_id: Optional[int] = Field(default=None, ge=1)
+
+    model_config = {"extra": "forbid"}
+
+
+class InvestigationResponse(BaseModel):
+    id: int
     node_id: int
-    trigger_type: str = "manual"
+    started_at: str
+    completed_at: Optional[str] = None
+    trigger_type: str
     trigger_id: Optional[int] = None
+    status: str
+    summary: Optional[str] = None
+    raw_output: Optional[Any] = None
 
 
-@router.get("")
+class InvestigationCreatedResponse(BaseModel):
+    id: int
+    status: str
+    message: str
+
+
+@router.get("", response_model=List[InvestigationResponse])
 async def list_investigations(
-    limit: int = 50,
+    limit: int = Query(default=50, ge=1, le=500, description="Max investigations to retrieve"),
     session: AsyncSession = Depends(get_session),
 ) -> List[Dict[str, Any]]:
     stmt = (
@@ -42,15 +63,15 @@ async def list_investigations(
     ]
 
 
-@router.get("/{investigation_id}")
+@router.get("/{investigation_id}", response_model=InvestigationResponse)
 async def get_investigation(
-    investigation_id: int,
+    investigation_id: int = Path(..., ge=1, description="Investigation ID"),
     session: AsyncSession = Depends(get_session),
 ) -> Dict[str, Any]:
     stmt = select(AgentInvestigation).where(AgentInvestigation.id == investigation_id)
     inv = (await session.execute(stmt)).scalar_one_or_none()
     if not inv:
-        raise HTTPException(status_code=404, detail="Investigation not found")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Investigation not found")
 
     return {
         "id": inv.id,
@@ -65,11 +86,18 @@ async def get_investigation(
     }
 
 
-@router.post("", status_code=status.HTTP_201_CREATED)
+@router.post("", response_model=InvestigationCreatedResponse, status_code=status.HTTP_201_CREATED)
 async def trigger_investigation(
     req: InvestigationCreateRequest,
     session: AsyncSession = Depends(get_session),
 ) -> Dict[str, Any]:
+    node = await NodeService.get_node(req.node_id, session)
+    if not node:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Node {req.node_id} not found",
+        )
+
     inv = AgentInvestigation(
         node_id=req.node_id,
         trigger_type=req.trigger_type,
