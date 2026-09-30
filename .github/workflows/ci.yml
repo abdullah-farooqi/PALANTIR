@@ -85,6 +85,10 @@ jobs:
           fi
           echo "Webhook authentication rejection verified (HTTP 403)."
 
+      - name: Run Full Pytest Suite in Live Stack
+        run: |
+          docker compose exec -T backend pytest tests/ -v
+
       - name: Container Logs on Failure
         if: failure()
         run: |

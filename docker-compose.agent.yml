@@ -1,0 +1,79 @@
+# ─────────────────────────────────────────────────────────────────────
+# PALANTIR — Remote Endpoint / Child Agent Deployment
+# Run this file on any remote VM, server, or cloud instance to stream
+# telemetry and push alerts to the central PALANTIR server.
+#
+# Usage:
+#   PALANTIR_SERVER_URL=http://<PARENT_IP>:8000 \
+#   NODE_ADVERTISED_URL=http://<CHILD_IP>:19999 \
+#   docker compose -f docker-compose.agent.yml up -d
+# ─────────────────────────────────────────────────────────────────────
+
+services:
+  sensor:
+    image: ${PALANTIR_NETDATA_IMAGE:-palantir-netdata:latest}
+    container_name: palantir-agent-sensor
+    hostname: ${NODE_HOSTNAME:-remote-node}
+    restart: unless-stopped
+    pid: host
+    ports:
+      - "${NETDATA_PORT:-19999}:19999"
+    cap_add:
+      - SYS_PTRACE
+      - SYS_ADMIN
+    security_opt:
+      - apparmor:unconfined
+    volumes:
+      - netdata_agent_lib:/usr/local/var/lib/netdata
+      - netdata_agent_cache:/usr/local/var/cache/netdata
+    environment:
+      - PALANTIR_WEBHOOK_URL=${PALANTIR_SERVER_URL:-http://localhost:8000}/internal/alert
+      - PALANTIR_WEBHOOK_SECRET=${PALANTIR_WEBHOOK_SECRET:-palantir-super-secret-key-change-me}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:19999/api/v1/info || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 6
+
+  # One-shot auto-registration sidecar
+  enroller:
+    image: curlimages/curl:latest
+    container_name: palantir-agent-enroller
+    restart: "no"
+    depends_on:
+      sensor:
+        condition: service_healthy
+    environment:
+      - PALANTIR_SERVER_URL=${PALANTIR_SERVER_URL:-http://localhost:8000}
+      - NODE_HOSTNAME=${NODE_HOSTNAME:-remote-node}
+      - NODE_ADVERTISED_URL=${NODE_ADVERTISED_URL:-http://localhost:19999}
+      - OS_TYPE=${OS_TYPE:-linux}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "[ENROLLER] Probing Netdata sensor readiness..."
+        until curl -sf "http://sensor:19999/api/v1/info" >/dev/null 2>&1; do
+          sleep 2
+        done
+        echo "[ENROLLER] Netdata sensor is ready."
+        echo "[ENROLLER] Registering node '$$NODE_HOSTNAME' ($$NODE_ADVERTISED_URL) with PALANTIR at $$PALANTIR_SERVER_URL..."
+        
+        HTTP_RESPONSE=$$(curl -s -w "\nHTTP_STATUS:%{http_code}" -X POST "$$PALANTIR_SERVER_URL/api/v1/nodes" \
+          -H "Content-Type: application/json" \
+          -d "{\"hostname\":\"$$NODE_HOSTNAME\",\"netdata_url\":\"$$NODE_ADVERTISED_URL\",\"os_type\":\"$$OS_TYPE\"}")
+        
+        STATUS_CODE=$$(echo "$$HTTP_RESPONSE" | grep "HTTP_STATUS" | cut -d':' -f2)
+        BODY=$$(echo "$$HTTP_RESPONSE" | sed '/HTTP_STATUS/d')
+
+        if [ "$$STATUS_CODE" -eq 201 ]; then
+          echo "[ENROLLER] ✓ Successfully registered with PALANTIR parent server: $$BODY"
+          exit 0
+        else
+          echo "[ENROLLER] Registration failed with status $$STATUS_CODE: $$BODY"
+          echo "[ENROLLER] Will re-try when parent server becomes available or can be enrolled manually."
+          exit 1
+        fi
+
+volumes:
+  netdata_agent_lib:
+  netdata_agent_cache:

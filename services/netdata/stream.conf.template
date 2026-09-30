@@ -1,0 +1,32 @@
+# ─────────────────────────────────────────────────────────────────────
+# Netdata Parent-Child Streaming Configuration Template
+# ─────────────────────────────────────────────────────────────────────
+# Netdata natively supports real-time metrics streaming over port 19999.
+# This is useful when child VMs are behind strict NAT or firewalls where
+# the central PALANTIR parent cannot initiate inbound connections.
+#
+# Generate a random UUID for the API key:
+#   uuidgen   (e.g., 11111111-2222-3333-4444-555555555555)
+# ─────────────────────────────────────────────────────────────────────
+
+# ── PARENT CONFIGURATION (PALANTIR Server) ───────────────────────────
+# Place in: /usr/local/etc/netdata/stream.conf on the parent Netdata container
+#
+# [11111111-2222-3333-4444-555555555555]
+#     enabled = yes
+#     default history = 3600
+#     default memory mode = dbengine
+#     health enabled by default = auto
+#     allow from = *
+
+# ── CHILD CONFIGURATION (Remote VM / Endpoint) ──────────────────────
+# Place in: /usr/local/etc/netdata/stream.conf on the child Netdata container
+#
+# [stream]
+#     enabled = yes
+#     destination = <PALANTIR_PARENT_IP>:19999
+#     api key = 11111111-2222-3333-4444-555555555555
+#     timeout seconds = 60
+#     default port = 19999
+#     buffer size bytes = 1048576
+#     reconnect delay seconds = 5

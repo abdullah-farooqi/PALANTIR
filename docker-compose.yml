@@ -32,18 +32,50 @@ services:
       timeout: 5s
       retries: 5
 
+  netdata:
+    build:
+      context: ./services/netdata
+      dockerfile: Dockerfile
+    image: palantir-netdata:latest
+    container_name: palantir-netdata
+    hostname: local-node
+    restart: unless-stopped
+    pid: host
+    ports:
+      - "19999:19999"
+    cap_add:
+      - SYS_PTRACE
+      - SYS_ADMIN
+    security_opt:
+      - apparmor:unconfined
+    volumes:
+      - ./services/netdata/health_alarm_notify.conf:/usr/local/etc/netdata/health_alarm_notify.conf:ro
+      - ./services/netdata/health.d/palantir.conf:/usr/local/etc/netdata/health.d/palantir.conf:ro
+      - netdata_lib:/usr/local/var/lib/netdata
+      - netdata_cache:/usr/local/var/cache/netdata
+    environment:
+      - PALANTIR_WEBHOOK_URL=http://backend:8000/internal/alert
+      - PALANTIR_WEBHOOK_SECRET=${PALANTIR_WEBHOOK_SECRET:-palantir-super-secret-key-change-me}
+
   backend:
     build:
       context: ./backend
       dockerfile: Dockerfile
       network: host
+    image: ${PALANTIR_BACKEND_IMAGE:-palantir-backend:latest}
     container_name: palantir-backend
     restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+      netdata:
+        condition: service_started
+    volumes:
+      - ./backend:/app
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-palantir}:${POSTGRES_PASSWORD:-palantir}@postgres:5432/${POSTGRES_DB:-palantir}
       SYNC_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-palantir}:${POSTGRES_PASSWORD:-palantir}@postgres:5432/${POSTGRES_DB:-palantir}
@@ -57,8 +89,11 @@ services:
       context: ./backend
       dockerfile: Dockerfile
       network: host
+    image: ${PALANTIR_BACKEND_IMAGE:-palantir-backend:latest}
     container_name: palantir-celery-worker
     restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     command: celery -A workers.celery_app.celery_app worker --loglevel=info
     depends_on:
       backend:
@@ -67,6 +102,10 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      netdata:
+        condition: service_started
+    volumes:
+      - ./backend:/app
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-palantir}:${POSTGRES_PASSWORD:-palantir}@postgres:5432/${POSTGRES_DB:-palantir}
       SYNC_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-palantir}:${POSTGRES_PASSWORD:-palantir}@postgres:5432/${POSTGRES_DB:-palantir}
@@ -78,14 +117,21 @@ services:
       context: ./backend
       dockerfile: Dockerfile
       network: host
+    image: ${PALANTIR_BACKEND_IMAGE:-palantir-backend:latest}
     container_name: palantir-celery-beat
     restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     command: celery -A workers.celery_app.celery_app beat --loglevel=info
     depends_on:
       backend:
         condition: service_started
       redis:
         condition: service_healthy
+      netdata:
+        condition: service_started
+    volumes:
+      - ./backend:/app
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-palantir}:${POSTGRES_PASSWORD:-palantir}@postgres:5432/${POSTGRES_DB:-palantir}
       SYNC_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-palantir}:${POSTGRES_PASSWORD:-palantir}@postgres:5432/${POSTGRES_DB:-palantir}
@@ -95,3 +141,5 @@ services:
 volumes:
   postgres_data:
   redis_data:
+  netdata_lib:
+  netdata_cache:

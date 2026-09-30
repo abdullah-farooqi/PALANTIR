@@ -3,6 +3,7 @@ from typing import List, Optional
 from datetime import datetime, timezone
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from core.security import validate_netdata_url
 from integrations.netdata.client import NetdataClient
 from integrations.netdata.exceptions import NetdataUnavailable
 from models.node import MonitoredNode
@@ -18,10 +19,12 @@ class NodeService:
         os_type: str,
         session: AsyncSession,
     ) -> MonitoredNode:
+        netdata_url = validate_netdata_url(netdata_url)
         client = NetdataClient(base_url=netdata_url)
         
         # Probe connectivity
         await client.info()
+
 
         # Discover contexts
         try:

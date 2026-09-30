@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import Any, List, Dict
+from typing import Any, List, Dict, Union
 
 
 class NetdataResult(BaseModel):
@@ -12,7 +12,7 @@ class NetdataDataResponse(BaseModel):
 
 
 class NetdataWeightsResponse(BaseModel):
-    result: Dict[str, Any]
+    result: Union[Dict[str, Any], List[Any]] = Field(default_factory=dict)
 
 
 class NetdataInfoResponse(BaseModel):

@@ -119,11 +119,15 @@ class NetdataClient:
                 raw = r.json()
                 if model is dict:
                     return raw
+                if hasattr(model, "model_validate"):
+                    return model.model_validate(raw)
                 return model(**raw)
         except httpx.TimeoutException:
             raise NetdataUnavailable(f"Timeout: {self.base_url}{path}")
         except httpx.ConnectError:
             raise NetdataUnavailable(f"Connection refused: {self.base_url}{path}")
+        except httpx.RequestError as e:
+            raise NetdataUnavailable(f"Network error on {self.base_url}{path}: {e}")
         except httpx.HTTPStatusError as e:
             raise NetdataUnavailable(
                 f"HTTP {e.response.status_code}: {path}"

@@ -1,18 +1,48 @@
-from typing import List
-from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel
+import logging
+from typing import List, Optional
+from fastapi import APIRouter, Depends, HTTPException, Path, status
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 from core.database import get_session
+from core.security import validate_netdata_url
 from services.nodes import NodeService
 from integrations.netdata.exceptions import NetdataUnavailable
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/nodes", tags=["Nodes"])
 
 
 class NodeRegisterRequest(BaseModel):
-    hostname: str
-    netdata_url: str
-    os_type: str = "linux"
+    hostname: str = Field(
+        ...,
+        min_length=1,
+        max_length=253,
+        pattern=r"^[a-zA-Z0-9_\.\-]+$",
+        description="Node hostname",
+    )
+    netdata_url: str = Field(
+        ...,
+        min_length=7,
+        max_length=2048,
+        description="Base URL of the Netdata agent",
+    )
+    os_type: str = Field(
+        default="linux",
+        min_length=1,
+        max_length=32,
+        pattern=r"^[a-zA-Z0-9_\-]+$",
+        description="Operating system type",
+    )
+
+    model_config = {"extra": "forbid"}
+
+    @field_validator("netdata_url")
+    @classmethod
+    def validate_url(cls, v: str) -> str:
+        try:
+            return validate_netdata_url(v)
+        except ValueError as err:
+            raise ValueError(f"Invalid netdata_url: {err}")
 
 
 class NodeResponse(BaseModel):
@@ -21,11 +51,10 @@ class NodeResponse(BaseModel):
     netdata_url: str
     os_type: str
     active: bool
-    context_count: int | None = None
-    alert_count: int | None = None
+    context_count: Optional[int] = None
+    alert_count: Optional[int] = None
 
-    class Config:
-        from_attributes = True
+    model_config = {"from_attributes": True}
 
 
 @router.get("", response_model=List[NodeResponse])
@@ -50,21 +79,28 @@ async def register_monitored_node(
             session=session,
         )
         return node
-    except NetdataUnavailable as e:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Netdata Agent unreachable: {str(e)}",
-        )
-    except Exception as e:
+    except ValueError as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Failed to register node: {str(e)}",
+            detail=str(e),
+        )
+    except NetdataUnavailable as e:
+        logger.warning(f"Netdata Agent unreachable during registration of {req.hostname}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Netdata Agent unreachable or returned an invalid response",
+        )
+    except Exception as e:
+        logger.exception(f"Unexpected failure registering node {req.hostname}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to register node due to an internal error",
         )
 
 
 @router.get("/{node_id}", response_model=NodeResponse)
 async def get_monitored_node(
-    node_id: int,
+    node_id: int = Path(..., ge=1, description="Monitored node ID"),
     session: AsyncSession = Depends(get_session),
 ):
     node = await NodeService.get_node(node_id, session)
@@ -75,9 +111,10 @@ async def get_monitored_node(
 
 @router.delete("/{node_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def deactivate_monitored_node(
-    node_id: int,
+    node_id: int = Path(..., ge=1, description="Monitored node ID"),
     session: AsyncSession = Depends(get_session),
 ):
     success = await NodeService.deactivate_node(node_id, session)
     if not success:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Node not found")
+

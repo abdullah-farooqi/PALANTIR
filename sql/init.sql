@@ -103,3 +103,11 @@ CREATE INDEX IF NOT EXISTS idx_investigations_node
 CREATE INDEX IF NOT EXISTS idx_investigations_status
     ON agent_investigations (status)
     WHERE status = 'running';
+
+-- ─────────────────────────────────────────────────────────────────────
+-- Default Seed: Local Netdata Sensor Node (Auto-Registered)
+-- ─────────────────────────────────────────────────────────────────────
+INSERT INTO monitored_nodes (hostname, netdata_url, os_type, active)
+VALUES ('local-node', 'http://netdata:19999', 'linux', TRUE)
+ON CONFLICT (hostname) DO NOTHING;
+
