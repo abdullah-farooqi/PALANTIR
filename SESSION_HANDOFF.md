@@ -1,111 +1,160 @@
 # PALANTIR — Session Handoff & Knowledge Base
 
-**Date:** 2026-09-30  
+**Date:** 2026-10-01  
 **Project Path:** `/home/abdullah-ahmad/Desktop/PALANTIR`  
-**Status:** **Full Stack + Zero-Touch Architecture + Remote Sensor Deployment + Automated CI/CD + Comprehensive Test Suite Verified (32/32 tests passing)**  
-**Live Nodes Monitored:**  
-- `local-node` (ID 2): Ingesting local host telemetry  
-- `kali-vm` (ID 5): Ingesting remote VM telemetry (Netdata v2.11.1, 248 contexts, 125 alert rules)  
-**Docker Image Published:** `abdullahahmadfarooqi/palantir-netdata:latest` (Docker Hub)  
-**Target Branches:**  
-- Active feature branch: `telemetry_pipeline`  
-- Pull Request target: `initial_project`  
-- Release target: `main`  
+**Current Branch:** `telemetry_pipeline` (Tracked with `origin/telemetry_pipeline`, PR #1 open to `initial_project`)  
+**Status:** **Distributed Multi-Node Telemetry Verified + Remote Physical Sensor (Fedora) + Central Auto-Registration Script + CI/CD 100% Passing**  
 
 ---
 
-## 1. Executive Summary
+## 1. Executive Summary & Latest Accomplishments
 
-In this session, we completed the **distributed telemetry pipeline** for **PALANTIR**:
-1. **Remote Agent Packaging & Publishing**: Compiled a minimal, headless Netdata Agent container (`abdullahahmadfarooqi/palantir-netdata:latest`, 61.7MB) and published it to Docker Hub.
-2. **Real-World Remote Deployment (Kali VM)**: Successfully deployed the sensor onto a remote Kali Linux virtual machine, registered it into PALANTIR as Node 5, and verified real-time metrics streaming into PostgreSQL.
-3. **NAT VM Traversal & Networking Resolution**: Diagnosed and resolved VirtualBox NAT network isolation (`10.0.2.15`) by configuring dynamic port forwarding (`19998 -> 19999`) via `VBoxManage`, allowing the central server to seamlessly pull metrics without modifying the VM or re-copying repositories.
-4. **Codebase Hardening & Bug Fixes**:
-   - Fixed `AsyncSession.commit` unawaited coroutine warnings in `MetricsService` and `AnomalyService`.
-   - Enhanced `NetdataClient` exception handling to catch `httpx.RequestError` and map all transport/socket errors to `NetdataUnavailable`.
-   - Upgraded `scripts/install-agent.sh` with automatic VirtualBox NAT IP detection and operational guidance.
-5. **Comprehensive Automated Test Suite**: 32/32 tests passing in 0.83s (`pytest backend/tests/`).
+In the most recent sessions, the **distributed telemetry pipeline** was expanded from simulated/VM endpoints to real-world physical and multi-node architectures:
+1. **Physical Remote Endpoint Deployment (`fedora`, Node ID 6)**:
+   - Deployed the lightweight Netdata telemetry sensor (`abdullahahmadfarooqi/palantir-netdata:latest`) onto an external physical Fedora laptop (`172.15.80.252:19999`).
+   - Auto-discovered **265 telemetry contexts** and **209 alert rules**.
+   - Successfully ingested hundreds of snapshots into PostgreSQL across `system`, `network`, `processes`, and `cgroup` categories.
+   - Verified anomaly scoring (`workers.anomaly_tasks.evaluate_all_nodes`) and alert webhook dispatching (`POST /internal/alert`) for the remote node.
+2. **Automated Registration & Discovery Utility (`scripts/register-node.sh`)**:
+   - Created a dedicated CLI tool for the Central Platform that eliminates manual `curl` errors and placeholder mistakes (e.g., `<REMOTE_ENDPOINT_IP>`).
+   - Automatically probes target Netdata sensors, extracts the real hostname (`host_labels._hostname` or `mirrored_hosts[0]`), OS type, and architecture, and registers the node in PALANTIR.
+   - Supports `--local` mode to auto-detect the host's routable network interface and register the central server itself with zero configuration.
+3. **Smart IP Routing on Agent (`scripts/install-agent.sh`)**:
+   - Upgraded agent network discovery to query kernel routing (`ip -4 route get <SERVER_HOST>`), ensuring the sensor automatically detects and advertises the exact IP facing the central platform regardless of complex network topologies or VPNs.
+4. **CI/CD Pipeline Fixed**:
+   - Fixed invalid GitHub Actions secrets syntax in `.github/workflows/docker-publish.yml`.
+   - Bootstrapped PostgreSQL & Redis services in `.github/workflows/ci.yml` so automated unit tests (32/32) pass cleanly on GitHub Actions runners.
+   - GitHub Pull Request #1 opened: [https://github.com/abdullah-farooqi/PALANTIR/pull/1](https://github.com/abdullah-farooqi/PALANTIR/pull/1).
 
 ---
 
-## 2. Remote Agent Deployment Architecture
+## 2. Monitored Node Inventory
 
-### Remote Agent Deployment Pattern
-Any remote endpoint or VM needs only Docker installed. It does NOT require PostgreSQL, Redis, Celery, or the full PALANTIR repository:
+| Node ID | Hostname | Netdata Sensor URL | OS | Status | Notes |
+| :---: | :---: | :---: | :---: | :---: | :--- |
+| **2** | `local-node` | `http://192.168.18.43:19999` (or `http://netdata:19999`) | Linux | **ACTIVE** | Central PALANTIR host platform (12 cores, 16 GB RAM). |
+| **5** | `kali-vm` | `http://192.168.18.43:19998` | Linux | **PAUSED** | VirtualBox VM running with NAT port forwarding (`19998 -> 19999`). Inactive when VM is shut down. |
+| **6** | `fedora` | `http://172.15.80.252:19999` | Linux | **ACTIVE** | Remote physical ThinkPad/Fedora workstation (8 cores, 16 GB RAM). Ingested 420+ snapshots. |
+
+---
+
+## 3. Node Enrollment Scripts Guide
+
+### A. Central Platform: `scripts/register-node.sh`
+Run this script on the central server to register either the local host or any remote machine without manually writing JSON payloads:
 
 ```bash
-docker run -d \
-  --name palantir-agent \
-  --restart unless-stopped \
-  --pid host \
-  --cap-add SYS_PTRACE \
-  --cap-add SYS_ADMIN \
-  --security-opt apparmor:unconfined \
-  -p 19999:19999 \
-  -e PALANTIR_WEBHOOK_URL=http://<SYSADMIN_SERVER_IP>:8000/internal/alert \
-  -e PALANTIR_WEBHOOK_SECRET=palantir-super-secret-key-change-me \
-  abdullahahmadfarooqi/palantir-netdata:latest
+# 1. Register the local central server:
+./scripts/register-node.sh --local
+
+# 2. Register a remote endpoint (automatically probes sensor & fetches real hostname):
+./scripts/register-node.sh 192.168.18.50
+
+# 3. Register a remote endpoint on a custom port or specify a custom hostname:
+./scripts/register-node.sh --target 192.168.18.50 --port 19999 --hostname prod-worker-01
+
+# 4. Point to a remote PALANTIR server:
+./scripts/register-node.sh 192.168.18.50 --server http://192.168.18.43:8000
 ```
 
-### VM NAT Traversal Pattern
-When monitoring VirtualBox or VMware VMs operating in standard NAT mode (`10.0.2.15`):
-- The VM can reach the host (`192.168.18.43:8000`), but inbound host connections to `10.0.2.15` are blocked by NAT isolation.
-- **Solution 1 (Bridged Adapter)**: Switch VM Network Adapter from NAT to Bridged Adapter to give the VM an IP on the local subnet (`192.168.18.x`).
-- **Solution 2 (Port Forwarding)**: Forward a host port (e.g. `19998`) to guest port `19999`:
-  ```bash
-  VBoxManage controlvm "<VM_NAME>" natpf1 "netdata-agent,tcp,,19998,,19999"
-  ```
-  Then register the node using the forwarded URL:
-  ```bash
-  curl -X POST http://<SYSADMIN_IP>:8000/api/v1/nodes \
-    -H "Content-Type: application/json" \
-    -d '{"hostname":"<VM_NAME>","netdata_url":"http://<SYSADMIN_IP>:19998","os_type":"linux"}'
-  ```
-
----
-
-## 3. Verified System State
-
-### Active Nodes in Database (`monitored_nodes`)
-```sql
- id | hostname   |         netdata_url        | active | context_count | alert_count 
-----+------------+----------------------------+--------+---------------+-------------
-  2 | local-node | http://netdata:19999       | t      |           261 |         202 
-  5 | kali-vm    | http://192.168.18.43:19998 | t      |           248 |         125 
-```
-
-### Live Snapshots Ingestion (`metric_snapshots`)
-```sql
- category  | count |         latest_stream         
------------+-------+-------------------------------
- network   |   900 | 2026-09-30 18:35:12.041296+00
- processes |   900 | 2026-09-30 18:35:12.041347+00
- system    |   870 | 2026-09-30 18:35:12.041320+00
-```
-
-### Alert Ingestion & Agent Triggering (`alert_events`)
-- Tested webhook: `POST /internal/alert` with HMAC authentication.
-- Classified as `event_id: 35` for `kali-vm` with `triggered_agent: true`.
-
----
-
-## 4. Test Suite Verification (32/32 Passing)
+### B. Remote Agent: `scripts/install-agent.sh`
+Run this one-liner on **any** remote Linux machine or VM (requires only Docker):
 
 ```bash
+# Direct execution from GitHub or local copy:
+./scripts/install-agent.sh http://<SYSADMIN_SERVER_IP>:8000
+
+# Or via curl:
+curl -fsSL https://raw.githubusercontent.com/abdullah-farooqi/PALANTIR/telemetry_pipeline/scripts/install-agent.sh | bash -s -- http://<SYSADMIN_SERVER_IP>:8000
+```
+*The installer automatically launches `abdullahahmadfarooqi/palantir-netdata:latest`, queries the kernel routing table to determine its IP facing `<SYSADMIN_SERVER_IP>`, verifies sensor readiness, and registers the node.*
+
+---
+
+## 4. Problem Diagnosis: Database Protection, Noise Filtering & Structured Ingestion
+
+During multi-node verification, three key structural issues were identified in the ingestion pipeline that must be resolved in the upcoming session:
+
+### 1. GUID Key Pollution (`@<machine-guid>`)
+- **Observation:** Netdata v2/v3 appends the unique host machine GUID to all metric context labels (e.g. `system.cpu@a3d4921e-c907-4718-b308-9bbd71278e6d`, `mem.swap@a3d4921e...`, `app.firefox_mem_usage@a3d4921e...`).
+- **Impact:** SQL queries cannot query standard keys like `data->>'system.cpu'`. Developers or analytical models must know the machine GUID or write fragile regex searches over JSONB keys.
+- **Solution:** Implement a normalization pass in `integrations/netdata/parsers.py` that strips `@<guid>` suffixes upon ingestion, standardizing all keys to `system.cpu`, `system.ram`, `system.load`, `mem.swap`, etc.
+
+### 2. Excessive Noise & Sparse Zero-Padding
+- **Observation:** In the `processes` category, Netdata dumps dimension entries for every known system daemon (over 150 entries per second), even when idle, resulting in dozens of `0.0` values (`app.agetty_fds_open: 0.0`, `app.tuned_cpu_utilization: 0.0`).
+- **Impact:** PostgreSQL storage accumulates tens of thousands of rows of mostly zero-filled JSON blobs, causing rapid database bloat without providing operational signal.
+- **Solution:** Implement filtering in `services/metrics.py`:
+  - Filter out zero/null dimensions for inactive processes.
+  - Sort and extract **Top-N CPU Consumers** and **Top-N Memory Consumers** (e.g., top 10 processes) rather than storing 150 idle background tasks.
+
+### 3. Lack of Structured, Queryable Typed Fields
+- **Observation:** `metric_snapshots` currently stores telemetry exclusively as unstructured `data (jsonb)`.
+- **Impact:** Querying time-series trends (e.g., "Give me CPU utilization > 80% over the last hour") requires expensive JSONB parsing operations across all rows.
+- **Solution:** Introduce a structured normalization layer ("Structured Metrics Logger"):
+  - Promote key high-cardinality metrics to indexed, typed columns (e.g., `cpu_utilization FLOAT`, `ram_used_mb FLOAT`, `ram_total_mb FLOAT`, `load_1m FLOAT`, `swap_used_mb FLOAT`, `net_rx_kbps FLOAT`, `net_tx_kbps FLOAT`).
+  - Store detailed process breakdowns as a clean, structured JSON array:
+    ```json
+    "top_processes": [
+      {"name": "firefox", "cpu_pct": 0.50, "mem_mb": 3656.9},
+      {"name": "alacritty", "cpu_pct": 0.08, "mem_mb": 669.3}
+    ]
+    ```
+
+---
+
+## 5. Next Session Action Plan
+
+In the upcoming session, work will focus on refactoring the ingestion pipeline for database protection, structured querying, and automated agent root-cause analysis:
+
+### Phase 1: Ingestion Normalizer & Structured Metrics Logger
+1. **Create `backend/integrations/netdata/normalizer.py`**:
+   - `strip_machine_guid(key: str) -> str`: Normalizes `metric@guid` $\rightarrow$ `metric`.
+   - `filter_active_metrics(data: dict) -> dict`: Discards inactive 0.0 entries.
+   - `extract_top_processes(process_data: dict, top_n: int = 10) -> List[dict]`: Groups CPU and memory usage by process name and outputs the top consumers.
+2. **Schema Upgrade for `metric_snapshots`**:
+   - Add first-class typed columns to `metric_snapshots`:
+     - `cpu_pct` (Double Precision / Float)
+     - `ram_used_mb` (Double Precision / Float)
+     - `ram_total_mb` (Double Precision / Float)
+     - `load_avg` (Double Precision / Float)
+     - `swap_used_mb` (Double Precision / Float)
+   - Add B-Tree indexes on `(node_id, category, collected_at)` and `(cpu_pct)`.
+3. **Update `MetricsService.collect_and_persist`**:
+   - Apply the normalizer before persisting to PostgreSQL.
+   - Store clean, queryable payloads in both the typed columns and cleaned JSONB.
+
+### Phase 2: Autonomous Investigation Agent (LangGraph)
+1. Wire `backend/workers/agent_tasks.py`:
+   - Trigger LangGraph diagnostic workflows whenever an anomaly is flagged or an alert is received with `triggered_agent == True`.
+   - Pass normalized metrics from the new structured schema into the prompt/context for root-cause analysis.
+   - Write investigation results into the `agent_investigations` table.
+
+### Phase 3: Database Retention & Performance
+1. Implement metric aggregation (rollups) or snapshot pruning to keep database storage lightweight and performant.
+
+---
+
+## 6. Verification Commands Quick Reference
+
+```bash
+# Check running containers:
+docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+
+# Check enrolled nodes in database:
+docker exec palantir-postgres psql -U palantir -d palantir -c \
+  "SELECT id, hostname, netdata_url, active, context_count, alert_count FROM monitored_nodes ORDER BY id;"
+
+# Check live snapshot counts per node:
+docker exec palantir-postgres psql -U palantir -d palantir -c \
+  "SELECT node_id, category, count(*), max(collected_at) FROM metric_snapshots GROUP BY node_id, category ORDER BY node_id;"
+
+# Run the central platform registration utility:
+./scripts/register-node.sh --help
+./scripts/register-node.sh --local
+
+# Stream live Celery worker ingestion logs:
+docker logs --tail 30 -f palantir-celery-worker
+
+# Run full backend test suite:
 docker exec palantir-backend pytest -v
 ```
-
-- **API Suite** (`tests/test_api.py`): 9 tests covering `/healthz`, node discovery, registration, 502 unavailable handling, SSRF/cloud metadata protection, metric queries, alerts, and investigations.
-- **Security Suite** (`tests/test_security.py`): 7 tests covering constant-time HMAC comparison, URI sanitization, port scanning prevention, and IMDS protection.
-- **Netdata Suite** (`tests/test_netdata.py`): 13 tests covering NaN/Inf sanitization, dynamic dimension extraction, anomaly score parsing, and mocked Netdata HTTP clients.
-- **Worker Suite** (`tests/test_workers.py`): 3 tests covering metric persistence, anomaly evaluation, and snapshot retention pruning.
-
----
-
-## 5. Next Steps & Development Priorities
-
-1. **Option 1: LangGraph Autonomous Investigation Agent**:
-   - Implement `backend/workers/agent_tasks.py` to trigger LangGraph multi-step diagnostic runs when alerts/anomalies occur with `triggered_agent == True`.
-   - Wire root-cause analysis LLM workflows that query recent `metric_snapshots` and generate investigation summaries into `investigations` table.
-2. **Option 2: Dashboard Frontend / Visual UI**:
-   - Build a lightweight dashboard (e.g. Next.js / Streamlit) visualizing node health, real-time metric graphs, and active investigation reports.

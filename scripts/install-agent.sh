@@ -117,7 +117,17 @@ fi
 NODE_HOSTNAME=$(echo "$NODE_HOSTNAME" | tr -cd 'a-zA-Z0-9.-' | cut -c1-63)
 
 if [ -z "$NODE_IP" ]; then
-  NODE_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oP 'src \K\S+' || hostname -I 2>/dev/null | awk '{print $1}' || echo "127.0.0.1")
+  # Extract server host/IP
+  SERVER_HOST=$(echo "$SERVER_URL" | sed -E 's|^https?://||; s|:[0-9]+/?$||; s|/.*$||')
+  # 1. Ask kernel which source IP is used to route to the central PALANTIR server:
+  if [ -n "$SERVER_HOST" ] && [[ ! "$SERVER_HOST" =~ [^a-zA-Z0-9.-] ]]; then
+    NODE_IP=$(ip -4 route get "$SERVER_HOST" 2>/dev/null | grep -oP 'src \K\S+' || true)
+  fi
+  # 2. Fallbacks:
+  if [ -z "$NODE_IP" ]; then
+    NODE_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oP 'src \K\S+' || \
+              hostname -I 2>/dev/null | awk '{print $1}' || echo "127.0.0.1")
+  fi
 fi
 
 if [[ "$NODE_IP" =~ ^10\.0\.2\. ]]; then
