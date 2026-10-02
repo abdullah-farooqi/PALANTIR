@@ -49,6 +49,7 @@ async def test_metrics_service_collect_and_persist(local_node_sync):
                 .where(
                     MetricSnapshot.node_id == local_node_sync.id,
                     MetricSnapshot.category == "system",
+                    MetricSnapshot.data["user"].as_float() == 10.5,
                 )
                 .order_by(MetricSnapshot.collected_at.desc())
                 .limit(1)
@@ -56,6 +57,108 @@ async def test_metrics_service_collect_and_persist(local_node_sync):
             snap = (await session.execute(stmt)).scalar_one_or_none()
             assert snap is not None
             assert snap.data["user"] == 10.5
+            assert snap.cpu_pct == 15.7
+
+
+@pytest.mark.asyncio
+async def test_metrics_service_ram_total_skips_invalid_metadata_and_uses_v3():
+    svc = MetricsService("http://mock-node:19999")
+    info = type("Info", (), {"ram_total": "not-a-number", "host_labels": {"_system_ram_total": "0"}})()
+    v3_info = type(
+        "V3Info",
+        (),
+        {"agents": [{"application": {"hw": {"ram": 8 * 1024 * 1024 * 1024}}}]},
+    )()
+
+    with patch.object(svc.client, "info", new=AsyncMock(return_value=info)), \
+         patch.object(svc.client, "info_v3", new=AsyncMock(return_value=v3_info)):
+        assert await svc.get_ram_total_mb() == 8192.0
+
+
+@pytest.mark.asyncio
+async def test_metrics_service_skips_malformed_rows(local_node_sync):
+    svc = MetricsService("http://mock-node:19999")
+
+    with patch.object(svc, "collect_network", new=AsyncMock(return_value=[None])), \
+         patch.object(svc, "collect_system", new=AsyncMock(return_value=[])), \
+         patch.object(svc, "collect_processes", new=AsyncMock(return_value=[])), \
+         patch.object(svc, "collect_containers", new=AsyncMock(return_value=[])), \
+         patch.object(svc, "get_ram_total_mb", new=AsyncMock(return_value=None)):
+        with get_sync_session() as session:
+            await svc.collect_and_persist(local_node_sync.id, session)
+
+
+@pytest.mark.asyncio
+async def test_metrics_service_typed_columns_and_normalizer(local_node_sync):
+    svc = MetricsService("http://mock-node:19999")
+    svc._ram_total_mb = 16000.0
+
+    mock_system = [{
+        "timestamp": 1727000100,
+        "system.cpu@87f56850-57c0-43b7-a6e2-13c37aaaa009": 25.4,
+        "system.ram@87f56850-57c0-43b7-a6e2-13c37aaaa009": 4096.5,
+        "system.load@87f56850-57c0-43b7-a6e2-13c37aaaa009": 1.25,
+        "mem.swap@87f56850-57c0-43b7-a6e2-13c37aaaa009": 512.0,
+    }]
+    mock_processes = [{
+        "timestamp": 1727000100,
+        "app.firefox_cpu_utilization@87f56850-57c0-43b7-a6e2-13c37aaaa009": 12.5,
+        "app.firefox_mem_usage@87f56850-57c0-43b7-a6e2-13c37aaaa009": 1024.0,
+        "app.idle_daemon_cpu_utilization@87f56850-57c0-43b7-a6e2-13c37aaaa009": 0.0,
+        "app.idle_daemon_mem_usage@87f56850-57c0-43b7-a6e2-13c37aaaa009": 0.0,
+    }]
+
+    with patch.object(svc, "collect_network", new=AsyncMock(return_value=[])), \
+         patch.object(svc, "collect_system", new=AsyncMock(return_value=mock_system)), \
+         patch.object(svc, "collect_processes", new=AsyncMock(return_value=mock_processes)), \
+         patch.object(svc, "collect_containers", new=AsyncMock(return_value=[])):
+
+        with get_sync_session() as session:
+            await svc.collect_and_persist(local_node_sync.id, session)
+
+    async with AsyncSessionLocal() as session:
+        # Check system snapshot typed columns
+        stmt_sys = (
+            select(MetricSnapshot)
+                .where(
+                    MetricSnapshot.node_id == local_node_sync.id,
+                    MetricSnapshot.category == "system",
+                    MetricSnapshot.data["system.cpu"].as_float() == 25.4,
+                )
+            .order_by(MetricSnapshot.collected_at.desc())
+            .limit(1)
+        )
+        sys_snap = (await session.execute(stmt_sys)).scalar_one_or_none()
+        assert sys_snap is not None
+        assert sys_snap.cpu_pct == 25.4
+        assert sys_snap.ram_used_mb == 4096.5
+        assert sys_snap.ram_total_mb == 16000.0
+        assert sys_snap.load_avg == 1.25
+        assert sys_snap.swap_used_mb == 512.0
+        assert "system.cpu" in sys_snap.data
+        assert "system.cpu@mock-guid" not in sys_snap.data
+
+        # Check processes snapshot typed columns & bloat reduction
+        stmt_proc = (
+            select(MetricSnapshot)
+                .where(
+                    MetricSnapshot.node_id == local_node_sync.id,
+                    MetricSnapshot.category == "processes",
+                    MetricSnapshot.data["app.firefox_cpu_utilization"].as_float() == 12.5,
+                )
+            .order_by(MetricSnapshot.collected_at.desc())
+            .limit(1)
+        )
+        proc_snap = (await session.execute(stmt_proc)).scalar_one_or_none()
+        assert proc_snap is not None
+        assert proc_snap.top_processes is not None
+        assert len(proc_snap.top_processes) == 1
+        assert proc_snap.top_processes[0]["name"] == "firefox"
+        assert proc_snap.top_processes[0]["cpu_pct"] == 12.5
+        assert proc_snap.top_processes[0]["mem_mb"] == 1024.0
+        # Inactive daemon filtered out
+        assert "app.idle_daemon_cpu_utilization" not in proc_snap.data
+
 
 
 @pytest.mark.asyncio

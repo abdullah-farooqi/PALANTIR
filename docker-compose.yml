@@ -56,6 +56,12 @@ services:
     environment:
       - PALANTIR_WEBHOOK_URL=http://backend:8000/internal/alert
       - PALANTIR_WEBHOOK_SECRET=${PALANTIR_WEBHOOK_SECRET:-palantir-super-secret-key-change-me}
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:19999/api/v1/info"]
+      interval: 30s
+      timeout: 5s
+      start_period: 90s
+      retries: 3
 
   backend:
     build:
@@ -73,7 +79,7 @@ services:
       redis:
         condition: service_healthy
       netdata:
-        condition: service_started
+        condition: service_healthy
     volumes:
       - ./backend:/app
     environment:
@@ -103,7 +109,7 @@ services:
       redis:
         condition: service_healthy
       netdata:
-        condition: service_started
+        condition: service_healthy
     volumes:
       - ./backend:/app
     environment:
@@ -129,7 +135,7 @@ services:
       redis:
         condition: service_healthy
       netdata:
-        condition: service_started
+        condition: service_healthy
     volumes:
       - ./backend:/app
     environment:

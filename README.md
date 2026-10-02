@@ -54,7 +54,7 @@ docker compose up -d
 curl -s http://localhost:8000/healthz | python3 -m json.tool
 ```
 
-On boot, the backend automatically discovers the local Netdata sensor, maps 260+ telemetry contexts, and registers `local-node` into PostgreSQL.
+On boot, the backend probes the configured Netdata endpoint, discovers the contexts available on that host, and registers `local-node` into PostgreSQL. Context counts are host-specific and must not be hard-coded.
 
 ---
 
@@ -124,6 +124,22 @@ curl -X POST http://<SYSADMIN_SERVER_IP>:8000/api/v1/nodes \
 
 ## 4. Verification & Testing
 
+### Verify a live Netdata host
+
+Run the host-endpoint checks before trusting a new agent or upgrade:
+
+```bash
+cd backend
+NETDATA_URL=http://localhost:19999 ./venv/bin/python scripts/verify_live.py
+# Or from the repository root:
+NETDATA_URL=http://localhost:19999 ./backend/venv/bin/python backend/scripts/verify_live.py
+```
+
+The verifier checks the v1 host-label and v3 identity split, host-derived RAM,
+context discovery, non-empty recent `contexts` queries, JSON2 row shape,
+unknown-context behavior, the `anomaly-rate` method echo, and the v3
+current-alert envelope. A healthy host may have no current alert instances.
+
 ### Verify Live Ingestion on Central Server (Ubuntu)
 ```bash
 # 1. Watch incoming snapshot count update every 60s
@@ -137,15 +153,63 @@ curl -s http://localhost:8000/api/v1/nodes/5/metrics | python3 -m json.tool
 docker logs -f --tail 20 palantir-celery-worker 2>&1 | grep --line-buffered "19998"
 ```
 
-### Run the Automated Test Suite (32 Tests)
+### Run the Automated Test Suite (58 Tests)
 ```bash
+# Host virtual environment (run from backend so pyproject.toml is loaded)
+cd backend
+./venv/bin/pytest -q
+
+# Running stack
 docker exec palantir-backend pytest -v
 ```
-All 32 tests validate API contracts, Netdata JSON2 parsers, NaN/Inf resilience, timing-safe webhook HMAC verification, and Celery pipelines.
+The suite validates API contracts, Netdata JSON2 parsers, GUID normalization,
+typed metric persistence, NaN/Inf resilience, timing-safe webhook HMAC
+verification, and Celery pipelines.
 
 ---
 
-## 5. Branching & Contribution Strategy
+## 5. Netdata API-v3 Rules
+
+PALANTIR uses the host endpoint as the source of truth. API-v3 is permissive:
+several incorrect requests return valid-looking responses instead of errors.
+
+| Concern | Required behavior | Failure mode to avoid |
+|---|---|---|
+| Data selection | Use `contexts=...`, never `chart=...` | `chart` can be silently ignored and return unrelated contexts |
+| Time window | Send `after=-60` (or another explicit window) | A fresh agent's default window can predate startup and return no rows |
+| Instances | Send `group_by=instance` for NICs, mounts, processes, and containers | Omitting it aggregates instances together |
+| Data shape | Request `format=json2`; parse values as `[value, anomaly, flags]` triples | Treating dimensions as scalars corrupts values |
+| Response envelope | Read rows from `result.data` and labels from `result.labels` | Looking for top-level `data` reports false emptiness |
+| Anomaly scores | Use `/api/v3/weights?...&method=anomaly-rate` | Other method names can silently select a different calculation |
+| Alert definitions | Use `/api/v1/alarms?all` | `/api/v1/alerts` is not the endpoint; `all=1` is not equivalent to bare `all` |
+| Current alerts | POST `/api/v3/alerts` with `options` | A healthy host may return only `api`, `nodes`, and `timings` |
+| Alert configuration | GET `/api/v3/alert_config?config=<hash>` | The configuration hash is required |
+
+The live verifier is intentionally a semantic check, not just an HTTP health
+probe. In particular, an empty current-alert set is not evidence that the
+health subsystem is stopped; inspect the envelope and the agent's health
+capability before drawing that conclusion.
+
+## 6. Structured Metric Storage
+
+`metric_snapshots` retains cleaned JSONB in `data` for compatibility and
+promotes common values into nullable typed columns: `cpu_pct`, `ram_used_mb`,
+`ram_total_mb`, `load_avg`, `swap_used_mb`, and `top_processes`. The schema is
+partitioned by `collected_at`, has node/category/time indexes, B-tree indexes
+for typed resource values, and a partial GIN index for `top_processes`.
+
+The checked-in `sql/init.sql` is safe to rerun against an existing volume: it
+uses `IF NOT EXISTS` for tables and indexes and `ADD COLUMN IF NOT EXISTS` for
+the typed migration. For an already-running stack, apply it explicitly:
+
+```bash
+docker exec -i palantir-postgres psql -v ON_ERROR_STOP=1 \
+  -U palantir -d palantir < sql/init.sql
+```
+
+---
+
+## 7. Branching & Contribution Strategy
 
 The PALANTIR development workflow follows a phased branch hierarchy:
 1. `telemetry_pipeline` (Feature branch): Active development of sensor collection, parsers, and node enrollment.

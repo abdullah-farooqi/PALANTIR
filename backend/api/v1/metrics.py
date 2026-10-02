@@ -15,11 +15,23 @@ class MetricSnapshotItem(BaseModel):
     collected_at: str
     category: str
     data: Any
+    cpu_pct: Optional[float] = None
+    ram_used_mb: Optional[float] = None
+    ram_total_mb: Optional[float] = None
+    load_avg: Optional[float] = None
+    swap_used_mb: Optional[float] = None
+    top_processes: Optional[List[Dict[str, Any]]] = None
 
 
 class CategoryMetricResponse(BaseModel):
     collected_at: Optional[str] = None
     data: Optional[Any] = None
+    cpu_pct: Optional[float] = None
+    ram_used_mb: Optional[float] = None
+    ram_total_mb: Optional[float] = None
+    load_avg: Optional[float] = None
+    swap_used_mb: Optional[float] = None
+    top_processes: Optional[List[Dict[str, Any]]] = None
 
 
 @router.get("", response_model=Dict[str, CategoryMetricResponse])
@@ -41,13 +53,19 @@ async def get_latest_metrics_all(
                 MetricSnapshot.node_id == node_id,
                 MetricSnapshot.category == cat,
             )
-            .order_by(MetricSnapshot.collected_at.desc())
+            .order_by(MetricSnapshot.collected_at.desc(), MetricSnapshot.id.desc())
             .limit(1)
         )
         snap = (await session.execute(stmt)).scalar_one_or_none()
         result[cat] = {
             "collected_at": snap.collected_at.isoformat() if snap else None,
             "data": snap.data if snap else None,
+            "cpu_pct": snap.cpu_pct if snap else None,
+            "ram_used_mb": snap.ram_used_mb if snap else None,
+            "ram_total_mb": snap.ram_total_mb if snap else None,
+            "load_avg": snap.load_avg if snap else None,
+            "swap_used_mb": snap.swap_used_mb if snap else None,
+            "top_processes": snap.top_processes if snap else None,
         }
     return result
 
@@ -76,7 +94,7 @@ async def get_latest_metrics_by_category(
             MetricSnapshot.node_id == node_id,
             MetricSnapshot.category == category,
         )
-        .order_by(MetricSnapshot.collected_at.desc())
+        .order_by(MetricSnapshot.collected_at.desc(), MetricSnapshot.id.desc())
         .limit(limit)
     )
     rows = (await session.execute(stmt)).scalars().all()
@@ -86,6 +104,12 @@ async def get_latest_metrics_by_category(
             "collected_at": r.collected_at.isoformat(),
             "category": r.category,
             "data": r.data,
+            "cpu_pct": r.cpu_pct,
+            "ram_used_mb": r.ram_used_mb,
+            "ram_total_mb": r.ram_total_mb,
+            "load_avg": r.load_avg,
+            "swap_used_mb": r.swap_used_mb,
+            "top_processes": r.top_processes,
         }
         for r in rows
     ]

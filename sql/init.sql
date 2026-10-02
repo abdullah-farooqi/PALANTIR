@@ -25,11 +25,25 @@ CREATE TABLE IF NOT EXISTS metric_snapshots (
     category     TEXT        NOT NULL
                  CHECK (category IN ('network','system','processes','containers')),
     data         JSONB       NOT NULL,
+    cpu_pct      FLOAT,
+    ram_used_mb  FLOAT,
+    ram_total_mb FLOAT,
+    load_avg     FLOAT,
+    swap_used_mb FLOAT,
+    top_processes JSONB,
     PRIMARY KEY (id, collected_at)
 ) PARTITION BY RANGE (collected_at);
 
 CREATE TABLE IF NOT EXISTS metric_snapshots_default
     PARTITION OF metric_snapshots DEFAULT;
+
+-- Keep rerunning this file safe when upgrading an existing database volume.
+ALTER TABLE metric_snapshots ADD COLUMN IF NOT EXISTS cpu_pct FLOAT;
+ALTER TABLE metric_snapshots ADD COLUMN IF NOT EXISTS ram_used_mb FLOAT;
+ALTER TABLE metric_snapshots ADD COLUMN IF NOT EXISTS ram_total_mb FLOAT;
+ALTER TABLE metric_snapshots ADD COLUMN IF NOT EXISTS load_avg FLOAT;
+ALTER TABLE metric_snapshots ADD COLUMN IF NOT EXISTS swap_used_mb FLOAT;
+ALTER TABLE metric_snapshots ADD COLUMN IF NOT EXISTS top_processes JSONB;
 
 -- Anomaly events — when correlation threshold is crossed
 CREATE TABLE IF NOT EXISTS anomaly_events (
@@ -83,6 +97,28 @@ CREATE INDEX IF NOT EXISTS idx_snapshots_category
 CREATE INDEX IF NOT EXISTS idx_snapshots_data_gin
     ON metric_snapshots USING GIN (data);
 
+CREATE INDEX IF NOT EXISTS idx_snapshots_node_cat_time
+    ON metric_snapshots (node_id, category, collected_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_snapshots_cpu_pct
+    ON metric_snapshots (cpu_pct);
+
+CREATE INDEX IF NOT EXISTS idx_snapshots_ram_used_mb
+    ON metric_snapshots (ram_used_mb)
+    WHERE ram_used_mb IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_snapshots_load_avg
+    ON metric_snapshots (load_avg)
+    WHERE load_avg IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_snapshots_swap_used_mb
+    ON metric_snapshots (swap_used_mb)
+    WHERE swap_used_mb IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_snapshots_top_processes_gin
+    ON metric_snapshots USING GIN (top_processes)
+    WHERE top_processes IS NOT NULL;
+
 CREATE INDEX IF NOT EXISTS idx_anomaly_node_time
     ON anomaly_events (node_id, detected_at DESC);
 
@@ -110,4 +146,3 @@ CREATE INDEX IF NOT EXISTS idx_investigations_status
 INSERT INTO monitored_nodes (hostname, netdata_url, os_type, active)
 VALUES ('local-node', 'http://netdata:19999', 'linux', TRUE)
 ON CONFLICT (hostname) DO NOTHING;
-

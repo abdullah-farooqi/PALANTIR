@@ -1,40 +1,49 @@
-# PALANTIR — Session Handoff & Knowledge Base
+# PALANTIR — Session Handoff
 
-**Date:** 2026-10-01  
-**Project Path:** `/home/abdullah-ahmad/Desktop/PALANTIR`  
-**Current Branch:** `telemetry_pipeline` (Tracked with `origin/telemetry_pipeline`, PR #1 open to `initial_project`)  
-**Status:** **Distributed Multi-Node Telemetry Verified + Remote Physical Sensor (Fedora) + Central Auto-Registration Script + CI/CD 100% Passing**  
-
----
-
-## 1. Executive Summary & Latest Accomplishments
-
-In the most recent sessions, the **distributed telemetry pipeline** was expanded from simulated/VM endpoints to real-world physical and multi-node architectures:
-1. **Physical Remote Endpoint Deployment (`fedora`, Node ID 6)**:
-   - Deployed the lightweight Netdata telemetry sensor (`abdullahahmadfarooqi/palantir-netdata:latest`) onto an external physical Fedora laptop (`172.15.80.252:19999`).
-   - Auto-discovered **265 telemetry contexts** and **209 alert rules**.
-   - Successfully ingested hundreds of snapshots into PostgreSQL across `system`, `network`, `processes`, and `cgroup` categories.
-   - Verified anomaly scoring (`workers.anomaly_tasks.evaluate_all_nodes`) and alert webhook dispatching (`POST /internal/alert`) for the remote node.
-2. **Automated Registration & Discovery Utility (`scripts/register-node.sh`)**:
-   - Created a dedicated CLI tool for the Central Platform that eliminates manual `curl` errors and placeholder mistakes (e.g., `<REMOTE_ENDPOINT_IP>`).
-   - Automatically probes target Netdata sensors, extracts the real hostname (`host_labels._hostname` or `mirrored_hosts[0]`), OS type, and architecture, and registers the node in PALANTIR.
-   - Supports `--local` mode to auto-detect the host's routable network interface and register the central server itself with zero configuration.
-3. **Smart IP Routing on Agent (`scripts/install-agent.sh`)**:
-   - Upgraded agent network discovery to query kernel routing (`ip -4 route get <SERVER_HOST>`), ensuring the sensor automatically detects and advertises the exact IP facing the central platform regardless of complex network topologies or VPNs.
-4. **CI/CD Pipeline Fixed**:
-   - Fixed invalid GitHub Actions secrets syntax in `.github/workflows/docker-publish.yml`.
-   - Bootstrapped PostgreSQL & Redis services in `.github/workflows/ci.yml` so automated unit tests (32/32) pass cleanly on GitHub Actions runners.
-   - GitHub Pull Request #1 opened: [https://github.com/abdullah-farooqi/PALANTIR/pull/1](https://github.com/abdullah-farooqi/PALANTIR/pull/1).
+**Date:** 2026-10-02
+**Project Path:** `/home/abdullah-ahmad/Desktop/PALANTIR`
+**Reference:** `/home/abdullah-ahmad/Desktop/netdata/PALANTIR`
+**Status:** **Implementation and documentation changes are uncommitted; verify `git status` before handoff.**
 
 ---
 
-## 2. Monitored Node Inventory
+## 1. Current Architecture and Accomplishments
 
-| Node ID | Hostname | Netdata Sensor URL | OS | Status | Notes |
-| :---: | :---: | :---: | :---: | :---: | :--- |
-| **2** | `local-node` | `http://192.168.18.43:19999` (or `http://netdata:19999`) | Linux | **ACTIVE** | Central PALANTIR host platform (12 cores, 16 GB RAM). |
-| **5** | `kali-vm` | `http://192.168.18.43:19998` | Linux | **PAUSED** | VirtualBox VM running with NAT port forwarding (`19998 -> 19999`). Inactive when VM is shut down. |
-| **6** | `fedora` | `http://172.15.80.252:19999` | Linux | **ACTIVE** | Remote physical ThinkPad/Fedora workstation (8 cores, 16 GB RAM). Ingested 420+ snapshots. |
+PALANTIR is a central FastAPI/Celery/PostgreSQL service that pulls telemetry
+from one or more Netdata HTTP endpoints. Remote endpoints only need Netdata;
+they do not run the PALANTIR database, Redis, or workers.
+
+The current collection path is:
+1. `NetdataClient` probes `/api/v1/info` for host labels/RAM and `/api/v3/info`
+   for agent identity, hardware, capabilities, and context counts.
+2. `/api/v3/data` is queried with explicit contexts, an explicit recent
+   `after` window, `format=json2`, and `group_by=instance` where separation
+   matters.
+3. JSON2 rows are parsed as timestamp plus dimension values. Each dimension
+   value is `[value, anomaly-rate, flags]`; the first item is the metric value.
+4. The ingestion normalizer strips `@<machine-guid>` suffixes, removes idle
+   zero/null process dimensions, and emits ranked `top_processes` arrays.
+5. `metric_snapshots` stores cleaned JSONB plus nullable typed columns for CPU,
+   RAM, load, swap, and top processes. It is range-partitioned by time.
+6. Celery schedules collection, anomaly evaluation, and retention work. Alert
+   definitions, current alerts, and alert transitions use separate endpoints.
+
+Implemented in the current worktree:
+- Netdata key normalization and active process extraction.
+- JSON2 parsing with GUID removal and missing-value tolerance.
+- Typed metric fields, migration-safe SQL, and query indexes.
+- Host RAM discovery from v1 info/host labels with a v3 hardware fallback.
+- v3 info, anomaly, current-alert, alert-transition, and alert-config calls.
+- A semantic live verifier at `backend/scripts/verify_live.py`.
+- Compose health gating so backend and Celery wait for a healthy Netdata API.
+
+---
+
+## 2. Node Inventory Guidance
+
+Do not carry historical IPs, node IDs, context counts, or alert counts forward
+as constants. Query the current registry and probe each endpoint because these
+values are host-specific and can change between sessions.
 
 ---
 
@@ -71,28 +80,31 @@ curl -fsSL https://raw.githubusercontent.com/abdullah-farooqi/PALANTIR/telemetry
 
 ---
 
-## 4. Problem Diagnosis: Database Protection, Noise Filtering & Structured Ingestion
+## 4. Ingestion and Database Status
 
-During multi-node verification, three key structural issues were identified in the ingestion pipeline that must be resolved in the upcoming session:
+The three previously identified storage problems are now addressed in the
+current implementation:
 
 ### 1. GUID Key Pollution (`@<machine-guid>`)
 - **Observation:** Netdata v2/v3 appends the unique host machine GUID to all metric context labels (e.g. `system.cpu@a3d4921e-c907-4718-b308-9bbd71278e6d`, `mem.swap@a3d4921e...`, `app.firefox_mem_usage@a3d4921e...`).
 - **Impact:** SQL queries cannot query standard keys like `data->>'system.cpu'`. Developers or analytical models must know the machine GUID or write fragile regex searches over JSONB keys.
-- **Solution:** Implement a normalization pass in `integrations/netdata/parsers.py` that strips `@<guid>` suffixes upon ingestion, standardizing all keys to `system.cpu`, `system.ram`, `system.load`, `mem.swap`, etc.
+- **Status:** `integrations/netdata/parsers.py` and the normalizer strip
+  `@<guid>` suffixes at ingestion, standardizing keys such as `system.cpu`,
+  `system.ram`, `system.load`, and `mem.swap`.
 
 ### 2. Excessive Noise & Sparse Zero-Padding
 - **Observation:** In the `processes` category, Netdata dumps dimension entries for every known system daemon (over 150 entries per second), even when idle, resulting in dozens of `0.0` values (`app.agetty_fds_open: 0.0`, `app.tuned_cpu_utilization: 0.0`).
 - **Impact:** PostgreSQL storage accumulates tens of thousands of rows of mostly zero-filled JSON blobs, causing rapid database bloat without providing operational signal.
-- **Solution:** Implement filtering in `services/metrics.py`:
-  - Filter out zero/null dimensions for inactive processes.
-  - Sort and extract **Top-N CPU Consumers** and **Top-N Memory Consumers** (e.g., top 10 processes) rather than storing 150 idle background tasks.
+- **Status:** `services/metrics.py` filters zero/null dimensions for inactive
+  processes and sorts the remaining data into Top-N CPU and memory consumers.
 
 ### 3. Lack of Structured, Queryable Typed Fields
-- **Observation:** `metric_snapshots` currently stores telemetry exclusively as unstructured `data (jsonb)`.
-- **Impact:** Querying time-series trends (e.g., "Give me CPU utilization > 80% over the last hour") requires expensive JSONB parsing operations across all rows.
-- **Solution:** Introduce a structured normalization layer ("Structured Metrics Logger"):
-  - Promote key high-cardinality metrics to indexed, typed columns (e.g., `cpu_utilization FLOAT`, `ram_used_mb FLOAT`, `ram_total_mb FLOAT`, `load_1m FLOAT`, `swap_used_mb FLOAT`, `net_rx_kbps FLOAT`, `net_tx_kbps FLOAT`).
-  - Store detailed process breakdowns as a clean, structured JSON array:
+- **Status:** `metric_snapshots` now promotes `cpu_pct`, `ram_used_mb`,
+  `ram_total_mb`, `load_avg`, and `swap_used_mb` to typed columns and stores
+  `top_processes` as a structured JSON array. It retains cleaned `data` JSONB
+  for compatibility. The SQL migration is safe to rerun against an existing
+  database volume.
+  - Example `top_processes` value:
     ```json
     "top_processes": [
       {"name": "firefox", "cpu_pct": 0.50, "mem_mb": 3656.9},
@@ -102,39 +114,45 @@ During multi-node verification, three key structural issues were identified in t
 
 ---
 
-## 5. Next Session Action Plan
+## 5. API-v3 Rules That Must Not Regress
 
-In the upcoming session, work will focus on refactoring the ingestion pipeline for database protection, structured querying, and automated agent root-cause analysis:
+Netdata API-v3 is permissive and can return plausible but incorrect data for
+bad requests. Treat these as integration invariants:
 
-### Phase 1: Ingestion Normalizer & Structured Metrics Logger
-1. **Create `backend/integrations/netdata/normalizer.py`**:
-   - `strip_machine_guid(key: str) -> str`: Normalizes `metric@guid` $\rightarrow$ `metric`.
-   - `filter_active_metrics(data: dict) -> dict`: Discards inactive 0.0 entries.
-   - `extract_top_processes(process_data: dict, top_n: int = 10) -> List[dict]`: Groups CPU and memory usage by process name and outputs the top consumers.
-2. **Schema Upgrade for `metric_snapshots`**:
-   - Add first-class typed columns to `metric_snapshots`:
-     - `cpu_pct` (Double Precision / Float)
-     - `ram_used_mb` (Double Precision / Float)
-     - `ram_total_mb` (Double Precision / Float)
-     - `load_avg` (Double Precision / Float)
-     - `swap_used_mb` (Double Precision / Float)
-   - Add B-Tree indexes on `(node_id, category, collected_at)` and `(cpu_pct)`.
-3. **Update `MetricsService.collect_and_persist`**:
-   - Apply the normalizer before persisting to PostgreSQL.
-   - Store clean, queryable payloads in both the typed columns and cleaned JSONB.
+| Area | Correct request/interpretation | Silent failure |
+|---|---|---|
+| Data selection | `contexts=system.cpu,...` | `chart=` may be ignored and query all contexts |
+| Fresh-agent window | `after=-60` or another explicit recent window | The default window can predate startup and return no rows |
+| Per-instance data | `group_by=instance` for NICs, mounts, processes, containers | Missing grouping aggregates instances |
+| Payload format | `format=json2` | Values are triples, not scalars |
+| Response location | Read `.result.labels` and `.result.data` | Top-level `.data` gives false emptiness |
+| Anomaly scores | `/api/v3/weights?...&method=anomaly-rate` | Other method names can select another calculation |
+| Alert definitions | `/api/v1/alarms?all` | `/api/v1/alerts` is not the endpoint; bare `all` matters |
+| Current alerts | POST `/api/v3/alerts` with an `options` array | A healthy host can return only `api`, `nodes`, and `timings` |
+| Alert configuration | GET `/api/v3/alert_config?config=<hash>` | The configuration hash is required |
+| Alert history | POST `/api/v3/alert_transitions` with `after` | Do not infer history from current firing alerts |
 
-### Phase 2: Autonomous Investigation Agent (LangGraph)
+An empty current-alert result does not prove that health monitoring is down.
+Confirm the envelope, v3 health capability, and (when needed) v1 alarm
+definitions before reporting a health failure.
+
+## 6. Next Steps
+
+The normalizer and typed persistence path are implemented. Remaining work is
+operational hardening and the planned investigation workflow:
+
+### Phase 1: Autonomous Investigation Agent (LangGraph)
 1. Wire `backend/workers/agent_tasks.py`:
    - Trigger LangGraph diagnostic workflows whenever an anomaly is flagged or an alert is received with `triggered_agent == True`.
    - Pass normalized metrics from the new structured schema into the prompt/context for root-cause analysis.
    - Write investigation results into the `agent_investigations` table.
 
-### Phase 3: Database Retention & Performance
+### Phase 2: Database Retention & Performance
 1. Implement metric aggregation (rollups) or snapshot pruning to keep database storage lightweight and performant.
 
 ---
 
-## 6. Verification Commands Quick Reference
+## 7. Verification Commands Quick Reference
 
 ```bash
 # Check running containers:
@@ -148,6 +166,14 @@ docker exec palantir-postgres psql -U palantir -d palantir -c \
 docker exec palantir-postgres psql -U palantir -d palantir -c \
   "SELECT node_id, category, count(*), max(collected_at) FROM metric_snapshots GROUP BY node_id, category ORDER BY node_id;"
 
+# Apply an idempotent schema migration to an existing database:
+docker exec -i palantir-postgres psql -v ON_ERROR_STOP=1 \
+  -U palantir -d palantir < sql/init.sql
+
+# Verify a live Netdata endpoint:
+NETDATA_URL=http://localhost:19999 \
+  ./backend/venv/bin/python backend/scripts/verify_live.py
+
 # Run the central platform registration utility:
 ./scripts/register-node.sh --help
 ./scripts/register-node.sh --local
@@ -156,5 +182,23 @@ docker exec palantir-postgres psql -U palantir -d palantir -c \
 docker logs --tail 30 -f palantir-celery-worker
 
 # Run full backend test suite:
-docker exec palantir-backend pytest -v
+cd backend && ./venv/bin/pytest -q
+docker exec palantir-backend pytest -q
 ```
+
+The current suite contains 58 tests covering normalizer behavior, API
+contracts, JSON2 parsing, typed persistence, security validation, workers, and
+webhook handling. Record the exact pass count from the command output rather
+than copying a historical count into future handoffs.
+
+## 8. Live Host Facts Verified During This Session
+
+The available local agent responded at `http://localhost:19999` with Netdata
+`v2.11.1`, machine GUID `87f56850-57c0-43b7-a6e2-13c37aaaa009`, and 261
+available v3 contexts. Host RAM was exposed in bytes through v3 hardware and
+v1 `ram_total`/`_system_ram_total`. Current alerts returned the expected
+`api`/`nodes`/`timings` envelope with no firing instances, and anomaly weights
+echoed `method: anomaly-rate`.
+
+These are observations of the current local host, not constants for remote
+nodes. Always rerun the verifier for another endpoint.
