@@ -2,9 +2,9 @@ name: PALANTIR CI/CD Pipeline
 
 on:
   push:
-    branches: [ "main", "initial_project" ]
+    branches: [ "main", "initial_project" , "telemetry_pipeline" ]
   pull_request:
-    branches: [ "main", "initial_project" ]
+    branches: [ "main", "initial_project" ,  "telemetry_pipeline" ]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
