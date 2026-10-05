@@ -66,6 +66,41 @@ docker compose up -d --build
 curl -s http://localhost:8000/healthz | python3 -m json.tool
 ```
 
+### Test the published images on another machine
+
+GitHub Actions publishes the backend, Netdata, and host collector images to
+Docker Hub and GitHub Container Registry after the unit and Docker smoke tests
+pass. The central stack uses Docker Hub images by default. To pull those images
+on a test machine, clone this repository for its Compose files and SQL schema,
+then prepare a private environment file:
+
+```bash
+git clone https://github.com/abdullah-farooqi/PALANTIR.git
+cd PALANTIR
+cp .env.example .env
+chmod 600 .env
+```
+
+Set the required database passwords, webhook secret, API tokens, and Authentik
+secret in `.env`. Generate a separate value for each with `openssl rand -hex
+32`. Set `PALANTIR_LAN_BIND_IP` to the test machine's LAN address if other
+machines need to reach it. Keep `.env` on that machine and out of GitHub.
+
+To use the published images rather than rebuilding or mounting source code,
+run:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.images.yml pull
+docker compose -f docker-compose.yml -f docker-compose.images.yml up -d --no-build
+```
+
+Docker Hub images can be pulled without logging in when their repositories are
+public. For private repositories, run `docker login` with a Docker Hub access
+token. The GitHub Actions publish job uses the repository's `DOCKERHUB_TOKEN`
+secret for Docker Hub and its built-in `GITHUB_TOKEN` for GitHub Container
+Registry. These registry credentials are separate from the runtime values in
+`.env`.
+
 On boot, the backend probes the configured Netdata endpoint, discovers the contexts available on that host, and registers `local-node` into PostgreSQL. Context counts are host-specific and must not be hard-coded.
 
 ### API access

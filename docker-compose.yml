@@ -37,7 +37,7 @@ services:
     build:
       context: ./services/netdata
       dockerfile: Dockerfile
-    image: palantir-netdata:latest
+    image: ${PALANTIR_NETDATA_IMAGE:-abdullahahmadfarooqi/palantir-netdata:latest}
     container_name: palantir-netdata
     hostname: local-node
     restart: unless-stopped
@@ -70,7 +70,7 @@ services:
       context: ./backend
       dockerfile: Dockerfile
       network: host
-    image: ${PALANTIR_BACKEND_IMAGE:-palantir-backend:latest}
+    image: ${PALANTIR_BACKEND_IMAGE:-abdullahahmadfarooqi/palantir-backend:latest}
     container_name: palantir-backend
     restart: unless-stopped
     extra_hosts:

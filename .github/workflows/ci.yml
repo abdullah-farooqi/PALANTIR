@@ -73,6 +73,9 @@ jobs:
     name: Docker Stack Build & Smoke Test
     runs-on: ubuntu-latest
     needs: unit-tests
+    permissions:
+      contents: read
+      packages: write
     # Disposable credentials for the throwaway Compose stack. These override
     # the intentionally blank values in .env.example and are not production secrets.
     env:
@@ -95,6 +98,9 @@ jobs:
 
       - name: Build Docker Stack
         run: docker compose build
+
+      - name: Build host collector image
+        run: docker build -t palantir-host-collector:latest ./agent
 
       - name: Start Docker Stack in Background
         run: docker compose up -d
@@ -127,6 +133,47 @@ jobs:
       - name: Run Full Pytest Suite in Live Stack
         run: |
           docker compose exec -T backend pytest tests/ -v
+
+      - name: Log in to Docker Hub
+        if: github.event_name == 'push' && github.ref == 'refs/heads/telemetry_pipeline'
+        uses: docker/login-action@v3
+        with:
+          username: abdullahahmadfarooqi
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Log in to GitHub Container Registry
+        if: github.event_name == 'push' && github.ref == 'refs/heads/telemetry_pipeline'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish images to Docker Hub and GitHub Container Registry
+        if: github.event_name == 'push' && github.ref == 'refs/heads/telemetry_pipeline'
+        env:
+          DOCKERHUB_NAMESPACE: abdullahahmadfarooqi
+          GHCR_NAMESPACE: ghcr.io/abdullah-farooqi
+          IMAGE_TAG: sha-${{ github.sha }}
+        run: |
+          set -euo pipefail
+          images=(palantir-backend palantir-netdata palantir-host-collector)
+          docker tag palantir-host-collector:latest "$DOCKERHUB_NAMESPACE/palantir-host-collector:latest"
+
+          for image in "${images[@]}"; do
+            docker tag "$DOCKERHUB_NAMESPACE/$image:latest" "$DOCKERHUB_NAMESPACE/$image:telemetry_pipeline"
+            docker tag "$DOCKERHUB_NAMESPACE/$image:latest" "$DOCKERHUB_NAMESPACE/$image:$IMAGE_TAG"
+            docker tag "$DOCKERHUB_NAMESPACE/$image:latest" "$GHCR_NAMESPACE/$image:latest"
+            docker tag "$DOCKERHUB_NAMESPACE/$image:latest" "$GHCR_NAMESPACE/$image:telemetry_pipeline"
+            docker tag "$DOCKERHUB_NAMESPACE/$image:latest" "$GHCR_NAMESPACE/$image:$IMAGE_TAG"
+
+            docker push "$DOCKERHUB_NAMESPACE/$image:latest"
+            docker push "$DOCKERHUB_NAMESPACE/$image:telemetry_pipeline"
+            docker push "$DOCKERHUB_NAMESPACE/$image:$IMAGE_TAG"
+            docker push "$GHCR_NAMESPACE/$image:latest"
+            docker push "$GHCR_NAMESPACE/$image:telemetry_pipeline"
+            docker push "$GHCR_NAMESPACE/$image:$IMAGE_TAG"
+          done
 
       - name: Container Logs on Failure
         if: failure()

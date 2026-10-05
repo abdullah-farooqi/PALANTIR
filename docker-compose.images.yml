@@ -1,0 +1,17 @@
+# Run published images instead of rebuilding from source or mounting the
+# checked-out backend over the image. Requires Docker Compose v2.24 or newer.
+services:
+  netdata:
+    build: !reset null
+
+  backend:
+    build: !reset null
+    volumes: !reset []
+
+  celery_worker:
+    build: !reset null
+    volumes: !reset []
+
+  celery_beat:
+    build: !reset null
+    volumes: !reset []
