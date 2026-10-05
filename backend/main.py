@@ -1,9 +1,10 @@
 import asyncio
 import logging
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from core.config import settings
+from core.api_auth import require_read
 from core.database import AsyncSessionLocal
 from services.nodes import NodeService
 from api.v1.nodes import router as nodes_router
@@ -11,6 +12,12 @@ from api.v1.metrics import router as metrics_router
 from api.v1.alerts import router as alerts_router
 from api.v1.investigations import router as investigations_router
 from api.v1.internal import router as internal_router
+from api.v1.logs import router as logs_router
+from api.v1.fleet import router as fleet_router
+from api.v1.events import router as events_router
+from api.v1.catalog import router as metric_catalog_router
+from api.v1.fleet_logs import router as fleet_logs_router
+from api.v1.health import router as operational_health_router
 
 logging.basicConfig(
     level=logging.INFO,
@@ -70,10 +77,10 @@ app = FastAPI(
 # CORS configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=settings.cors_origins,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 # Health endpoint
@@ -86,6 +93,16 @@ app.include_router(internal_router, prefix="/internal", tags=["Internal Webhooks
 
 # Public API v1 routers
 app.include_router(nodes_router, prefix=settings.API_V1_STR)
-app.include_router(metrics_router, prefix=settings.API_V1_STR)
-app.include_router(alerts_router, prefix=settings.API_V1_STR)
-app.include_router(investigations_router, prefix=settings.API_V1_STR)
+app.include_router(metrics_router, prefix=settings.API_V1_STR, dependencies=[Depends(require_read)])
+app.include_router(logs_router, prefix=settings.API_V1_STR, dependencies=[Depends(require_read)])
+app.include_router(alerts_router, prefix=settings.API_V1_STR, dependencies=[Depends(require_read)])
+app.include_router(fleet_router, prefix=settings.API_V1_STR, dependencies=[Depends(require_read)])
+app.include_router(events_router, prefix=settings.API_V1_STR, dependencies=[Depends(require_read)])
+app.include_router(fleet_logs_router, prefix=settings.API_V1_STR, dependencies=[Depends(require_read)])
+app.include_router(operational_health_router, prefix=settings.API_V1_STR, dependencies=[Depends(require_read)])
+app.include_router(metric_catalog_router, prefix=settings.API_V1_STR)
+app.include_router(
+    investigations_router,
+    prefix=settings.API_V1_STR,
+    dependencies=[Depends(require_read)],
+)

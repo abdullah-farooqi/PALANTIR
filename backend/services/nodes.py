@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from core.security import validate_netdata_url
 from integrations.netdata.client import NetdataClient
 from integrations.netdata.exceptions import NetdataUnavailable
+from integrations.agent.client import AgentCollectorClient
 from models.node import MonitoredNode
 
 logger = logging.getLogger(__name__)
@@ -18,9 +19,20 @@ class NodeService:
         netdata_url: str,
         os_type: str,
         session: AsyncSession,
+        collector_url: Optional[str] = None,
     ) -> MonitoredNode:
         netdata_url = validate_netdata_url(netdata_url)
         client = NetdataClient(base_url=netdata_url)
+        capabilities = None
+        if collector_url:
+            collector_url = validate_netdata_url(collector_url)
+            try:
+                collector = AgentCollectorClient(collector_url)
+                await collector.info()
+                capabilities = await collector.capabilities()
+            except Exception as exc:
+                logger.warning("Host collector unavailable during enrollment for %s: %s", hostname, exc)
+                capabilities = {"status": "unavailable", "reason": str(exc)[:300]}
         
         # Probe connectivity
         await client.info()
@@ -48,6 +60,9 @@ class NodeService:
 
         if existing:
             existing.netdata_url = netdata_url
+            if collector_url is not None:
+                existing.collector_url = collector_url
+                existing.capabilities = capabilities
             existing.os_type = os_type
             existing.active = True
             existing.context_count = context_count
@@ -60,6 +75,8 @@ class NodeService:
         node = MonitoredNode(
             hostname=hostname,
             netdata_url=netdata_url,
+            collector_url=collector_url,
+            capabilities=capabilities,
             os_type=os_type,
             active=True,
             context_count=context_count,

@@ -45,5 +45,8 @@ async def receive_alert(
     if not event:
         return {"status": "ignored", "reason": "unregistered node or invalid payload"}
 
-    return {"status": "received", "event_id": event.id}
-
+    return {
+        "status": "received",
+        "event_id": event.id,
+        "investigation_id": event.investigation_id,
+    }

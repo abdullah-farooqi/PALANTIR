@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 from sqlalchemy import Column, Integer, String, Boolean, DateTime
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship
 from .base import Base
 
@@ -10,6 +11,8 @@ class MonitoredNode(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     hostname = Column(String, nullable=False, unique=True)
     netdata_url = Column(String, nullable=False)
+    collector_url = Column(String, nullable=True)
+    capabilities = Column(JSONB, nullable=True)
     os_type = Column(String, nullable=False, default="linux")
     active = Column(Boolean, nullable=False, default=True)
     context_count = Column(Integer, nullable=True)
@@ -23,8 +26,8 @@ class MonitoredNode(Base):
         DateTime(timezone=True),
         nullable=False,
         default=lambda: datetime.now(timezone.utc),
-        onupdate=lambda: datetime.now(timezone.utc),
     )
+    last_collection_at = Column(DateTime(timezone=True), nullable=True)
 
     # Relationships
     snapshots = relationship("MetricSnapshot", back_populates="node", cascade="all, delete-orphan")

@@ -1,17 +1,21 @@
 # ─────────────────────────────────────────────────────────────────────
 # PALANTIR — Remote Endpoint / Child Agent Deployment
-# Run this file on any remote VM, server, or cloud instance to stream
-# telemetry and push alerts to the central PALANTIR server.
+# Run this file on a remote Linux host to deploy Netdata plus the PALANTIR
+# host collector and register both endpoints with the central server.
 #
 # Usage:
-#   PALANTIR_SERVER_URL=http://<PARENT_IP>:8000 \
+#   PALANTIR_SERVER_URL=https://<PALANTIR_PROXY_HOST> \
+#   PALANTIR_WEBHOOK_SECRET=<CENTRAL_WEBHOOK_SECRET> \
+#   PALANTIR_API_ENROLL_TOKEN=<RESTRICTED_ENROLLMENT_TOKEN> \
+#   PALANTIR_CA_CERT=/etc/ssl/certs/palantir-central-ca.crt \
 #   NODE_ADVERTISED_URL=http://<CHILD_IP>:19999 \
+#   COLLECTOR_ADVERTISED_URL=http://<CHILD_IP>:20000 \
 #   docker compose -f docker-compose.agent.yml up -d
 # ─────────────────────────────────────────────────────────────────────
 
 services:
   sensor:
-    image: ${PALANTIR_NETDATA_IMAGE:-palantir-netdata:latest}
+    image: ${PALANTIR_NETDATA_IMAGE:-abdullahahmadfarooqi/palantir-netdata:latest}
     container_name: palantir-agent-sensor
     hostname: ${NODE_HOSTNAME:-remote-node}
     restart: unless-stopped
@@ -26,41 +30,129 @@ services:
     volumes:
       - netdata_agent_lib:/usr/local/var/lib/netdata
       - netdata_agent_cache:/usr/local/var/cache/netdata
+      - ./central-ca.crt:/etc/ssl/certs/palantir-central-ca.crt:ro
     environment:
       - PALANTIR_WEBHOOK_URL=${PALANTIR_SERVER_URL:-http://localhost:8000}/internal/alert
-      - PALANTIR_WEBHOOK_SECRET=${PALANTIR_WEBHOOK_SECRET:-palantir-super-secret-key-change-me}
+      - PALANTIR_WEBHOOK_SECRET=${PALANTIR_WEBHOOK_SECRET:?Set the same webhook secret configured on the central server}
+      - PALANTIR_CA_CERT=${PALANTIR_CA_CERT:-}
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://127.0.0.1:19999/api/v1/info || exit 1"]
       interval: 5s
       timeout: 5s
       retries: 6
 
+  collector:
+    image: ${PALANTIR_COLLECTOR_IMAGE:-abdullahahmadfarooqi/palantir-host-collector:latest}
+    container_name: palantir-agent-collector
+    hostname: ${NODE_HOSTNAME:-remote-node}
+    restart: unless-stopped
+    pid: host
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_add:
+      - SYS_PTRACE
+      - SYS_ADMIN
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      - "${COLLECTOR_PORT:-20000}:20000"
+    volumes:
+      - type: bind
+        source: /proc
+        target: /host/proc
+        read_only: true
+      - type: bind
+        source: /sys
+        target: /host/sys
+        read_only: true
+      - type: bind
+        source: /
+        target: /host
+        read_only: true
+        bind:
+          propagation: rslave
+      - type: bind
+        source: /run
+        target: /host/run
+        read_only: true
+      - type: bind
+        source: /var/log
+        target: /host/var/log
+        read_only: true
+      - agent_collector_state:/var/lib/palantir-agent
+    environment:
+      - HOST_PROC=/host/proc
+      - HOST_SYS=/host/sys
+      - HOST_ROOT=/host
+      - HOST_LOG=/host/var/log
+      - HOME=/tmp
+      - DOCKER_SOCKET=/host/run/docker.sock
+      - APP_LOG_GLOBS=${APP_LOG_GLOBS:-/host/var/log/**/*.log,/host/var/log/syslog,/host/var/log/messages,/host/var/log/auth.log}
+      - PALANTIR_AGENT_TOKEN=${PALANTIR_AGENT_TOKEN:-}
+      - LOG_MIN_PRIORITY=${LOG_MIN_PRIORITY:-7}
+      - KUBERNETES_API_URL=${KUBERNETES_API_URL:-}
+      - KUBERNETES_TOKEN=${KUBERNETES_TOKEN:-}
+      - KUBERNETES_CA_CERT=${KUBERNETES_CA_CERT:-}
+      - PROXMOX_API_URL=${PROXMOX_API_URL:-}
+      - PROXMOX_API_TOKEN=${PROXMOX_API_TOKEN:-}
+      - PROXMOX_CA_CERT=${PROXMOX_CA_CERT:-}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:20000/healthz', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
   # One-shot auto-registration sidecar
   enroller:
     image: curlimages/curl:latest
     container_name: palantir-agent-enroller
-    restart: "no"
+    restart: on-failure
     depends_on:
       sensor:
+        condition: service_healthy
+      collector:
         condition: service_healthy
     environment:
       - PALANTIR_SERVER_URL=${PALANTIR_SERVER_URL:-http://localhost:8000}
       - NODE_HOSTNAME=${NODE_HOSTNAME:-remote-node}
       - NODE_ADVERTISED_URL=${NODE_ADVERTISED_URL:-http://localhost:19999}
+      - COLLECTOR_ADVERTISED_URL=${COLLECTOR_ADVERTISED_URL:-http://localhost:20000}
       - OS_TYPE=${OS_TYPE:-linux}
+      - PALANTIR_API_ENROLL_TOKEN=${PALANTIR_API_ENROLL_TOKEN:-}
+      - PALANTIR_CA_CERT=${PALANTIR_CA_CERT:-}
+    volumes:
+      - ./central-ca.crt:/etc/ssl/certs/palantir-central-ca.crt:ro
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
+        if [ -z "$$PALANTIR_API_ENROLL_TOKEN" ]; then
+          echo "[ENROLLER] No enrollment token configured; skipping automatic registration."
+          echo "[ENROLLER] The node can be registered later by a PALANTIR admin."
+          exit 0
+        fi
         echo "[ENROLLER] Probing Netdata sensor readiness..."
         until curl -sf "http://sensor:19999/api/v1/info" >/dev/null 2>&1; do
           sleep 2
         done
-        echo "[ENROLLER] Netdata sensor is ready."
-        echo "[ENROLLER] Registering node '$$NODE_HOSTNAME' ($$NODE_ADVERTISED_URL) with PALANTIR at $$PALANTIR_SERVER_URL..."
+        until curl -sf "http://collector:20000/healthz" >/dev/null 2>&1; do
+          sleep 2
+        done
+        case "$$PALANTIR_SERVER_URL" in
+          https://*) ;;
+          *) echo "[ENROLLER] HTTPS is required when sending the enrollment token."; exit 1 ;;
+        esac
+        echo "[ENROLLER] Netdata and host collector are ready."
+        echo "[ENROLLER] Registering node '$$NODE_HOSTNAME' with PALANTIR at $$PALANTIR_SERVER_URL..."
+        CURL_CA_ARGS=""
+        if [ -n "$$PALANTIR_CA_CERT" ]; then
+          CURL_CA_ARGS="--cacert $$PALANTIR_CA_CERT"
+        fi
         
-        HTTP_RESPONSE=$$(curl -s -w "\nHTTP_STATUS:%{http_code}" -X POST "$$PALANTIR_SERVER_URL/api/v1/nodes" \
+        HTTP_RESPONSE=$$(curl $$CURL_CA_ARGS -s -w "\nHTTP_STATUS:%{http_code}" -X POST "$$PALANTIR_SERVER_URL/api/v1/nodes" \
+          -H "Authorization: Bearer $$PALANTIR_API_ENROLL_TOKEN" \
           -H "Content-Type: application/json" \
-          -d "{\"hostname\":\"$$NODE_HOSTNAME\",\"netdata_url\":\"$$NODE_ADVERTISED_URL\",\"os_type\":\"$$OS_TYPE\"}")
+          -d "{\"hostname\":\"$$NODE_HOSTNAME\",\"netdata_url\":\"$$NODE_ADVERTISED_URL\",\"collector_url\":\"$$COLLECTOR_ADVERTISED_URL\",\"os_type\":\"$$OS_TYPE\"}")
         
         STATUS_CODE=$$(echo "$$HTTP_RESPONSE" | grep "HTTP_STATUS" | cut -d':' -f2)
         BODY=$$(echo "$$HTTP_RESPONSE" | sed '/HTTP_STATUS/d')
@@ -77,3 +169,4 @@ services:
 volumes:
   netdata_agent_lib:
   netdata_agent_cache:
+  agent_collector_state:

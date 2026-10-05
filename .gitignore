@@ -19,8 +19,13 @@ htmlcov/
 # Environment & Secrets (Keep .env.example tracked)
 .env
 .env.local
+.env.*
 .env.*.local
 !.env.example
+
+# Per-installation private CA certificates (the CA root is generated locally)
+central-ca.crt
+caddy-root.crt
 
 # Celery
 celerybeat-schedule

@@ -17,6 +17,7 @@ PALANTIR_URL=""
 HOSTNAME_VAL="$(hostname -s 2>/dev/null || echo "remote-node")"
 NETDATA_URL=""
 OS_TYPE="linux"
+API_TOKEN="${PALANTIR_API_ENROLL_TOKEN:-${PALANTIR_API_ADMIN_TOKEN:-}}"
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -49,6 +50,10 @@ done
 
 if [ -z "$PALANTIR_URL" ]; then
   echo "Error: --palantir-url is required (e.g., --palantir-url http://192.168.1.100:8000)"
+  exit 1
+fi
+if [ -n "$API_TOKEN" ] && [[ "$PALANTIR_URL" != https://* ]]; then
+  echo "Error: use an HTTPS PALANTIR URL when sending an API token."
   exit 1
 fi
 
@@ -86,7 +91,16 @@ PAYLOAD=$(cat <<EOF
 EOF
 )
 
-RESPONSE=$(curl -s -w "\nHTTP_STATUS:%{http_code}" -X POST "${PALANTIR_URL}/api/v1/nodes" \
+AUTH_HEADER=()
+if [ -n "$API_TOKEN" ]; then
+  AUTH_HEADER=(-H "Authorization: Bearer ${API_TOKEN}")
+fi
+SERVER_CA_ARGS=()
+if [ -n "${PALANTIR_CA_CERT:-}" ]; then
+  SERVER_CA_ARGS=(--cacert "$PALANTIR_CA_CERT")
+fi
+RESPONSE=$(curl "${SERVER_CA_ARGS[@]}" -s -w "\nHTTP_STATUS:%{http_code}" -X POST "${PALANTIR_URL}/api/v1/nodes" \
+  "${AUTH_HEADER[@]}" \
   -H "Content-Type: application/json" \
   -d "$PAYLOAD")
 

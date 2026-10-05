@@ -34,9 +34,11 @@ RED='\033[0;31m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-SERVER_URL="${PALANTIR_SERVER_URL:-http://localhost:8000}"
+SERVER_URL="${PALANTIR_SERVER_URL:-http://127.0.0.1:8000}"
+API_TOKEN="${PALANTIR_API_ADMIN_TOKEN:-${PALANTIR_API_ENROLL_TOKEN:-}}"
 TARGET_HOST=""
 TARGET_PORT="19999"
+COLLECTOR_PORT="20000"
 CUSTOM_HOSTNAME=""
 OS_TYPE="linux"
 IS_LOCAL=false
@@ -52,7 +54,8 @@ show_help() {
   echo "  --local             Automatically detect and register the local central machine"
   echo "  --target <HOST/IP>  Target endpoint IP or hostname running Netdata"
   echo "  --port <PORT>       Netdata sensor port (default: 19999)"
-  echo "  --server <URL>      PALANTIR server URL (default: http://localhost:8000 or \$PALANTIR_SERVER_URL)"
+  echo "  --collector-port <PORT> PALANTIR collector port (default: 20000)"
+  echo "  --server <URL>      PALANTIR server URL (default: http://127.0.0.1:8000 or \$PALANTIR_SERVER_URL)"
   echo "  --hostname <NAME>   Override auto-detected hostname"
   echo "  --os <OS>           Operating system type: linux, windows (default: linux)"
   echo "  -h, --help          Show this help message"
@@ -78,6 +81,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --port)
       TARGET_PORT="$2"
+      shift 2
+      ;;
+    --collector-port)
+      COLLECTOR_PORT="$2"
       shift 2
       ;;
     --server)
@@ -108,6 +115,20 @@ while [[ $# -gt 0 ]]; do
 done
 
 SERVER_URL="${SERVER_URL%/}"
+SERVER_HOST_PART="${SERVER_URL#*://}"
+SERVER_HOST_PART="${SERVER_HOST_PART%%/*}"
+IS_LOOPBACK_HTTP=false
+case "$SERVER_HOST_PART" in
+  localhost|localhost:*|127.0.0.1|127.0.0.1:*|\[::1\]|\[::1\]:*)
+    if [[ "$SERVER_URL" == http://* ]]; then
+      IS_LOOPBACK_HTTP=true
+    fi
+    ;;
+esac
+if [ -n "$API_TOKEN" ] && [[ "$SERVER_URL" != https://* ]] && [ "$IS_LOOPBACK_HTTP" != true ]; then
+  echo -e "${RED}[ERROR] Use an HTTPS PALANTIR server URL when sending an API token.${NC}"
+  exit 1
+fi
 
 echo -e "${BLUE}==========================================================${NC}"
 echo -e "${BLUE}${BOLD}        PALANTIR Central Platform Node Enroller          ${NC}"
@@ -142,11 +163,14 @@ if [ "$IS_LOCAL" = true ] || [ -z "$TARGET_HOST" ]; then
                      ip -4 route get 8.8.8.8 2>/dev/null | grep -oP 'src \K\S+' || \
                      hostname -I 2>/dev/null | awk '{print $1}' || echo "127.0.0.1")
 
-  # When PALANTIR backend runs inside Docker, it connects to host services via LAN IP or docker service name 'netdata'
-  if curl -sf --connect-timeout 2 "http://netdata:${TARGET_PORT}/api/v1/info" >/dev/null 2>&1; then
+  # Probe the host-published loopback port, but give the backend the Compose
+  # service DNS name so its container can reach Netdata without a host port.
+  SENSOR_PROBE_URL="http://127.0.0.1:${TARGET_PORT}"
+  if curl -sf --connect-timeout 2 "${SENSOR_PROBE_URL}/api/v1/info" >/dev/null 2>&1; then
     FINAL_SENSOR_URL="http://netdata:${TARGET_PORT}"
   else
     FINAL_SENSOR_URL="http://${PRIMARY_LOCAL_IP}:${TARGET_PORT}"
+    SENSOR_PROBE_URL="$FINAL_SENSOR_URL"
   fi
   DEFAULT_NAME="$(hostname -s 2>/dev/null || echo "central-server")"
 else
@@ -158,12 +182,28 @@ else
   fi
 
   FINAL_SENSOR_URL="http://${TARGET_HOST}:${TARGET_PORT}"
+  SENSOR_PROBE_URL="$FINAL_SENSOR_URL"
   DEFAULT_NAME="$TARGET_HOST"
 fi
 
+if [ "$IS_LOCAL" = true ]; then
+  PROBE_COLLECTOR_URL="http://127.0.0.1:${COLLECTOR_PORT}"
+  CANDIDATE_COLLECTOR_URL="http://host.docker.internal:${COLLECTOR_PORT}"
+else
+  PROBE_COLLECTOR_URL="http://${TARGET_HOST}:${COLLECTOR_PORT}"
+  CANDIDATE_COLLECTOR_URL="http://${TARGET_HOST}:${COLLECTOR_PORT}"
+fi
+FINAL_COLLECTOR_URL=""
+if curl -sf --connect-timeout 2 "${PROBE_COLLECTOR_URL}/healthz" >/dev/null 2>&1; then
+  FINAL_COLLECTOR_URL="$CANDIDATE_COLLECTOR_URL"
+  echo -e "${GREEN}[OK] PALANTIR host collector reachable at ${FINAL_COLLECTOR_URL}.${NC}"
+else
+  echo -e "${YELLOW}[INFO] No PALANTIR host collector found; registering the Netdata endpoint only.${NC}"
+fi
+
 # Step 3: Probe Sensor and Fetch Remote Metadata
-echo -e "${YELLOW}[3/4] Probing sensor at ${FINAL_SENSOR_URL}/api/v1/info...${NC}"
-SENSOR_INFO=$(curl -sf --connect-timeout 4 --max-time 6 "${FINAL_SENSOR_URL}/api/v1/info" 2>/dev/null || true)
+echo -e "${YELLOW}[3/4] Probing sensor at ${SENSOR_PROBE_URL}/api/v1/info...${NC}"
+SENSOR_INFO=$(curl -sf --connect-timeout 4 --max-time 6 "${SENSOR_PROBE_URL}/api/v1/info" 2>/dev/null || true)
 
 DETECTED_NAME=""
 DETECTED_OS=""
@@ -214,7 +254,18 @@ echo ""
 # Step 4: Register with Central PALANTIR Database
 echo -e "${YELLOW}[4/4] Submitting node enrollment to PALANTIR API...${NC}"
 
-PAYLOAD=$(cat <<EOF
+if [ -n "$FINAL_COLLECTOR_URL" ]; then
+  PAYLOAD=$(cat <<EOF
+{
+  "hostname": "$NODE_NAME",
+  "netdata_url": "$FINAL_SENSOR_URL",
+  "collector_url": "$FINAL_COLLECTOR_URL",
+  "os_type": "$FINAL_OS"
+}
+EOF
+)
+else
+  PAYLOAD=$(cat <<EOF
 {
   "hostname": "$NODE_NAME",
   "netdata_url": "$FINAL_SENSOR_URL",
@@ -222,8 +273,14 @@ PAYLOAD=$(cat <<EOF
 }
 EOF
 )
+fi
 
+AUTH_HEADER=()
+if [ -n "$API_TOKEN" ]; then
+  AUTH_HEADER=(-H "Authorization: Bearer ${API_TOKEN}")
+fi
 RESPONSE=$(curl -s -w "\nHTTP_STATUS:%{http_code}" -X POST "${SERVER_URL}/api/v1/nodes" \
+  "${AUTH_HEADER[@]}" \
   -H "Content-Type: application/json" \
   -d "$PAYLOAD")
 
@@ -237,9 +294,9 @@ if [ "$HTTP_STATUS" -eq 201 ]; then
   echo -e "${GREEN}Telemetry ingestion will automatically begin within 60 seconds.${NC}"
   exit 0
 elif [ "$HTTP_STATUS" -eq 409 ]; then
-  echo -e "${YELLOW}[NOTICE] Node '${NODE_NAME}' or URL '${FINAL_SENSOR_URL}' is already registered.${NC}"
+  echo -e "${RED}[ERROR] Registration conflicted with an existing node or URL.${NC}"
   echo -e "Response: ${BODY}"
-  exit 0
+  exit 1
 else
   echo -e "${RED}[ERROR] Enrollment failed with HTTP Status ${HTTP_STATUS}:${NC}"
   echo -e "$BODY"

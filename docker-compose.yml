@@ -5,15 +5,15 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-palantir}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-palantir}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: ${POSTGRES_DB:-palantir}
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U palantir -d palantir"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-palantir} -d ${POSTGRES_DB:-palantir}"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -22,8 +22,9 @@ services:
     image: redis:7-alpine
     container_name: palantir-redis
     restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     volumes:
       - redis_data:/data
     healthcheck:
@@ -42,7 +43,7 @@ services:
     restart: unless-stopped
     pid: host
     ports:
-      - "19999:19999"
+      - "127.0.0.1:19999:19999"
     cap_add:
       - SYS_PTRACE
       - SYS_ADMIN
@@ -55,7 +56,8 @@ services:
       - netdata_cache:/usr/local/var/cache/netdata
     environment:
       - PALANTIR_WEBHOOK_URL=http://backend:8000/internal/alert
-      - PALANTIR_WEBHOOK_SECRET=${PALANTIR_WEBHOOK_SECRET:-palantir-super-secret-key-change-me}
+      - PALANTIR_WEBHOOK_SECRET=${PALANTIR_WEBHOOK_SECRET:?Set PALANTIR_WEBHOOK_SECRET in .env}
+      - AGENT_AUTH_TOKEN=${AGENT_AUTH_TOKEN:-}
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:19999/api/v1/info"]
       interval: 30s
@@ -83,12 +85,101 @@ services:
     volumes:
       - ./backend:/app
     environment:
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-palantir}:${POSTGRES_PASSWORD:-palantir}@postgres:5432/${POSTGRES_DB:-palantir}
-      SYNC_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-palantir}:${POSTGRES_PASSWORD:-palantir}@postgres:5432/${POSTGRES_DB:-palantir}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-palantir}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-palantir}
+      SYNC_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-palantir}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-palantir}
       REDIS_URL: redis://redis:6379/0
-      PALANTIR_WEBHOOK_SECRET: ${PALANTIR_WEBHOOK_SECRET:-palantir-super-secret-key-change-me}
+      PALANTIR_WEBHOOK_SECRET: ${PALANTIR_WEBHOOK_SECRET:?Set PALANTIR_WEBHOOK_SECRET in .env}
+      PALANTIR_API_READ_TOKEN: ${PALANTIR_API_READ_TOKEN:-}
+      PALANTIR_API_ADMIN_TOKEN: ${PALANTIR_API_ADMIN_TOKEN:-}
+      PALANTIR_API_ENROLL_TOKEN: ${PALANTIR_API_ENROLL_TOKEN:-}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
+      AGENT_AUTH_TOKEN: ${AGENT_AUTH_TOKEN:-}
+      METRICS_RETENTION_HOURS: ${METRICS_RETENTION_HOURS:-24}
+      LOG_RETENTION_DAYS: ${LOG_RETENTION_DAYS:-7}
+      NODE_REACHABLE_SECONDS: ${NODE_REACHABLE_SECONDS:-180}
+      NODE_STALE_SECONDS: ${NODE_STALE_SECONDS:-900}
+      METRIC_STALE_SECONDS: ${METRIC_STALE_SECONDS:-180}
+      WORKER_HEARTBEAT_STALE_SECONDS: ${WORKER_HEARTBEAT_STALE_SECONDS:-180}
     ports:
-      - "8000:8000"
+      # Keep direct host access for local maintenance; LAN clients must use Caddy.
+      - "127.0.0.1:8000:8000"
+
+  authentik-postgres:
+    image: postgres:16-alpine
+    container_name: palantir-authentik-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: authentik
+      POSTGRES_PASSWORD: ${AUTHENTIK_POSTGRES_PASSWORD:?Set AUTHENTIK_POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: authentik
+    volumes:
+      - authentik_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U authentik -d authentik"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  authentik-server:
+    image: ${AUTHENTIK_IMAGE:-ghcr.io/goauthentik/server}:${AUTHENTIK_TAG:-2026.8.3}
+    container_name: palantir-authentik-server
+    command: server
+    restart: unless-stopped
+    depends_on:
+      authentik-postgres:
+        condition: service_healthy
+    environment:
+      AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY:?Set AUTHENTIK_SECRET_KEY in .env}
+      AUTHENTIK_POSTGRESQL__HOST: authentik-postgres
+      AUTHENTIK_POSTGRESQL__USER: authentik
+      AUTHENTIK_POSTGRESQL__NAME: authentik
+      AUTHENTIK_POSTGRESQL__PASSWORD: ${AUTHENTIK_POSTGRES_PASSWORD:?Set AUTHENTIK_POSTGRES_PASSWORD in .env}
+      AUTHENTIK_WEB__BASE_URL: https://auth.palantir.home.arpa
+      AUTHENTIK_ERROR_REPORTING__ENABLED: "false"
+    volumes:
+      - authentik_media:/media
+      - authentik_templates:/templates
+
+  authentik-worker:
+    image: ${AUTHENTIK_IMAGE:-ghcr.io/goauthentik/server}:${AUTHENTIK_TAG:-2026.8.3}
+    container_name: palantir-authentik-worker
+    command: worker
+    restart: unless-stopped
+    depends_on:
+      authentik-postgres:
+        condition: service_healthy
+    environment:
+      AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY:?Set AUTHENTIK_SECRET_KEY in .env}
+      AUTHENTIK_POSTGRESQL__HOST: authentik-postgres
+      AUTHENTIK_POSTGRESQL__USER: authentik
+      AUTHENTIK_POSTGRESQL__NAME: authentik
+      AUTHENTIK_POSTGRESQL__PASSWORD: ${AUTHENTIK_POSTGRES_PASSWORD:?Set AUTHENTIK_POSTGRES_PASSWORD in .env}
+      AUTHENTIK_ERROR_REPORTING__ENABLED: "false"
+    volumes:
+      - authentik_media:/media
+      - authentik_templates:/templates
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: palantir-caddy
+    restart: unless-stopped
+    depends_on:
+      - backend
+      - authentik-server
+    environment:
+      PALANTIR_API_READ_TOKEN: ${PALANTIR_API_READ_TOKEN:?Set PALANTIR_API_READ_TOKEN in .env}
+      PALANTIR_API_ADMIN_TOKEN: ${PALANTIR_API_ADMIN_TOKEN:?Set PALANTIR_API_ADMIN_TOKEN in .env}
+      PALANTIR_API_ENROLL_TOKEN: ${PALANTIR_API_ENROLL_TOKEN:-}
+    ports:
+      # Set PALANTIR_LAN_BIND_IP to the server's static LAN address in .env.
+      # The loopback default keeps the proxy private until that is configured.
+      - "${PALANTIR_LAN_BIND_IP:-127.0.0.1}:80:80"
+      - "${PALANTIR_LAN_BIND_IP:-127.0.0.1}:443:443"
+      - "${PALANTIR_LAN_BIND_IP:-127.0.0.1}:443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
 
   celery_worker:
     build:
@@ -113,10 +204,13 @@ services:
     volumes:
       - ./backend:/app
     environment:
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-palantir}:${POSTGRES_PASSWORD:-palantir}@postgres:5432/${POSTGRES_DB:-palantir}
-      SYNC_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-palantir}:${POSTGRES_PASSWORD:-palantir}@postgres:5432/${POSTGRES_DB:-palantir}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-palantir}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-palantir}
+      SYNC_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-palantir}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-palantir}
       REDIS_URL: redis://redis:6379/0
-      PALANTIR_WEBHOOK_SECRET: ${PALANTIR_WEBHOOK_SECRET:-palantir-super-secret-key-change-me}
+      PALANTIR_WEBHOOK_SECRET: ${PALANTIR_WEBHOOK_SECRET:?Set PALANTIR_WEBHOOK_SECRET in .env}
+      AGENT_AUTH_TOKEN: ${AGENT_AUTH_TOKEN:-}
+      METRICS_RETENTION_HOURS: ${METRICS_RETENTION_HOURS:-24}
+      LOG_RETENTION_DAYS: ${LOG_RETENTION_DAYS:-7}
 
   celery_beat:
     build:
@@ -139,13 +233,18 @@ services:
     volumes:
       - ./backend:/app
     environment:
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-palantir}:${POSTGRES_PASSWORD:-palantir}@postgres:5432/${POSTGRES_DB:-palantir}
-      SYNC_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-palantir}:${POSTGRES_PASSWORD:-palantir}@postgres:5432/${POSTGRES_DB:-palantir}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-palantir}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-palantir}
+      SYNC_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-palantir}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-palantir}
       REDIS_URL: redis://redis:6379/0
-      PALANTIR_WEBHOOK_SECRET: ${PALANTIR_WEBHOOK_SECRET:-palantir-super-secret-key-change-me}
+      PALANTIR_WEBHOOK_SECRET: ${PALANTIR_WEBHOOK_SECRET:?Set PALANTIR_WEBHOOK_SECRET in .env}
 
 volumes:
   postgres_data:
   redis_data:
   netdata_lib:
   netdata_cache:
+  authentik_postgres_data:
+  authentik_media:
+  authentik_templates:
+  caddy_data:
+  caddy_config:

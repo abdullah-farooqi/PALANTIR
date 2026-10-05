@@ -13,6 +13,7 @@ from integrations.netdata.contexts import (
 )
 from integrations.netdata.exceptions import NetdataUnavailable
 from models.anomaly import AnomalyEvent
+from services.investigations import enqueue_investigation_async
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +39,6 @@ class AnomalyService:
             .where(
                 AnomalyEvent.node_id == node_id,
                 AnomalyEvent.detected_at >= cooldown_threshold,
-                AnomalyEvent.triggered_agent == True,
             )
             .limit(1)
         )
@@ -53,10 +53,10 @@ class AnomalyService:
             rates = parse_anomaly_rates(raw)
         except NetdataUnavailable as e:
             logger.warning(f"Node {node_id} unreachable for anomaly eval: {e}")
-            return
+            raise
         except Exception as e:
             logger.error(f"Anomaly eval query error for node {node_id}: {e}")
-            return
+            raise
 
         if not rates:
             # ML still warming up (first 900s) — correct, not an error
@@ -89,21 +89,21 @@ class AnomalyService:
                 if hasattr(res, "__await__"):
                     await res
 
-            # ── Extension point: wire your LangGraph agent here ──────────
-            # from workers.agent_tasks import run_investigation
-            # run_investigation.delay(
-            #     node_id=node_id,
-            #     trigger_type="anomaly",
-            #     trigger_id=event.id,
-            #     context_scores=anomalous,
-            # )
-            # ─────────────────────────────────────────────────────────────
-
-            event.triggered_agent = True
             if hasattr(session, "commit"):
                 res = session.commit()
                 if hasattr(res, "__await__"):
                     await res
+            try:
+                _, dispatched = await enqueue_investigation_async(
+                    session,
+                    node_id=node_id,
+                    trigger_type="anomaly",
+                    trigger_id=event.id,
+                )
+                if not dispatched:
+                    logger.warning("Investigation dispatch failed for anomaly event %s", event.id)
+            except Exception:
+                logger.exception("Could not enqueue an investigation for anomaly event %s", event.id)
         except Exception as exc:
             if hasattr(session, "rollback"):
                 res = session.rollback()

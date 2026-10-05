@@ -1,17 +1,74 @@
 # PALANTIR — Session Handoff
 
-**Date:** 2026-10-02
+**Date:** 2026-10-04
 **Project Path:** `/home/abdullah-ahmad/Desktop/PALANTIR`
 **Reference:** `/home/abdullah-ahmad/Desktop/netdata/PALANTIR`
 **Status:** **Implementation and documentation changes are uncommitted; verify `git status` before handoff.**
+
+### Expanded Linux Agent Implementation (runtime validation pending)
+
+The monitored-host deployment now has a Compose design with Netdata on `19999`
+and a PALANTIR collector on `20000`. The collector exposes category JSON and
+structured systemd/application log events; the central worker polls both
+endpoints. Existing nodes may continue registering only `netdata_url`.
+
+Collector coverage currently includes system resources, disk/filesystem and
+`/proc/mdstat` RAID state, interface/protocol counters, systemd services,
+process memory/CPU time/OOM counters, TCP/UDP sockets by PID, Docker and LXD
+containers, libvirt and Proxmox VMs, and Kubernetes pods when API credentials
+are configured. Missing integrations are reported through the capabilities
+endpoint and skipped. Docker inventory is capped at 500 entries and live stats
+are gathered concurrently for at most 100 running containers. Firewall
+enumeration may report permission denied when host namespace access is blocked.
+Direct containerd CRI and legacy LXC adapters are not implemented yet; the
+capabilities response identifies those rather than claiming they are collected.
+
+Logs are read from journald plus configured files, parsed into JSON event
+fields, and stored separately in `log_events`. On first poll, journald starts
+with a 70-second lookback; file tails begin at the current end when first seen.
+This avoids an unbounded historical import. Metric retention is configurable
+with `METRICS_RETENTION_HOURS` (default 24); log retention uses
+`LOG_RETENTION_DAYS` (default 7).
+
+The collector Compose service mounts host `/`, `/proc`, `/sys`, `/run`, and
+`/var/log` read-only. This exposes host file contents to the collector, and the
+Docker socket permits Docker API actions despite the read-only mount. Keep the
+published agent ports private and restrict them to the central server.
+
+Earlier static validation passed before the API authentication, alert lifecycle,
+and investigation semantics changes were made. Those newer changes have not
+been validated, and the images have not been built or checked against a running
+central stack or monitored host. Before deploying the backend, apply the
+idempotent `sql/init.sql` updates (including the one-time legacy dispatch-flag
+correction); before remote installation, build and publish the new
+`palantir-host-collector` image with `scripts/build-and-push.sh`.
+
+The LAN gateway is defined by the root `Caddyfile` and `docker-compose.yml`:
+Caddy exposes `palantir.home.arpa` and `auth.palantir.home.arpa`, Authentik is
+backed by a separate PostgreSQL volume, and Caddy injects read/admin/enrollment
+tokens based on Authentik group headers after clearing browser-supplied identity
+headers. A restricted enrollment token is accepted only on machine `POST
+/api/v1/nodes` requests. Direct backend, PostgreSQL, Redis, and central Netdata
+ports are bound to host loopback. Configure local DNS,
+`PALANTIR_LAN_BIND_IP`, all required secrets, Authentik's initial administrator,
+and the proxy application/groups before LAN access. Caddy's private root CA must
+be trusted by client devices. This gateway configuration has not been validated
+or started; do not mark it deployment-ready until its Compose and Caddy config
+are checked with configured local secrets and DNS.
+
+API tokens and the webhook secret must each be independently generated, at
+least 32 characters, and distinct; no default webhook secret is accepted.
+Remote installs without the optional enrollment token skip automatic node
+registration cleanly and can be registered later from the central host with
+`scripts/register-node.sh` and an admin token.
 
 ---
 
 ## 1. Current Architecture and Accomplishments
 
 PALANTIR is a central FastAPI/Celery/PostgreSQL service that pulls telemetry
-from one or more Netdata HTTP endpoints. Remote endpoints only need Netdata;
-they do not run the PALANTIR database, Redis, or workers.
+from Netdata and optional PALANTIR host-collector HTTP endpoints. Remote
+endpoints do not run the PALANTIR database, Redis, or central workers.
 
 The current collection path is:
 1. `NetdataClient` probes `/api/v1/info` for host labels/RAM and `/api/v3/info`
@@ -27,6 +84,40 @@ The current collection path is:
    RAM, load, swap, and top processes. It is range-partitioned by time.
 6. Celery schedules collection, anomaly evaluation, and retention work. Alert
    definitions, current alerts, and alert transitions use separate endpoints.
+
+### Priority 1 backend UI gaps addressed
+
+The Priority 1 scope and API contract are recorded in
+[`BACKEND_UI_SCOPE_AND_LIMITATIONS.md`](BACKEND_UI_SCOPE_AND_LIMITATIONS.md).
+The implementation adds:
+
+- Node successful-contact and collection timestamps, plus derived
+  `reachable`/`stale`/`unreachable` state. Defaults are 180 seconds for
+  reachable and 900 seconds for stale; override with `NODE_REACHABLE_SECONDS`
+  and `NODE_STALE_SECONDS`.
+- `GET /api/v1/fleet/summary` for enabled and reachability counts, latest metric
+  time, latest-transition active alert count, 24-hour anomaly summary, and
+  database/API plus Celery collection/evaluation heartbeats. A task heartbeat
+  measures pipeline activity and node-level failures, not per-category scrape success.
+- `GET /api/v1/events` for filterable alert/anomaly rows with stable keyset
+  pagination. Clients should reuse the same filters when following a cursor.
+- `GET /api/v1/nodes/{node_id}/metrics/{category}/series` for retention-bounded
+  ranges, source selection, cursor pages, raw timestamped snapshot envelopes,
+  or source-grouped numeric buckets.
+- `GET /api/v1/metrics/schema` and
+  `GET /api/v1/nodes/{node_id}/collection-status` for schema version 1, stable
+  typed field metadata, source-specific status, freshness, and safe error codes.
+
+Snapshot retention defaults to 24 hours. Category staleness defaults to 180
+seconds (`METRIC_STALE_SECONDS`). The series endpoint rejects ranges older than
+retention or wider than the configured retention window. The schema documents
+the common envelope and typed fields; arbitrary source JSON remains
+collector-defined. The migration adds `last_collection_at`, status/heartbeat
+tables and supporting indexes. Apply `sql/init.sql` before deploying updated
+API/worker containers.
+
+The Priority 1 code and documentation have not been exercised against a running
+database or stack in this handoff. No tests were run in this work session.
 
 Implemented in the current worktree:
 - Netdata key normalization and active process extraction.
@@ -54,29 +145,34 @@ Run this script on the central server to register either the local host or any r
 
 ```bash
 # 1. Register the local central server:
-./scripts/register-node.sh --local
+PALANTIR_API_ADMIN_TOKEN='<CENTRAL_ADMIN_TOKEN>' \
+  ./scripts/register-node.sh --local
 
 # 2. Register a remote endpoint (automatically probes sensor & fetches real hostname):
-./scripts/register-node.sh 192.168.18.50
+PALANTIR_API_ADMIN_TOKEN='<CENTRAL_ADMIN_TOKEN>' \
+  ./scripts/register-node.sh 192.168.18.50 --server http://127.0.0.1:8000
 
 # 3. Register a remote endpoint on a custom port or specify a custom hostname:
-./scripts/register-node.sh --target 192.168.18.50 --port 19999 --hostname prod-worker-01
+PALANTIR_API_ADMIN_TOKEN='<CENTRAL_ADMIN_TOKEN>' \
+  ./scripts/register-node.sh --target 192.168.18.50 --port 19999 \
+    --hostname prod-worker-01 --server http://127.0.0.1:8000
 
-# 4. Point to a remote PALANTIR server:
-./scripts/register-node.sh 192.168.18.50 --server http://192.168.18.43:8000
 ```
 
 ### B. Remote Agent: `scripts/install-agent.sh`
-Run this one-liner on **any** remote Linux machine or VM (requires only Docker):
+Copy the Caddy root CA certificate to the remote host, then run this on a
+remote Linux host that has Docker and Compose:
 
 ```bash
-# Direct execution from GitHub or local copy:
-./scripts/install-agent.sh http://<SYSADMIN_SERVER_IP>:8000
-
-# Or via curl:
-curl -fsSL https://raw.githubusercontent.com/abdullah-farooqi/PALANTIR/telemetry_pipeline/scripts/install-agent.sh | bash -s -- http://<SYSADMIN_SERVER_IP>:8000
+curl -fsSL https://raw.githubusercontent.com/abdullah-farooqi/PALANTIR/telemetry_pipeline/scripts/install-agent.sh \
+  | sudo bash -s -- --server https://palantir.home.arpa --ca-cert ./caddy-root.crt --secret '<CENTRAL_PALANTIR_WEBHOOK_SECRET>' --enrollment-token '<CENTRAL_PALANTIR_API_ENROLL_TOKEN>'
 ```
-*The installer automatically launches `abdullahahmadfarooqi/palantir-netdata:latest`, queries the kernel routing table to determine its IP facing `<SYSADMIN_SERVER_IP>`, verifies sensor readiness, and registers the node.*
+The installer downloads the Compose definition, writes a mode-600 `.env`, pulls
+the images, starts both services, waits for health, and enrolls the endpoint.
+The enrollment token is restricted to create-only node registration. The
+central server requires separate read/admin API tokens; Caddy injects them
+after Authentik login. Keep all API tokens out of browser code. The proxy setup
+expects the UI to be same-origin; CORS credentials remain disabled.
 
 ---
 
@@ -136,19 +232,24 @@ An empty current-alert result does not prove that health monitoring is down.
 Confirm the envelope, v3 health capability, and (when needed) v1 alarm
 definitions before reporting a health failure.
 
-## 6. Next Steps
+## 6. Remaining Work
 
-The normalizer and typed persistence path are implemented. Remaining work is
-operational hardening and the planned investigation workflow:
+Priority 2 and 3 changes now add fleet log search, durable Redis/Celery
+investigation jobs, validated event ownership, a strict bounded result schema version 1,
+investigation search, searchable node inventory, and operational health. Alert
+and qualifying anomaly events enqueue a telemetry evidence summary; event links
+are saved only after successful queue dispatch. This workflow does not call an
+LLM or infer root cause. A future LangGraph diagnosis can replace the workflow
+behind the same job/result contract if configured and reviewed.
 
-### Phase 1: Autonomous Investigation Agent (LangGraph)
-1. Wire `backend/workers/agent_tasks.py`:
-   - Trigger LangGraph diagnostic workflows whenever an anomaly is flagged or an alert is received with `triggered_agent == True`.
-   - Pass normalized metrics from the new structured schema into the prompt/context for root-cause analysis.
-   - Write investigation results into the `agent_investigations` table.
+The Redis service now uses append-only persistence. Apply the expanded,
+idempotent `sql/init.sql` before starting API, worker, and beat containers. The
+new operational endpoints and migrations have not been exercised against a
+running stack. API contract tests were added, but no tests were run during this
+work session.
 
-### Phase 2: Database Retention & Performance
-1. Implement metric aggregation (rollups) or snapshot pruning to keep database storage lightweight and performant.
+Metric and log pruning now use environment-configured retention; rollups remain
+a future optimization once collection volume is measured.
 
 ---
 
@@ -186,10 +287,10 @@ cd backend && ./venv/bin/pytest -q
 docker exec palantir-backend pytest -q
 ```
 
-The current suite contains 58 tests covering normalizer behavior, API
-contracts, JSON2 parsing, typed persistence, security validation, workers, and
-webhook handling. Record the exact pass count from the command output rather
-than copying a historical count into future handoffs.
+The preceding Netdata-only baseline contained 58 tests. The expanded agent,
+logs, and category API changes were added afterward; do not treat that earlier
+pass count as validation of the current worktree. Record fresh results when
+the user requests verification.
 
 ## 8. Live Host Facts Verified During This Session
 

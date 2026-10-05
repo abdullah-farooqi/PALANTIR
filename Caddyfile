@@ -1,0 +1,155 @@
+palantir.home.arpa {
+	tls internal
+
+	route {
+		# The embedded Authentik outpost needs its callback paths without auth.
+		reverse_proxy /outpost.goauthentik.io/* http://authentik-server:9000 {
+			header_up -Authorization
+			header_up -X-Authentik-Groups
+		}
+
+		# Keep the process health probe available on the LAN.
+		@health path /healthz
+		handle @health {
+			reverse_proxy backend:8000 {
+				header_up -Authorization
+				header_up -X-Authentik-Groups
+			}
+		}
+
+		# Netdata webhooks use their own shared secret at the backend.
+		@alert_webhook {
+			path /internal/alert
+			method POST
+		}
+		handle @alert_webhook {
+			reverse_proxy backend:8000 {
+				header_up -Authorization
+				header_up -X-Authentik-Groups
+			}
+		}
+
+		# CORS preflight has no session cookie. FastAPI's explicit origin policy
+		# decides whether it may proceed; it cannot read API data.
+		@preflight {
+			path /api/v1/*
+			method OPTIONS
+		}
+		handle @preflight {
+			reverse_proxy backend:8000 {
+				header_up -Authorization
+				header_up -X-Authentik-Groups
+			}
+		}
+
+		# Restricted machine credential for unattended agent enrollment. The
+		# backend limits this token to create-only POST /api/v1/nodes access.
+		@machine_enroll {
+			path /api/v1/nodes /api/v1/nodes/
+			method POST
+			header Authorization "Bearer {$PALANTIR_API_ENROLL_TOKEN}"
+		}
+		handle @machine_enroll {
+			reverse_proxy backend:8000 {
+				header_up Authorization "Bearer {$PALANTIR_API_ENROLL_TOKEN}"
+				header_up -X-Authentik-Groups
+			}
+		}
+
+		# Strip browser-supplied credentials and Authentik claims before checking
+		# the session. Only the forward-auth response may restore the group claim.
+		request_header -Authorization
+		request_header -X-Authentik-Groups
+		request_header -X-Authentik-Username
+		request_header -X-Authentik-Entitlements
+		request_header -X-Authentik-Email
+		request_header -X-Authentik-Name
+		request_header -X-Authentik-Uid
+		request_header -X-Authentik-Jwt
+		request_header -X-Authentik-Meta-Jwks
+		request_header -X-Authentik-Meta-Outpost
+		request_header -X-Authentik-Meta-Provider
+		request_header -X-Authentik-Meta-App
+		request_header -X-Authentik-Meta-Version
+
+		forward_auth http://authentik-server:9000 {
+			uri /outpost.goauthentik.io/auth/caddy
+			copy_headers X-Authentik-Groups
+			trusted_proxies private_ranges
+		}
+
+		@api_read {
+			path /api/v1/*
+			method GET HEAD
+		}
+		@api_register {
+			path /api/v1/nodes /api/v1/nodes/
+			method POST
+		}
+		@api_write {
+			path /api/v1/*
+			method POST PUT PATCH DELETE
+		}
+		@role_read header_regexp X-Authentik-Groups `(^|\|)(palantir-read|palantir-admin)(\||$)`
+		@role_admin header_regexp X-Authentik-Groups `(^|\|)palantir-admin(\||$)`
+		@role_enroll header_regexp X-Authentik-Groups `(^|\|)palantir-enroll(\||$)`
+
+		handle @api_read {
+			handle @role_read {
+				reverse_proxy backend:8000 {
+					header_up Authorization "Bearer {$PALANTIR_API_READ_TOKEN}"
+					header_up -X-Authentik-Groups
+				}
+			}
+			handle {
+				respond "Read access required" 403
+			}
+		}
+
+		handle @api_register {
+			handle @role_admin {
+				reverse_proxy backend:8000 {
+					header_up Authorization "Bearer {$PALANTIR_API_ADMIN_TOKEN}"
+					header_up -X-Authentik-Groups
+				}
+			}
+			handle @role_enroll {
+				reverse_proxy backend:8000 {
+					header_up Authorization "Bearer {$PALANTIR_API_ENROLL_TOKEN}"
+					header_up -X-Authentik-Groups
+				}
+			}
+			handle {
+				respond "Node enrollment access required" 403
+			}
+		}
+
+		handle @api_write {
+			handle @role_admin {
+				reverse_proxy backend:8000 {
+					header_up Authorization "Bearer {$PALANTIR_API_ADMIN_TOKEN}"
+					header_up -X-Authentik-Groups
+				}
+			}
+			handle {
+				respond "Admin access required" 403
+			}
+		}
+
+		# Protect API docs and other non-API backend routes with the read role.
+		handle @role_read {
+			reverse_proxy backend:8000 {
+				header_up -Authorization
+				header_up -X-Authentik-Groups
+			}
+		}
+		handle {
+			respond "Read access required" 403
+		}
+	}
+}
+
+auth.palantir.home.arpa {
+	tls internal
+	reverse_proxy authentik-server:9000
+}

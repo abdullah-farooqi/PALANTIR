@@ -10,6 +10,13 @@ celery_app.conf.update(
     result_serializer="json",
     timezone="UTC",
     enable_utc=True,
+    imports=(
+        "workers.metrics_tasks",
+        "workers.anomaly_tasks",
+        "workers.maintenance_tasks",
+        "workers.health_tasks",
+        "workers.investigation_tasks",
+    ),
 )
 
 celery_app.conf.beat_schedule = {
@@ -21,14 +28,12 @@ celery_app.conf.beat_schedule = {
         "task": "workers.anomaly_tasks.evaluate_all_nodes",
         "schedule": 300.0,
     },
+    "celery-beat-heartbeat-30s": {
+        "task": "workers.health_tasks.record_beat_heartbeat",
+        "schedule": 30.0,
+    },
     "prune-snapshots-daily": {
         "task": "workers.maintenance_tasks.prune_old_snapshots",
         "schedule": crontab(hour=3, minute=0),
     },
 }
-
-celery_app.autodiscover_tasks([
-    "workers.metrics_tasks",
-    "workers.anomaly_tasks",
-    "workers.maintenance_tasks",
-])
