@@ -366,9 +366,10 @@ cd backend
 ./venv/bin/pytest -q tests/test_priority_api_contracts.py
 ```
 
-The older API tests still assume unauthenticated requests and the previous
-`201/running` investigation response. Update those fixtures and expectations
-before treating the full suite below as a release gate.
+The API integration fixture supplies a test-only admin role and mocks Celery
+dispatch; authentication behavior is tested separately. Run the suite against
+a local test database with the current `sql/init.sql` migration applied, never
+against production data.
 
 ```bash
 # Host virtual environment (run from backend so pyproject.toml is loaded)

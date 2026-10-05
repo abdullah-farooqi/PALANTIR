@@ -4,19 +4,29 @@ import httpx
 from httpx import AsyncClient, ASGITransport
 from main import app
 from core.config import settings
+from core.api_auth import get_api_role
 from models.node import MonitoredNode
 from models.alert import AlertEvent
 from core.database import AsyncSessionLocal
+from services import investigations as investigation_service
 from sqlalchemy import select
 
 
 @pytest.fixture
-async def client():
-    async with AsyncClient(
-        transport=ASGITransport(app=app),
-        base_url="http://test",
-    ) as ac:
-        yield ac
+async def client(monkeypatch):
+    # Business endpoint tests use an explicit test-only admin identity. API
+    # authentication itself is covered independently in test_security.py.
+    app.dependency_overrides[get_api_role] = lambda: "admin"
+    monkeypatch.setattr(settings, "PALANTIR_WEBHOOK_SECRET", "test-webhook-secret-" + "x" * 40)
+    monkeypatch.setattr(investigation_service, "_enqueue", lambda *_args, **_kwargs: None)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as ac:
+            yield ac
+    finally:
+        app.dependency_overrides.pop(get_api_role, None)
 
 
 @pytest.fixture
@@ -289,7 +299,7 @@ async def test_internal_webhook_auth_and_processing(client: AsyncClient, existin
     assert resp.status_code == 200
     assert resp.json()["status"] == "ignored"
 
-    # 4. Valid secret and registered node -> 200 Received + triggered_agent=True
+    # 4. Valid secret and registered node -> 200 Received and an investigation link.
     resp = await client.post(
         "/internal/alert",
         headers={"X-PALANTIR-Secret": settings.PALANTIR_WEBHOOK_SECRET},
@@ -307,7 +317,8 @@ async def test_internal_webhook_auth_and_processing(client: AsyncClient, existin
         assert ev is not None
         assert ev.alert_name == "test_security_spike"
         assert ev.status == "CRITICAL"
-        assert ev.triggered_agent is True
+        assert ev.triggered_agent is False
+        assert ev.investigation_id is not None
 
     # 5. Case-insensitivity normalization test (lowercase "warning" -> "WARNING")
     warn_payload = {
@@ -330,7 +341,8 @@ async def test_internal_webhook_auth_and_processing(client: AsyncClient, existin
         stmt = select(AlertEvent).where(AlertEvent.id == warn_event_id)
         ev = (await session.execute(stmt)).scalar_one_or_none()
         assert ev.status == "WARNING"
-        assert ev.triggered_agent is True
+        assert ev.triggered_agent is False
+        assert ev.investigation_id is not None
 
     # 6. CLEAR status -> triggered_agent should be False
     clear_payload = {
@@ -381,11 +393,12 @@ async def test_investigations_lifecycle(client: AsyncClient, existing_node: Moni
         "/api/v1/investigations",
         json={"node_id": existing_node.id, "trigger_type": "manual"},
     )
-    assert resp.status_code == 201
+    assert resp.status_code == 202
     data = resp.json()
     assert "id" in data
     inv_id = data["id"]
-    assert data["status"] == "running"
+    assert data["status"] == "queued"
+    assert data["job_id"]
 
     # 4. List investigations
     resp = await client.get("/api/v1/investigations")
@@ -400,7 +413,7 @@ async def test_investigations_lifecycle(client: AsyncClient, existing_node: Moni
     assert inv_detail["id"] == inv_id
     assert inv_detail["node_id"] == existing_node.id
     assert inv_detail["trigger_type"] == "manual"
-    assert inv_detail["status"] == "running"
+    assert inv_detail["status"] == "queued"
 
     # 6. Non-existent investigation ID -> 404
     resp = await client.get("/api/v1/investigations/999999")

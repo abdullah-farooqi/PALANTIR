@@ -1,17 +1,50 @@
 import pytest
+from fastapi import HTTPException
+from fastapi.security import HTTPAuthorizationCredentials
+from core.api_auth import get_api_role
 from core.security import verify_webhook_secret, validate_netdata_url
 from core.config import settings
 
 
-def test_verify_webhook_secret():
+def test_verify_webhook_secret(monkeypatch):
+    test_secret = "test-webhook-secret-" + "x" * 40
+    monkeypatch.setattr(settings, "PALANTIR_WEBHOOK_SECRET", test_secret)
     # Valid matching secret
-    assert verify_webhook_secret(settings.PALANTIR_WEBHOOK_SECRET) is True
+    assert verify_webhook_secret(test_secret) is True
 
     # Incorrect secrets
     assert verify_webhook_secret("wrong-secret") is False
     assert verify_webhook_secret("") is False
     assert verify_webhook_secret(None) is False
     assert verify_webhook_secret(12345) is False  # Non-string
+
+
+@pytest.mark.asyncio
+async def test_api_auth_fails_closed_without_configured_tokens(monkeypatch):
+    monkeypatch.setattr(settings, "PALANTIR_API_READ_TOKEN", "")
+    monkeypatch.setattr(settings, "PALANTIR_API_ADMIN_TOKEN", "")
+    monkeypatch.setattr(settings, "PALANTIR_API_ENROLL_TOKEN", "")
+
+    with pytest.raises(HTTPException) as error:
+        await get_api_role(None)
+
+    assert error.value.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_api_auth_recognizes_distinct_roles(monkeypatch):
+    tokens = {
+        "read": "read-token-" + "r" * 40,
+        "admin": "admin-token-" + "a" * 40,
+        "enroll": "enroll-token-" + "e" * 40,
+    }
+    monkeypatch.setattr(settings, "PALANTIR_API_READ_TOKEN", tokens["read"])
+    monkeypatch.setattr(settings, "PALANTIR_API_ADMIN_TOKEN", tokens["admin"])
+    monkeypatch.setattr(settings, "PALANTIR_API_ENROLL_TOKEN", tokens["enroll"])
+
+    for role, token in tokens.items():
+        credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
+        assert await get_api_role(credentials) == role
 
 
 def test_validate_netdata_url_valid():

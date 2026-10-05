@@ -173,7 +173,8 @@ async def test_anomaly_service_evaluate_and_trigger(local_node_sync):
     }
 
     with patch.object(svc.client, "get_anomaly_scores", new=AsyncMock(return_value=None)), \
-         patch("services.anomaly.parse_anomaly_rates", return_value=mock_weights_resp):
+         patch("services.anomaly.parse_anomaly_rates", return_value=mock_weights_resp), \
+         patch("services.anomaly.enqueue_investigation_async", new=AsyncMock(return_value=(None, True))):
 
         with get_sync_session() as session:
             await svc.evaluate_and_trigger(local_node_sync.id, session)
@@ -189,7 +190,7 @@ async def test_anomaly_service_evaluate_and_trigger(local_node_sync):
             event = (await session.execute(stmt)).scalar_one_or_none()
             assert event is not None
             assert event.max_score == 0.92
-            assert event.triggered_agent is True
+            assert event.triggered_agent is False
             assert "net.net" in event.contexts
             assert "system.cpu" in event.contexts
 

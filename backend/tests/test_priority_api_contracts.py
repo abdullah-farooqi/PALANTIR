@@ -13,25 +13,13 @@ from main import app
 
 
 def test_priority_two_and_three_routes_are_registered():
-    registered = {
-        (route.path, method)
-        for route in app.routes
-        if hasattr(route, "methods")
-        for method in route.methods
-    }
+    paths = app.openapi()["paths"]
 
-    assert ("/api/v1/logs", "GET") in registered
-    assert ("/api/v1/investigations/search", "GET") in registered
-    assert ("/api/v1/investigations", "POST") in registered
-    assert ("/api/v1/nodes/search", "GET") in registered
-    assert ("/api/v1/health/operations", "GET") in registered
-    create_route = next(
-        route
-        for route in app.routes
-        if getattr(route, "path", None) == "/api/v1/investigations"
-        and "POST" in getattr(route, "methods", set())
-    )
-    assert create_route.status_code == 202
+    assert "get" in paths["/api/v1/logs"]
+    assert "get" in paths["/api/v1/investigations/search"]
+    assert paths["/api/v1/investigations"]["post"]["responses"].get("202")
+    assert "get" in paths["/api/v1/nodes/search"]
+    assert "get" in paths["/api/v1/health/operations"]
 
 
 def test_investigation_request_requires_consistent_trigger_reference():
