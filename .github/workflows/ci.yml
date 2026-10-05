@@ -73,6 +73,15 @@ jobs:
     name: Docker Stack Build & Smoke Test
     runs-on: ubuntu-latest
     needs: unit-tests
+    # Disposable credentials for the throwaway Compose stack. These override
+    # the intentionally blank values in .env.example and are not production secrets.
+    env:
+      POSTGRES_PASSWORD: ci-only-postgres-password-20261005
+      PALANTIR_WEBHOOK_SECRET: ci-webhook-secret-0123456789abcdef0123456789abcdef
+      PALANTIR_API_READ_TOKEN: ci-read-token-0123456789abcdef0123456789abcdef
+      PALANTIR_API_ADMIN_TOKEN: ci-admin-token-0123456789abcdef0123456789abcdef
+      AUTHENTIK_SECRET_KEY: ci-only-authentik-secret-key-0123456789abcdef0123456789abcdef
+      AUTHENTIK_POSTGRES_PASSWORD: ci-only-authentik-postgres-password-20261005
 
     steps:
       - name: Checkout code
