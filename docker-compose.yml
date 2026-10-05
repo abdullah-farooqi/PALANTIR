@@ -186,7 +186,7 @@ services:
       context: ./backend
       dockerfile: Dockerfile
       network: host
-    image: ${PALANTIR_BACKEND_IMAGE:-palantir-backend:latest}
+    image: ${PALANTIR_BACKEND_IMAGE:-abdullahahmadfarooqi/palantir-backend:latest}
     container_name: palantir-celery-worker
     restart: unless-stopped
     extra_hosts:
@@ -217,7 +217,7 @@ services:
       context: ./backend
       dockerfile: Dockerfile
       network: host
-    image: ${PALANTIR_BACKEND_IMAGE:-palantir-backend:latest}
+    image: ${PALANTIR_BACKEND_IMAGE:-abdullahahmadfarooqi/palantir-backend:latest}
     container_name: palantir-celery-beat
     restart: unless-stopped
     extra_hosts:
