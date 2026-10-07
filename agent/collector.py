@@ -255,8 +255,14 @@ def _firewall_state() -> dict[str, Any]:
     # Report rules only when the host's nft binary and network namespace are usable.
     nft = shutil.which("nft")
     nsenter = shutil.which("nsenter")
-    if not nft or not nsenter or not (HOST_PROC / "1/ns/net").exists():
-        return {"status": "unavailable", "reason": "nftables or host network namespace is unavailable"}
+    try:
+        host_net_namespace_available = (HOST_PROC / "1/ns/net").exists()
+    except OSError:
+        # Container proc mounts can hide namespace links or deny stat access.
+        # Capability discovery should report that limitation instead of failing.
+        host_net_namespace_available = False
+    if not nft or not nsenter or not host_net_namespace_available:
+        return {"status": "unavailable", "reason": "nftables or host network namespace is unavailable or inaccessible"}
     try:
         result = subprocess.run(
             [nsenter, f"--net={HOST_PROC / '1/ns/net'}", nft, "-j", "list", "ruleset"],
