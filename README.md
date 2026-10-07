@@ -49,22 +49,19 @@ flowchart TD
 Run the central PALANTIR platform on your primary server:
 
 ```bash
-# 1. Clone repository and set up environment
-git clone https://github.com/abdullah-farooqi/PALANTIR.git
+git clone -b telemetry_pipeline https://github.com/abdullah-farooqi/PALANTIR.git
 cd PALANTIR
-cp .env.example .env
 
-# Generate independent values, then paste each into its matching .env setting:
-openssl rand -hex 32  # run separately for each database password, API token, and webhook secret
-openssl rand -base64 48  # AUTHENTIK_SECRET_KEY
-# Set PALANTIR_LAN_BIND_IP to the server's static LAN address before starting.
-
-# 2. Launch the full stack
-docker compose up -d --build
-
-# 3. Verify health
-curl -s http://localhost:8000/healthz | python3 -m json.tool
+# Creates a private .env, generates separate secrets, and starts published images.
+./scripts/setup-central.sh --lan-ip <CENTRAL_SERVER_LAN_IP>
 ```
+
+The central setup script does not print generated secrets. It creates `.env`
+with mode `600` and a second mode `600` file named `.env.agent-secrets` that
+contains only the webhook, enrollment, collector, and image settings needed by
+remote hosts. Keep both files out of Git and copy only `.env.agent-secrets` to
+trusted remote hosts. The script preserves an existing `.env`; fill its required
+values and set `PALANTIR_LAN_BIND_IP` before rerunning if you already have one.
 
 ### Test the published images on another machine
 
@@ -75,7 +72,7 @@ on a test machine, clone this repository for its Compose files and SQL schema,
 then prepare a private environment file:
 
 ```bash
-git clone https://github.com/abdullah-farooqi/PALANTIR.git
+git clone -b telemetry_pipeline https://github.com/abdullah-farooqi/PALANTIR.git
 cd PALANTIR
 cp .env.example .env
 chmod 600 .env
@@ -198,43 +195,80 @@ CORS credentials remain disabled.
 
 Remote hosts do **not** run PostgreSQL, Redis, Celery, or the central backend. Deploy the Netdata sensor and PALANTIR host collector together with Compose. The Compose enroller registers both endpoints.
 
-### One-command endpoint installation
+### Configure a remote endpoint
 
-On a Linux endpoint that already has Docker and Docker Compose, run this once
-as root. Copy `caddy-root.crt` from the PALANTIR server to the endpoint first:
+On the central server, first export Caddy's public root certificate after the
+central stack is running:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/abdullah-farooqi/PALANTIR/telemetry_pipeline/scripts/install-agent.sh \
-  | sudo bash -s -- --server https://palantir.home.arpa --ca-cert /path/to/caddy-root.crt --secret '<CENTRAL_PALANTIR_WEBHOOK_SECRET>' --enrollment-token '<CENTRAL_PALANTIR_API_ENROLL_TOKEN>'
+docker cp palantir-caddy:/data/caddy/pki/authorities/local/root.crt ./caddy-root.crt
 ```
 
-The installer detects the hostname and reachable host IP, downloads the Compose
-definition, writes its protected configuration under `/opt/palantir-agent`,
-pulls the Netdata and PALANTIR images, starts the bundle, waits for health, and
-enrolls the node centrally using the optional restricted enrollment token. The
-token can create new nodes and repeat an unchanged enrollment; it cannot read
-data, modify existing nodes, or deactivate them. The
-central server URL, webhook secret, and enrollment token are configured for the
-agent. The enrollment token is accepted only for node-registration POSTs and is
-checked by the backend's create-only role. Without it, the agent skips automatic
-registration; register the endpoint later from the central host with
-`scripts/register-node.sh` and an admin token. Optional flags can override the
-hostname, IP, ports, image tags, install directory, or collector token. Docker
-and Compose must already be installed on the endpoint.
+Copy only the agent-specific secrets file and public CA certificate to the
+remote host over SSH. Create a private staging directory first:
 
-The bundle exposes Netdata on port `19999` and the host collector on `20000`. Allow central-server access to those ports on the private network. The collector mounts host `/proc`, `/sys`, `/var/log`, `/run`, and `/` read-only so it can inspect mount usage and host files. That grants it read access to host files; the mounted Docker socket can also issue Docker API operations even through a read-only filesystem mount. Restrict network access to the agent ports and deploy it only on trusted hosts.
+```bash
+ssh <REMOTE_USER>@<REMOTE_IP> 'install -d -m 700 ~/palantir-bootstrap'
+scp .env.agent-secrets caddy-root.crt <REMOTE_USER>@<REMOTE_IP>:palantir-bootstrap/
+```
 
-The webhook secret must match `PALANTIR_WEBHOOK_SECRET` on the central server. The installer requires it through `--secret` or the `PALANTIR_WEBHOOK_SECRET` environment variable.
+On the remote Ubuntu host, clone the deployment branch and run the host setup
+script as root:
 
-Optional collector authentication uses the same token in the central `.env` (`AGENT_AUTH_TOKEN`) and the remote agent (`--token` or `PALANTIR_AGENT_TOKEN`). Without a token, any client that can reach port `20000` can query the collector.
+```bash
+git clone -b telemetry_pipeline https://github.com/abdullah-farooqi/PALANTIR.git
+cd PALANTIR
+sudo ./scripts/setup-agent.sh \
+  --secrets-file "$HOME/palantir-bootstrap/.env.agent-secrets" \
+  --ca-cert "$HOME/palantir-bootstrap/caddy-root.crt"
+```
+
+The script asks for a unique node name and the IP address/ports the central
+server can reach. It writes `/opt/palantir-agent/.env.agent` with mode `600`,
+copies the Compose file and CA certificate, pulls the Netdata and collector
+images, starts them, waits for health, and submits the restricted enrollment
+request. It does not print the secrets. After successful setup, remove the
+staged secrets file from the remote host:
+
+```bash
+rm -f "$HOME/palantir-bootstrap/.env.agent-secrets"
+```
+
+You can omit `--secrets-file` to enter the central URL and secrets through
+hidden prompts instead.
+
+The environment values are assigned as follows:
+
+- **Central `.env`:** database passwords; webhook secret; read, admin, and
+  restricted enrollment API tokens; Authentik signing key and database password;
+  `AGENT_AUTH_TOKEN`; and the central server's LAN bind IP.
+- **Remote `.env.agent`:** central HTTPS URL; node name; remote advertised IP and
+  ports; the same webhook, enrollment, and collector tokens; the Caddy root CA
+  path; and the sensor/collector image names.
+- **Never copy:** the central `.env`, read token, admin token, Docker Hub token,
+  or GitHub Actions token to a remote host. The registry images are public, so
+  remote Docker pulls do not need the CI publishing credential.
+
+For a VirtualBox remote VM, bridged networking is recommended so the central
+host can reach its advertised IP. Inbound TCP ports `19999` and `20000` on the
+remote host should be allowed from the central server only. Central outbound
+traffic must reach those ports; the remote host must reach central HTTPS on 443.
+
+The restricted enrollment token can create a node or repeat an unchanged
+enrollment; it cannot read data, modify existing nodes, or deactivate them. If
+you do not use automatic enrollment, register the endpoint later from the
+central host with `scripts/register-node.sh` and an admin token.
+
+The older `scripts/install-agent.sh` remains available for compatibility. For
+new deployments, use `scripts/setup-agent.sh` so secrets are entered via a
+protected file or hidden prompts instead of command-line arguments.
+
+The bundle exposes Netdata on port `19999` and the host collector on `20000`. The collector mounts host `/proc`, `/sys`, `/var/log`, `/run`, and `/` read-only so it can inspect mount usage and host files. That grants it read access to host files; the mounted Docker socket can also issue Docker API operations even through a read-only filesystem mount. Restrict network access to the agent ports and deploy it only on trusted hosts.
 
 Optional host integrations are discovered and skipped when unavailable. Docker and LXD use their local sockets; libvirt uses the host system connection. Kubernetes and Proxmox API integrations can be configured with `KUBERNETES_API_URL`, `KUBERNETES_TOKEN`, `KUBERNETES_CA_CERT`, `PROXMOX_API_URL`, `PROXMOX_API_TOKEN`, and `PROXMOX_CA_CERT` in the agent Compose environment. Proxmox tokens use the API token value expected by its `PVEAPIToken` authorization scheme. Direct containerd CRI and legacy LXC collection are reported as not configured. Application log paths are configurable with `APP_LOG_GLOBS`; the collector starts tailing files from their current end and parses new JSON, syslog, or plain-text lines into events. It includes debug-level records by default; set `LOG_MIN_PRIORITY=6` to omit debug events.
 
-Build and publish the new collector image along with the existing images before remote deployment:
-
-```bash
-./scripts/build-and-push.sh --hub <DOCKERHUB_USER> --tag <VERSION>
-```
+The setup script pulls the published images automatically. Use
+`scripts/build-and-push.sh` only when publishing a new development build.
 
 ### Existing single-container installations
 
