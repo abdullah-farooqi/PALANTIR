@@ -68,7 +68,6 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
-      network: host
     image: ${PALANTIR_BACKEND_IMAGE:-abdullahahmadfarooqi/palantir-backend:latest}
     container_name: palantir-backend
     restart: unless-stopped
@@ -184,7 +183,6 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
-      network: host
     image: ${PALANTIR_BACKEND_IMAGE:-abdullahahmadfarooqi/palantir-backend:latest}
     container_name: palantir-celery-worker
     restart: unless-stopped
@@ -215,7 +213,6 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
-      network: host
     image: ${PALANTIR_BACKEND_IMAGE:-abdullahahmadfarooqi/palantir-backend:latest}
     container_name: palantir-celery-beat
     restart: unless-stopped
