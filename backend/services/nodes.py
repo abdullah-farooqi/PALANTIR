@@ -22,6 +22,9 @@ class NodeService:
         collector_url: Optional[str] = None,
     ) -> MonitoredNode:
         netdata_url = validate_netdata_url(netdata_url)
+        os_type = os_type.strip().lower()
+        if os_type not in {"linux", "windows"}:
+            raise ValueError("os_type must be either 'linux' or 'windows'")
         client = NetdataClient(base_url=netdata_url)
         capabilities = None
         if collector_url:

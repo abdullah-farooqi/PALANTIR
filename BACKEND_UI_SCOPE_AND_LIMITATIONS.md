@@ -4,6 +4,11 @@
 
 **Scope reviewed:** fleet and node overview, node detail and telemetry, alerts, anomalies, structured logs, investigations, and the API access needed by those screens. This is a source-code review of the checked-out backend, agent, proxy, and deployment configuration. It is not a live-stack verification.
 
+**Validation note (2026-10-07):** CI run `37347718534` passed the Python
+3.11/3.12 unit suites and Docker stack smoke/backend tests at commit `8b221d0`.
+The follow-up backend, deployment, and CI audit changes are newer than that run
+and need a fresh CI result before they can be called verified.
+
 ## 1. Current system behavior
 
 PALANTIR currently has a FastAPI API under `/api/v1`, a PostgreSQL store, Redis/Celery workers, a Netdata agent, and an optional PALANTIR host collector. Celery schedules metric collection every 60 seconds, anomaly evaluation every five minutes, and daily retention cleanup. The React UI will be a new client of these APIs; there is no frontend API/BFF layer in the current backend.
@@ -88,7 +93,7 @@ The category names accepted by the metrics API are `network`, `system`, `storage
 
 ### 3.6 API security and operational integration
 
-1. **API tokens must be provisioned and kept server-side.** `/api/v1` requires a Bearer token: read tokens allow read routes, admin tokens allow management operations, and an optional enrollment token can create nodes or repeat an identical enrollment but cannot modify or reactivate one. The LAN deployment includes Caddy with Authentik forward authentication; Caddy strips browser-supplied authorization/identity headers and injects the role token. A machine enrollment token is accepted only for `POST /api/v1/nodes`. Backend port 8000, PostgreSQL, Redis, and central Netdata are bound to host loopback. Do not embed shared tokens in browser JavaScript. `/healthz` remains a process health endpoint, and `/internal/alert` uses its webhook secret.
+1. **API tokens must be provisioned and kept server-side.** `/api/v1` requires a Bearer token: read tokens allow read routes, admin tokens allow management operations, and an optional enrollment token can create nodes or repeat an identical enrollment but cannot modify or reactivate one. The LAN deployment includes Caddy with Authentik forward authentication; Caddy strips browser-supplied authorization/identity headers and injects the role token. A machine enrollment token is accepted only for `POST /api/v1/nodes`. Registration probes the supplied Netdata and collector URLs, including private LAN addresses needed for monitoring; an enrollment-token holder can therefore cause central-side requests to reachable URLs. Give this token only to trusted host administrators. Backend port 8000, PostgreSQL, Redis, and central Netdata are bound to host loopback. Do not embed shared tokens in browser JavaScript. `/healthz` remains a process health endpoint, and `/internal/alert` uses its webhook secret.
 2. **CORS is explicit and disabled by default.** Set `CORS_ALLOWED_ORIGINS` to explicit origins only when needed. Credentials are not enabled; the Authentik proxy setup expects a same-origin UI, so its CORS setting can remain empty.
 3. **Operational health is separate from process health.** `/healthz` remains a simple process check. `/api/v1/health/operations` reports database and Redis checks, Celery worker ping, scheduled beat-dispatch heartbeat, queue depth, task duration/failure rates, and investigation queue delay. Node/category timestamps remain the source for scrape freshness.
 4. **Polling remains the delivery contract.** Summary, cursor, and time-window endpoints support polling. No evidence currently shows that polling is inadequate, so SSE/WebSocket is deferred until UI load or update-latency measurements justify it.
@@ -162,7 +167,8 @@ Before calling the first UI milestone complete, the backend should ideally provi
 - [x] Investigation trigger references validated and linked to events only after dispatch.
 - [x] Searchable, filterable node inventory with keyset paging.
 - [x] Operational database/Redis/Celery/beat/queue and task health metrics.
-- [x] API contract/version tests added (not run during this work session).
+- [x] API contract/version test coverage is present. The earlier passing CI run
+  tested the code at `8b221d0`; the current audit changes need a fresh CI run.
 - [x] API/database and scheduled collection/evaluation worker health exposed in fleet summary separately from `/healthz`; Redis, Celery worker/beat dispatch, queue depth, task metrics, and investigation queue delay are reported by `/api/v1/health/operations`.
 
 ## 7. Source files reviewed

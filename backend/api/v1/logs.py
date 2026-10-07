@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query
@@ -23,14 +23,19 @@ async def list_node_logs(
     offset: int = Query(default=0, ge=0),
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
+    if (since is not None and since.tzinfo is None) or (until is not None and until.tzinfo is None):
+        raise HTTPException(status_code=400, detail="since and until must include a timezone")
+    if since is not None and until is not None and since >= until:
+        raise HTTPException(status_code=400, detail="since must be earlier than until")
+
     node = await NodeService.get_node(node_id, session)
     if not node:
         raise HTTPException(status_code=404, detail="Node not found")
     stmt = select(LogEvent).where(LogEvent.node_id == node_id)
     if since:
-        stmt = stmt.where(LogEvent.event_at >= since)
+        stmt = stmt.where(LogEvent.event_at >= since.astimezone(timezone.utc))
     if until:
-        stmt = stmt.where(LogEvent.event_at <= until)
+        stmt = stmt.where(LogEvent.event_at < until.astimezone(timezone.utc))
     if severity:
         stmt = stmt.where(LogEvent.severity == severity.lower())
     if source:

@@ -78,9 +78,9 @@ cp .env.example .env
 chmod 600 .env
 ```
 
-Set the required database passwords, webhook secret, API tokens, and Authentik
-secret in `.env`. Generate a separate value for each with `openssl rand -hex
-32`. Set `PALANTIR_LAN_BIND_IP` to the test machine's LAN address if other
+Set the required database passwords, webhook secret, API tokens, collector
+token (`AGENT_AUTH_TOKEN`), and Authentik secret in `.env`. Generate a separate
+value for each with `openssl rand -hex 32`. Set `PALANTIR_LAN_BIND_IP` to the test machine's LAN address if other
 machines need to reach it. Keep `.env` on that machine and out of GitHub.
 
 To use the published images rather than rebuilding or mounting source code,
@@ -112,7 +112,11 @@ Authentik authenticates the session. The only caller-supplied token accepted at
 the proxy is the restricted enrollment token, and only for `POST /api/v1/nodes`;
 the backend further limits it to create-only registration. The backend listens
 on host loopback, so LAN clients use the proxy. Never put shared tokens in
-browser JavaScript.
+browser JavaScript. `AGENT_AUTH_TOKEN` is a separate collector credential; set
+the same value as `PALANTIR_AGENT_TOKEN` on every remote host. Enrollment
+registration makes the central service probe the supplied endpoint URLs; only
+give the enrollment token to trusted host administrators and protect the
+central server with LAN firewall rules.
 
 ### LAN proxy and Authentik setup
 
@@ -125,13 +129,16 @@ DNS name.
 
 Before starting Compose, set `POSTGRES_PASSWORD`, `PALANTIR_LAN_BIND_IP`,
 `PALANTIR_API_READ_TOKEN`, `PALANTIR_API_ADMIN_TOKEN`,
-`PALANTIR_WEBHOOK_SECRET`, `AUTHENTIK_SECRET_KEY`, and
-`AUTHENTIK_POSTGRES_PASSWORD` in `.env`. Generate a different random value of
-at least 32 characters for each secret/token (for example, run
+`PALANTIR_API_ENROLL_TOKEN`, `PALANTIR_WEBHOOK_SECRET`, `AGENT_AUTH_TOKEN`,
+`AUTHENTIK_SECRET_KEY`, and `AUTHENTIK_POSTGRES_PASSWORD` in `.env`. Generate
+a different random value of at least 32 characters for each secret/token (for example, run
 `openssl rand -hex 32` separately for each). Keep all values distinct. Without
 a webhook secret, alert webhooks are rejected; without API tokens, API requests
 fail closed. Add both DNS names to the LAN DNS server before clients use them.
-Start the stack with `docker compose up -d`.
+Prefer `./scripts/setup-central.sh --lan-ip <CENTRAL_SERVER_LAN_IP>`; it
+validates the environment, applies the idempotent database schema, and starts
+the published image stack. For manual setup, initialize the schema before
+starting the backend with `docker compose up -d`.
 
 Make an initial TLS request from the server so Caddy creates its local root CA:
 
@@ -176,10 +183,8 @@ sudo update-ca-certificates
 ```
 
 The Caddy root CA is stored in the persistent `caddy_data` volume. Copy only its
-public root certificate to clients. For agents installed with
-`scripts/install-agent.sh`, first copy that file to the remote host, then pass
-`--ca-cert /path/to/caddy-root.crt`; the installer configures both the node
-enroller and Netdata webhook client to trust it. The root file
+public root certificate to clients. `scripts/setup-agent.sh` configures both
+the node enroller and Netdata webhook client to trust it. The root file
 `central-ca.crt` is only a placeholder for manual `docker-compose.agent.yml`
 deployments. Caddy's local certificates do not need public DNS or external port
 access.
@@ -274,9 +279,16 @@ The setup script pulls the published images automatically. Use
 
 The old `docker run` command deploys only Netdata. Replace it with the Compose bundle to enable host collection. Legacy nodes registered with only `netdata_url` continue to be polled for their existing Netdata categories.
 
-For a locally checked-out copy of this repository, run the same installer as
-root with `--server` and `--secret`; it performs the deployment and enrollment
-without requiring manual Compose or `.env` editing.
+For a locally checked-out copy of this repository, run:
+
+```bash
+sudo ./scripts/setup-agent.sh \
+  --secrets-file /path/to/.env.agent-secrets \
+  --ca-cert /path/to/caddy-root.crt
+```
+
+The older `install-agent.sh` wrapper rejects secret command-line arguments and
+delegates to the secure setup flow.
 
 ---
 

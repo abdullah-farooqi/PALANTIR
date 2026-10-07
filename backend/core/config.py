@@ -42,12 +42,13 @@ class Settings(BaseSettings):
         "PALANTIR_API_READ_TOKEN",
         "PALANTIR_API_ADMIN_TOKEN",
         "PALANTIR_API_ENROLL_TOKEN",
+        "AGENT_AUTH_TOKEN",
     )
     @classmethod
-    def validate_api_token_strength(cls, value: str) -> str:
+    def validate_access_token_strength(cls, value: str) -> str:
         if value and (len(value) < 32 or any(char.isspace() for char in value)):
             raise ValueError(
-                "Configured API tokens must be at least 32 characters and contain no whitespace"
+                "Configured API and collector tokens must be at least 32 characters and contain no whitespace"
             )
         return value
 
@@ -60,11 +61,12 @@ class Settings(BaseSettings):
                 self.PALANTIR_API_READ_TOKEN,
                 self.PALANTIR_API_ADMIN_TOKEN,
                 self.PALANTIR_API_ENROLL_TOKEN,
+                self.AGENT_AUTH_TOKEN,
             )
             if token
         ]
         if len(configured) != len(set(configured)):
-            raise ValueError("Configured webhook secret and API tokens must be distinct")
+            raise ValueError("Configured webhook, API, and collector tokens must be distinct")
         if self.NODE_STALE_SECONDS < self.NODE_REACHABLE_SECONDS:
             raise ValueError("NODE_STALE_SECONDS must be greater than or equal to NODE_REACHABLE_SECONDS")
         return self
@@ -115,12 +117,12 @@ class Settings(BaseSettings):
     )
 
     # Anomaly Engine Config
-    ANOMALY_THRESHOLD: float = 0.7
-    MIN_CONTEXTS_ANOMALOUS: int = 2
-    COOLDOWN_MINUTES: int = 10
+    ANOMALY_THRESHOLD: float = Field(default=0.7, ge=0, le=1)
+    MIN_CONTEXTS_ANOMALOUS: int = Field(default=2, ge=1)
+    COOLDOWN_MINUTES: int = Field(default=10, ge=0)
 
     # Netdata default client timeout
-    NETDATA_TIMEOUT_SECONDS: float = 5.0
+    NETDATA_TIMEOUT_SECONDS: float = Field(default=5.0, gt=0, le=120)
     AGENT_AUTH_TOKEN: str = Field(
         default="",
         description="Optional shared token sent to PALANTIR host collector endpoints",

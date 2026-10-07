@@ -13,11 +13,14 @@ NODE_NAME=""
 NETDATA_PORT="19999"
 COLLECTOR_PORT="20000"
 SERVER_URL=""
+SERVER_OVERRIDE=""
 WEBHOOK_SECRET=""
 ENROLL_TOKEN=""
 AGENT_TOKEN=""
 NETDATA_IMAGE="abdullahahmadfarooqi/palantir-netdata:latest"
 COLLECTOR_IMAGE="abdullahahmadfarooqi/palantir-host-collector:latest"
+NETDATA_IMAGE_OVERRIDE=""
+COLLECTOR_IMAGE_OVERRIDE=""
 
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
@@ -27,11 +30,14 @@ Usage: sudo ./scripts/setup-agent.sh [options]
 
 Options:
   --secrets-file PATH  Private .env.agent-secrets file made by setup-central.sh
+  --server URL         Central PALANTIR HTTPS origin (overrides the secrets file)
   --ca-cert PATH       Caddy root certificate copied from the central server
   --ip IPv4            Address the central server can reach on this host
   --hostname NAME      Node name (default: this machine's hostname)
   --netdata-port PORT  Published Netdata port (default: 19999)
   --collector-port PORT Published collector port (default: 20000)
+  --image IMAGE        Override the Netdata image
+  --collector-image IMAGE Override the host collector image
   --install-dir PATH   Install directory (default: /opt/palantir-agent)
   -h, --help           Show this help
 
@@ -43,11 +49,14 @@ EOF
 while (($#)); do
   case "$1" in
     --secrets-file) (($# >= 2)) || die "--secrets-file requires a path"; SECRETS_FILE="$2"; shift 2 ;;
+    --server) (($# >= 2)) || die "--server requires a URL"; SERVER_OVERRIDE="$2"; shift 2 ;;
     --ca-cert) (($# >= 2)) || die "--ca-cert requires a path"; CA_CERT="$2"; shift 2 ;;
     --ip) (($# >= 2)) || die "--ip requires an IPv4 address"; NODE_IP="$2"; shift 2 ;;
     --hostname) (($# >= 2)) || die "--hostname requires a name"; NODE_NAME="$2"; shift 2 ;;
     --netdata-port) (($# >= 2)) || die "--netdata-port requires a port"; NETDATA_PORT="$2"; shift 2 ;;
     --collector-port) (($# >= 2)) || die "--collector-port requires a port"; COLLECTOR_PORT="$2"; shift 2 ;;
+    --image) (($# >= 2)) || die "--image requires an image reference"; NETDATA_IMAGE_OVERRIDE="$2"; shift 2 ;;
+    --collector-image) (($# >= 2)) || die "--collector-image requires an image reference"; COLLECTOR_IMAGE_OVERRIDE="$2"; shift 2 ;;
     --install-dir) (($# >= 2)) || die "--install-dir requires a path"; INSTALL_DIR="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) die "Unknown option: $1 (use --help)" ;;
@@ -70,6 +79,10 @@ if [[ -n "$SECRETS_FILE" ]]; then
   NETDATA_IMAGE="$(awk -F= '$1 == "PALANTIR_NETDATA_IMAGE" { sub(/^[^=]*=/, ""); print; exit }' "$SECRETS_FILE")"
   COLLECTOR_IMAGE="$(awk -F= '$1 == "PALANTIR_COLLECTOR_IMAGE" { sub(/^[^=]*=/, ""); print; exit }' "$SECRETS_FILE")"
 fi
+
+[[ -z "$SERVER_OVERRIDE" ]] || SERVER_URL="$SERVER_OVERRIDE"
+[[ -z "$NETDATA_IMAGE_OVERRIDE" ]] || NETDATA_IMAGE="$NETDATA_IMAGE_OVERRIDE"
+[[ -z "$COLLECTOR_IMAGE_OVERRIDE" ]] || COLLECTOR_IMAGE="$COLLECTOR_IMAGE_OVERRIDE"
 
 prompt_value() {
   local label="$1" default="$2" response
@@ -97,8 +110,10 @@ valid_secret() {
 valid_ipv4() {
   local candidate="$1"
   [[ "$candidate" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
-  awk -F. '{ for (i = 1; i <= 4; i++) if ($i > 255) exit 1 }' <<<"$candidate" || return 1
-  [[ "$candidate" != 0.0.0.0 && "$candidate" != 127.* ]]
+  awk -F. '{
+    for (i = 1; i <= 4; i++) if ($i < 0 || $i > 255) exit 1
+    if ($1 == 0 || $1 == 127 || $1 >= 224 || ($1 == 169 && $2 == 254)) exit 1
+  }' <<<"$candidate"
 }
 
 valid_port() {
@@ -108,8 +123,13 @@ valid_port() {
 if [[ -z "$SERVER_URL" ]]; then
   SERVER_URL="$(prompt_value 'Central PALANTIR HTTPS URL' 'https://palantir.home.arpa')"
 fi
-[[ "$SERVER_URL" =~ ^https://[^/[:space:]]+/?$ ]] || die "Use the central HTTPS origin, for example https://palantir.home.arpa."
+[[ "$SERVER_URL" =~ ^https://[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?/?$ ]] || \
+  die "Use a central HTTPS origin with a DNS name or IPv4 address, for example https://palantir.home.arpa."
 SERVER_URL="${SERVER_URL%/}"
+if [[ "$SERVER_URL" =~ :([0-9]+)$ ]]; then
+  SERVER_PORT="${BASH_REMATCH[1]}"
+  (( 10#$SERVER_PORT > 0 && 10#$SERVER_PORT <= 65535 )) || die "Central HTTPS port must be between 1 and 65535."
+fi
 
 if [[ -z "$NODE_NAME" ]]; then
   DEFAULT_NAME="$(hostname -s 2>/dev/null || printf 'remote-node')"
@@ -129,6 +149,9 @@ NETDATA_PORT="$(prompt_value 'Published Netdata port' "$NETDATA_PORT")"
 COLLECTOR_PORT="$(prompt_value 'Published host collector port' "$COLLECTOR_PORT")"
 valid_port "$NETDATA_PORT" || die "Netdata port must be between 1 and 65535."
 valid_port "$COLLECTOR_PORT" || die "Collector port must be between 1 and 65535."
+NETDATA_PORT=$((10#$NETDATA_PORT))
+COLLECTOR_PORT=$((10#$COLLECTOR_PORT))
+[[ "$NETDATA_PORT" != "$COLLECTOR_PORT" ]] || die "Netdata and collector ports must be different."
 
 if [[ -z "$CA_CERT" ]]; then
   CA_CERT="$(prompt_value 'Path to the central Caddy root certificate' '')"
@@ -147,6 +170,8 @@ fi
 valid_secret "$WEBHOOK_SECRET" || die "Webhook secret must be at least 32 characters and use only letters, digits, dot, underscore, or hyphen."
 valid_secret "$ENROLL_TOKEN" || die "Enrollment token must be at least 32 characters and use only letters, digits, dot, underscore, or hyphen."
 valid_secret "$AGENT_TOKEN" || die "Collector token must be at least 32 characters and use only letters, digits, dot, underscore, or hyphen."
+[[ "$WEBHOOK_SECRET" != "$ENROLL_TOKEN" && "$WEBHOOK_SECRET" != "$AGENT_TOKEN" && "$ENROLL_TOKEN" != "$AGENT_TOKEN" ]] || \
+  die "Webhook, enrollment, and collector credentials must be different values."
 
 [[ "$NETDATA_IMAGE" =~ ^[A-Za-z0-9._/-]+:[A-Za-z0-9._-]+$ ]] || die "Invalid Netdata image reference in secrets file."
 [[ "$COLLECTOR_IMAGE" =~ ^[A-Za-z0-9._/-]+:[A-Za-z0-9._-]+$ ]] || die "Invalid collector image reference in secrets file."
@@ -215,7 +240,9 @@ EOF
 if [[ "$enrolled" == true ]]; then
   printf 'Central enrollment succeeded.\n'
 else
-  printf 'Enrollment has not completed; inspect with: docker logs palantir-agent-enroller\n'
+  printf 'Agent services are healthy, but central enrollment was not confirmed.\n' >&2
+  printf 'Inspect with: docker logs palantir-agent-enroller\n' >&2
+  exit 1
 fi
 cat <<EOF
 

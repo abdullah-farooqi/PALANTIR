@@ -40,8 +40,10 @@ done
 valid_ipv4() {
   local candidate="$1"
   [[ "$candidate" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
-  awk -F. '{ for (i = 1; i <= 4; i++) if ($i > 255) exit 1 }' <<<"$candidate" || return 1
-  [[ "$candidate" != 0.0.0.0 && "$candidate" != 127.* ]]
+  awk -F. '{
+    for (i = 1; i <= 4; i++) if ($i < 0 || $i > 255) exit 1
+    if ($1 == 0 || $1 == 127 || $1 >= 224 || ($1 == 169 && $2 == 254)) exit 1
+  }' <<<"$candidate"
 }
 
 read_env_value() {
@@ -121,12 +123,29 @@ for key in POSTGRES_PASSWORD PALANTIR_WEBHOOK_SECRET PALANTIR_API_READ_TOKEN \
   [[ -n "$value" ]] || die ".env is missing a value for ${key}. Set it and rerun."
   case "$key" in
     AUTHENTIK_SECRET_KEY)
-      [[ ${#value} -ge 32 ]] || die ".env value for ${key} must be at least 32 characters."
+      valid_secret "$value" || die ".env value for ${key} must be at least 32 characters and use only letters, digits, dot, underscore, or hyphen."
       ;;
     *TOKEN|*SECRET|*_PASSWORD)
       valid_secret "$value" || die ".env value for ${key} must be at least 32 characters and use only letters, digits, dot, underscore, or hyphen."
       ;;
   esac
+done
+
+SECRET_VALUES=(
+  "$(read_env_value POSTGRES_PASSWORD "$ENV_FILE")"
+  "$(read_env_value PALANTIR_WEBHOOK_SECRET "$ENV_FILE")"
+  "$(read_env_value PALANTIR_API_READ_TOKEN "$ENV_FILE")"
+  "$(read_env_value PALANTIR_API_ADMIN_TOKEN "$ENV_FILE")"
+  "$(read_env_value PALANTIR_API_ENROLL_TOKEN "$ENV_FILE")"
+  "$(read_env_value AUTHENTIK_SECRET_KEY "$ENV_FILE")"
+  "$(read_env_value AUTHENTIK_POSTGRES_PASSWORD "$ENV_FILE")"
+  "$(read_env_value AGENT_AUTH_TOKEN "$ENV_FILE")"
+)
+for ((i = 0; i < ${#SECRET_VALUES[@]}; i++)); do
+  for ((j = i + 1; j < ${#SECRET_VALUES[@]}; j++)); do
+    [[ "${SECRET_VALUES[i]}" != "${SECRET_VALUES[j]}" ]] || \
+      die "Secret values in .env must be unique; generate a different value for each setting."
+  done
 done
 
 LAN_IP="$(read_env_value PALANTIR_LAN_BIND_IP "$ENV_FILE")"
@@ -151,8 +170,38 @@ TEMP_AGENT=""
 trap - EXIT
 
 info "Pulling published images and starting the central platform"
-docker compose --env-file "$ENV_FILE" -f docker-compose.yml -f docker-compose.images.yml pull
-docker compose --env-file "$ENV_FILE" -f docker-compose.yml -f docker-compose.images.yml up -d --no-build
+COMPOSE=(docker compose --env-file "$ENV_FILE" -f docker-compose.yml -f docker-compose.images.yml)
+"${COMPOSE[@]}" pull
+
+# Stop API workers while applying schema changes so an older image cannot race
+# the migration during an upgrade. The SQL is also mounted as the fresh-volume
+# initialization script, and is idempotent for existing databases.
+if [[ -n "$("${COMPOSE[@]}" ps -q backend celery_worker celery_beat)" ]]; then
+  "${COMPOSE[@]}" stop backend celery_worker celery_beat
+fi
+"${COMPOSE[@]}" up -d postgres
+
+POSTGRES_USER="$(read_env_value POSTGRES_USER "$ENV_FILE")"
+POSTGRES_DB="$(read_env_value POSTGRES_DB "$ENV_FILE")"
+POSTGRES_USER="${POSTGRES_USER:-palantir}"
+POSTGRES_DB="${POSTGRES_DB:-palantir}"
+database_ready=false
+for _ in $(seq 1 60); do
+  # On a fresh volume, pg_isready can report the temporary PostgreSQL server
+  # used by the image's init scripts. Wait for the seed row written at the end
+  # of sql/init.sql so the explicit upgrade migration cannot race first boot.
+  if "${COMPOSE[@]}" exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+    -Atqc "SELECT EXISTS (SELECT 1 FROM monitored_nodes WHERE hostname = 'local-node')" 2>/dev/null | grep -qx t; then
+    database_ready=true
+    break
+  fi
+  sleep 2
+done
+[[ "$database_ready" == true ]] || die "PostgreSQL schema initialization did not finish; inspect with: ${COMPOSE[*]} logs postgres"
+
+"${COMPOSE[@]}" exec -T postgres psql -v ON_ERROR_STOP=1 \
+  -U "$POSTGRES_USER" -d "$POSTGRES_DB" <"${REPO_ROOT}/sql/init.sql"
+"${COMPOSE[@]}" up -d --no-build
 
 cat <<EOF
 

@@ -53,7 +53,12 @@ class AlertService:
             elif "WARN" in raw_status:
                 alert_status = "WARNING"
             else:
-                alert_status = "CLEAR"
+                logger.warning(
+                    "Ignoring alert webhook with unsupported status %r for %s",
+                    raw_status[:32],
+                    safe_hostname,
+                )
+                return None
         else:
             alert_status = raw_status
 

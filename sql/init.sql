@@ -213,6 +213,7 @@ ALTER TABLE agent_investigations ADD COLUMN IF NOT EXISTS queue_delay_ms INT;
 ALTER TABLE agent_investigations ADD COLUMN IF NOT EXISTS error_code VARCHAR(64);
 ALTER TABLE agent_investigations ADD COLUMN IF NOT EXISTS error_message TEXT;
 ALTER TABLE agent_investigations ALTER COLUMN started_at DROP NOT NULL;
+ALTER TABLE agent_investigations ALTER COLUMN started_at DROP DEFAULT;
 ALTER TABLE agent_investigations ALTER COLUMN status SET DEFAULT 'queued';
 ALTER TABLE agent_investigations DROP CONSTRAINT IF EXISTS agent_investigations_status_check;
 ALTER TABLE agent_investigations ADD CONSTRAINT agent_investigations_status_check
@@ -228,6 +229,10 @@ SET status = 'failed',
     error_message = 'This legacy running record has no queued job and was never dispatched.',
     summary = COALESCE(summary, 'Legacy investigation was not dispatched.')
 WHERE status = 'running' AND job_id IS NULL;
+-- Queued rows are not started until a worker claims them.
+UPDATE agent_investigations
+SET started_at = NULL
+WHERE status = 'queued' AND completed_at IS NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS uq_investigations_job_id
     ON agent_investigations (job_id)
     WHERE job_id IS NOT NULL;

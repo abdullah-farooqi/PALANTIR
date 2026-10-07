@@ -43,8 +43,8 @@ class NodeRegisterRequest(BaseModel):
     os_type: str = Field(
         default="linux",
         min_length=1,
-        max_length=32,
-        pattern=r"^[a-zA-Z0-9_\-]+$",
+        max_length=16,
+        pattern=r"^(linux|windows)$",
         description="Operating system type",
     )
 
@@ -67,6 +67,11 @@ class NodeRegisterRequest(BaseModel):
             return validate_netdata_url(v)
         except ValueError as err:
             raise ValueError(f"Invalid collector_url: {err}")
+
+    @field_validator("os_type", mode="before")
+    @classmethod
+    def normalize_os_type(cls, value: str) -> str:
+        return value.strip().lower() if isinstance(value, str) else value
 
 
 class NodeResponse(BaseModel):

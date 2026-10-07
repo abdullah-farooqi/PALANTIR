@@ -3,6 +3,7 @@ name: PALANTIR CI/CD Pipeline
 on:
   push:
     branches: [ "main", "initial_project" , "telemetry_pipeline" ]
+    tags: [ "v*" ]
   pull_request:
     branches: [ "main", "initial_project" ,  "telemetry_pipeline" ]
 
@@ -75,7 +76,6 @@ jobs:
     needs: unit-tests
     permissions:
       contents: read
-      packages: write
     # Disposable credentials for the throwaway Compose stack. These override
     # the intentionally blank values in .env.example and are not production secrets.
     env:
@@ -83,6 +83,8 @@ jobs:
       PALANTIR_WEBHOOK_SECRET: ci-webhook-secret-0123456789abcdef0123456789abcdef
       PALANTIR_API_READ_TOKEN: ci-read-token-0123456789abcdef0123456789abcdef
       PALANTIR_API_ADMIN_TOKEN: ci-admin-token-0123456789abcdef0123456789abcdef
+      PALANTIR_API_ENROLL_TOKEN: ci-enroll-token-0123456789abcdef0123456789abcdef
+      AGENT_AUTH_TOKEN: ci-agent-token-0123456789abcdef0123456789abcdef
       AUTHENTIK_SECRET_KEY: ci-only-authentik-secret-key-0123456789abcdef0123456789abcdef
       AUTHENTIK_POSTGRES_PASSWORD: ci-only-authentik-postgres-password-20261005
 
@@ -134,46 +136,22 @@ jobs:
         run: |
           docker compose exec -T backend pytest tests/ -v
 
-      - name: Log in to Docker Hub
-        if: github.event_name == 'push' && github.ref == 'refs/heads/telemetry_pipeline'
-        uses: docker/login-action@v3
-        with:
-          username: abdullahahmadfarooqi
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Log in to GitHub Container Registry
-        if: github.event_name == 'push' && github.ref == 'refs/heads/telemetry_pipeline'
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Publish images to Docker Hub and GitHub Container Registry
-        if: github.event_name == 'push' && github.ref == 'refs/heads/telemetry_pipeline'
-        env:
-          DOCKERHUB_NAMESPACE: abdullahahmadfarooqi
-          GHCR_NAMESPACE: ghcr.io/abdullah-farooqi
-          IMAGE_TAG: sha-${{ github.sha }}
+      - name: Save smoke-tested images for publishing
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/telemetry_pipeline' || startsWith(github.ref, 'refs/tags/v'))
         run: |
-          set -euo pipefail
-          images=(palantir-backend palantir-netdata palantir-host-collector)
-          docker tag palantir-host-collector:latest "$DOCKERHUB_NAMESPACE/palantir-host-collector:latest"
+          docker save --output palantir-images.tar \
+            abdullahahmadfarooqi/palantir-backend:latest \
+            abdullahahmadfarooqi/palantir-netdata:latest \
+            palantir-host-collector:latest
 
-          for image in "${images[@]}"; do
-            docker tag "$DOCKERHUB_NAMESPACE/$image:latest" "$DOCKERHUB_NAMESPACE/$image:telemetry_pipeline"
-            docker tag "$DOCKERHUB_NAMESPACE/$image:latest" "$DOCKERHUB_NAMESPACE/$image:$IMAGE_TAG"
-            docker tag "$DOCKERHUB_NAMESPACE/$image:latest" "$GHCR_NAMESPACE/$image:latest"
-            docker tag "$DOCKERHUB_NAMESPACE/$image:latest" "$GHCR_NAMESPACE/$image:telemetry_pipeline"
-            docker tag "$DOCKERHUB_NAMESPACE/$image:latest" "$GHCR_NAMESPACE/$image:$IMAGE_TAG"
-
-            docker push "$DOCKERHUB_NAMESPACE/$image:latest"
-            docker push "$DOCKERHUB_NAMESPACE/$image:telemetry_pipeline"
-            docker push "$DOCKERHUB_NAMESPACE/$image:$IMAGE_TAG"
-            docker push "$GHCR_NAMESPACE/$image:latest"
-            docker push "$GHCR_NAMESPACE/$image:telemetry_pipeline"
-            docker push "$GHCR_NAMESPACE/$image:$IMAGE_TAG"
-          done
+      - name: Upload smoke-tested images
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/telemetry_pipeline' || startsWith(github.ref, 'refs/tags/v'))
+        uses: actions/upload-artifact@v4
+        with:
+          name: palantir-images-${{ github.run_id }}-${{ github.run_attempt }}
+          path: palantir-images.tar
+          if-no-files-found: error
+          retention-days: 1
 
       - name: Container Logs on Failure
         if: failure()
@@ -183,3 +161,77 @@ jobs:
       - name: Clean Up Containers
         if: always()
         run: docker compose down -v
+
+  publish-images:
+    name: Publish smoke-tested images
+    runs-on: ubuntu-latest
+    needs: docker-smoke-test
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/telemetry_pipeline' || startsWith(github.ref, 'refs/tags/v'))
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Download smoke-tested images
+        uses: actions/download-artifact@v4
+        with:
+          name: palantir-images-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Load smoke-tested images
+        run: docker load --input palantir-images.tar
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: abdullahahmadfarooqi
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tag and publish smoke-tested images
+        env:
+          PUSH_REF: ${{ github.ref }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$PUSH_REF" == "refs/heads/telemetry_pipeline" ]]; then
+            suffixes=(latest telemetry_pipeline "sha-${COMMIT_SHA}")
+          elif [[ "$PUSH_REF" == refs/tags/v* ]]; then
+            version="${PUSH_REF#refs/tags/v}"
+            [[ "$version" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]] || {
+              echo "Release tag has an invalid Docker tag suffix." >&2
+              exit 1
+            }
+            suffixes=(latest "$version" "sha-${COMMIT_SHA}")
+          else
+            echo "Unsupported image publish ref: ${PUSH_REF}" >&2
+            exit 1
+          fi
+
+          for image in backend netdata collector; do
+            case "$image" in
+              backend)
+                docker_name=palantir-backend
+                source_image=abdullahahmadfarooqi/palantir-backend:latest
+                ;;
+              netdata)
+                docker_name=palantir-netdata
+                source_image=abdullahahmadfarooqi/palantir-netdata:latest
+                ;;
+              collector)
+                docker_name=palantir-host-collector
+                source_image=palantir-host-collector:latest
+                ;;
+            esac
+            for suffix in "${suffixes[@]}"; do
+              for target_image in "abdullahahmadfarooqi/${docker_name}" "ghcr.io/abdullah-farooqi/${docker_name}"; do
+                docker tag "$source_image" "${target_image}:${suffix}"
+                docker push "${target_image}:${suffix}"
+              done
+            done
+          done

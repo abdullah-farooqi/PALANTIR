@@ -1,6 +1,7 @@
 import hmac
 import ipaddress
 import re
+import socket
 from typing import Optional
 from urllib.parse import urlparse
 from core.config import settings
@@ -88,15 +89,13 @@ def validate_netdata_url(url: str) -> str:
         ip = ipaddress.ip_address(hostname_lower)
         is_ip = True
     except ValueError:
-        # Check for integer/hex encoded IP representations
+        # libc accepts abbreviated and octal IPv4 forms such as 127.1 and
+        # 0177.0.0.1. Treat those as IP literals too, instead of allowing them
+        # through hostname checks with different semantics at connect time.
         try:
-            if hostname_lower.isdigit():
-                ip = ipaddress.ip_address(int(hostname_lower))
-                is_ip = True
-            elif hostname_lower.startswith(("0x", "0X")):
-                ip = ipaddress.ip_address(int(hostname_lower, 16))
-                is_ip = True
-        except Exception:
+            ip = ipaddress.IPv4Address(socket.inet_aton(hostname_lower))
+            is_ip = True
+        except (OSError, OverflowError):
             pass
 
     if is_ip:

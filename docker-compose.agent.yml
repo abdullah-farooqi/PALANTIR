@@ -6,8 +6,10 @@
 # Usage:
 #   PALANTIR_SERVER_URL=https://<PALANTIR_PROXY_HOST> \
 #   PALANTIR_WEBHOOK_SECRET=<CENTRAL_WEBHOOK_SECRET> \
+#   PALANTIR_AGENT_TOKEN=<SHARED_COLLECTOR_TOKEN> \
 #   PALANTIR_API_ENROLL_TOKEN=<RESTRICTED_ENROLLMENT_TOKEN> \
 #   PALANTIR_CA_CERT=/etc/ssl/certs/palantir-central-ca.crt \
+#   NODE_HOSTNAME=<UNIQUE_HOSTNAME> \
 #   NODE_ADVERTISED_URL=http://<CHILD_IP>:19999 \
 #   COLLECTOR_ADVERTISED_URL=http://<CHILD_IP>:20000 \
 #   docker compose -f docker-compose.agent.yml up -d
@@ -17,7 +19,7 @@ services:
   sensor:
     image: ${PALANTIR_NETDATA_IMAGE:-abdullahahmadfarooqi/palantir-netdata:latest}
     container_name: palantir-agent-sensor
-    hostname: ${NODE_HOSTNAME:-remote-node}
+    hostname: ${NODE_HOSTNAME:?Set a unique NODE_HOSTNAME in the agent environment}
     restart: unless-stopped
     pid: host
     ports:
@@ -32,9 +34,9 @@ services:
       - netdata_agent_cache:/usr/local/var/cache/netdata
       - ./central-ca.crt:/etc/ssl/certs/palantir-central-ca.crt:ro
     environment:
-      - PALANTIR_WEBHOOK_URL=${PALANTIR_SERVER_URL:-http://localhost:8000}/internal/alert
+      - PALANTIR_WEBHOOK_URL=${PALANTIR_SERVER_URL:?Set the central HTTPS origin in the agent environment}/internal/alert
       - PALANTIR_WEBHOOK_SECRET=${PALANTIR_WEBHOOK_SECRET:?Set the same webhook secret configured on the central server}
-      - PALANTIR_CA_CERT=${PALANTIR_CA_CERT:-}
+      - PALANTIR_CA_CERT=${PALANTIR_CA_CERT:?Set the path to the mounted central root certificate}
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://127.0.0.1:19999/api/v1/info || exit 1"]
       interval: 5s
@@ -44,7 +46,7 @@ services:
   collector:
     image: ${PALANTIR_COLLECTOR_IMAGE:-abdullahahmadfarooqi/palantir-host-collector:latest}
     container_name: palantir-agent-collector
-    hostname: ${NODE_HOSTNAME:-remote-node}
+    hostname: ${NODE_HOSTNAME:?Set a unique NODE_HOSTNAME in the agent environment}
     restart: unless-stopped
     pid: host
     read_only: true
@@ -52,7 +54,6 @@ services:
       - /tmp
     cap_add:
       - SYS_PTRACE
-      - SYS_ADMIN
     security_opt:
       - no-new-privileges:true
     ports:
@@ -89,7 +90,7 @@ services:
       - HOME=/tmp
       - DOCKER_SOCKET=/host/run/docker.sock
       - APP_LOG_GLOBS=${APP_LOG_GLOBS:-/host/var/log/**/*.log,/host/var/log/syslog,/host/var/log/messages,/host/var/log/auth.log}
-      - PALANTIR_AGENT_TOKEN=${PALANTIR_AGENT_TOKEN:-}
+      - PALANTIR_AGENT_TOKEN=${PALANTIR_AGENT_TOKEN:?Set the same collector token as AGENT_AUTH_TOKEN on the central server}
       - LOG_MIN_PRIORITY=${LOG_MIN_PRIORITY:-7}
       - KUBERNETES_API_URL=${KUBERNETES_API_URL:-}
       - KUBERNETES_TOKEN=${KUBERNETES_TOKEN:-}
@@ -114,13 +115,13 @@ services:
       collector:
         condition: service_healthy
     environment:
-      - PALANTIR_SERVER_URL=${PALANTIR_SERVER_URL:-http://localhost:8000}
-      - NODE_HOSTNAME=${NODE_HOSTNAME:-remote-node}
-      - NODE_ADVERTISED_URL=${NODE_ADVERTISED_URL:-http://localhost:19999}
-      - COLLECTOR_ADVERTISED_URL=${COLLECTOR_ADVERTISED_URL:-http://localhost:20000}
+      - PALANTIR_SERVER_URL=${PALANTIR_SERVER_URL:?Set the central HTTPS origin in the agent environment}
+      - NODE_HOSTNAME=${NODE_HOSTNAME:?Set a unique NODE_HOSTNAME in the agent environment}
+      - NODE_ADVERTISED_URL=${NODE_ADVERTISED_URL:?Set the Netdata URL reachable from the central server}
+      - COLLECTOR_ADVERTISED_URL=${COLLECTOR_ADVERTISED_URL:?Set the collector URL reachable from the central server}
       - OS_TYPE=${OS_TYPE:-linux}
       - PALANTIR_API_ENROLL_TOKEN=${PALANTIR_API_ENROLL_TOKEN:-}
-      - PALANTIR_CA_CERT=${PALANTIR_CA_CERT:-}
+      - PALANTIR_CA_CERT=${PALANTIR_CA_CERT:?Set the path to the mounted central root certificate}
     volumes:
       - ./central-ca.crt:/etc/ssl/certs/palantir-central-ca.crt:ro
     entrypoint: ["/bin/sh", "-c"]

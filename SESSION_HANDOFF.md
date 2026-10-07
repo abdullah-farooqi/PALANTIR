@@ -1,11 +1,11 @@
 # PALANTIR — Session Handoff
 
-**Date:** 2026-10-04
+**Date:** 2026-10-07
 **Project Path:** `/home/abdullah-ahmad/Desktop/PALANTIR`
 **Reference:** `/home/abdullah-ahmad/Desktop/netdata/PALANTIR`
-**Status:** **Implementation and documentation changes are uncommitted; verify `git status` before handoff.**
+**Status:** **A broad backend, deployment, and CI audit is in progress. The worktree contains uncommitted fixes; its CI run is pending.**
 
-### Expanded Linux Agent Implementation (runtime validation pending)
+### Expanded Linux Agent Implementation and Validation Status
 
 The monitored-host deployment now has a Compose design with Netdata on `19999`
 and a PALANTIR collector on `20000`. The collector exposes category JSON and
@@ -35,13 +35,14 @@ The collector Compose service mounts host `/`, `/proc`, `/sys`, `/run`, and
 Docker socket permits Docker API actions despite the read-only mount. Keep the
 published agent ports private and restrict them to the central server.
 
-Earlier static validation passed before the API authentication, alert lifecycle,
-and investigation semantics changes were made. Those newer changes have not
-been validated, and the images have not been built or checked against a running
-central stack or monitored host. Before deploying the backend, apply the
-idempotent `sql/init.sql` updates (including the one-time legacy dispatch-flag
-correction); before remote installation, build and publish the new
-`palantir-host-collector` image with `scripts/build-and-push.sh`.
+CI run `37347718534` passed the Python 3.11/3.12 suites, Docker stack smoke
+checks, and backend tests at commit `8b221d0`; it published the backend,
+Netdata, and host collector images. The current audit changes were made after
+that run and still need their own CI result. Real DNS, Authentik login, LAN
+firewall, and remote-host enrollment need deployment-specific validation.
+`scripts/setup-central.sh` replays the idempotent `sql/init.sql` migration
+before starting the API and workers, including when an existing database volume
+is reused.
 
 The LAN gateway is defined by the root `Caddyfile` and `docker-compose.yml`:
 Caddy exposes `palantir.home.arpa` and `auth.palantir.home.arpa`, Authentik is
@@ -52,15 +53,16 @@ headers. A restricted enrollment token is accepted only on machine `POST
 ports are bound to host loopback. Configure local DNS,
 `PALANTIR_LAN_BIND_IP`, all required secrets, Authentik's initial administrator,
 and the proxy application/groups before LAN access. Caddy's private root CA must
-be trusted by client devices. This gateway configuration has not been validated
-or started; do not mark it deployment-ready until its Compose and Caddy config
-are checked with configured local secrets and DNS.
+be trusted by client devices. A prior CI smoke started the Compose services but
+did not validate real LAN DNS, Authentik login, or client certificate trust.
+Those deployment-specific steps remain to be checked on the target network.
 
 API tokens and the webhook secret must each be independently generated, at
 least 32 characters, and distinct; no default webhook secret is accepted.
-Remote installs without the optional enrollment token skip automatic node
-registration cleanly and can be registered later from the central host with
-`scripts/register-node.sh` and an admin token.
+Manual Compose deployments can omit the enrollment token and register later
+from the central host with `scripts/register-node.sh` and an admin token. The
+guided `scripts/setup-agent.sh` flow expects the token so it can confirm
+enrollment before reporting success.
 
 ---
 
@@ -116,8 +118,9 @@ collector-defined. The migration adds `last_collection_at`, status/heartbeat
 tables and supporting indexes. Apply `sql/init.sql` before deploying updated
 API/worker containers.
 
-The Priority 1 code and documentation have not been exercised against a running
-database or stack in this handoff. No tests were run in this work session.
+The earlier successful CI run exercised the Priority 1 code present at
+`8b221d0`. The current audit fixes have not yet been tested; the pending CI run
+will check the updated worktree.
 
 Implemented in the current worktree:
 - Netdata key normalization and active process extraction.
@@ -159,20 +162,23 @@ PALANTIR_API_ADMIN_TOKEN='<CENTRAL_ADMIN_TOKEN>' \
 
 ```
 
-### B. Remote Agent: `scripts/install-agent.sh`
-Copy the Caddy root CA certificate to the remote host, then run this on a
-remote Linux host that has Docker and Compose:
+### B. Remote Agent: `scripts/setup-agent.sh`
+Copy the agent-only secrets file and public Caddy root CA certificate to the
+remote host, then run this on a Linux host that has Docker and Compose:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/abdullah-farooqi/PALANTIR/telemetry_pipeline/scripts/install-agent.sh \
-  | sudo bash -s -- --server https://palantir.home.arpa --ca-cert ./caddy-root.crt --secret '<CENTRAL_PALANTIR_WEBHOOK_SECRET>' --enrollment-token '<CENTRAL_PALANTIR_API_ENROLL_TOKEN>'
+sudo ./scripts/setup-agent.sh \
+  --secrets-file /path/to/.env.agent-secrets \
+  --ca-cert /path/to/caddy-root.crt
 ```
-The installer downloads the Compose definition, writes a mode-600 `.env`, pulls
-the images, starts both services, waits for health, and enrolls the endpoint.
-The enrollment token is restricted to create-only node registration. The
-central server requires separate read/admin API tokens; Caddy injects them
-after Authentik login. Keep all API tokens out of browser code. The proxy setup
-expects the UI to be same-origin; CORS credentials remain disabled.
+The setup script writes a mode-600 `.env.agent`, pulls the images, starts both
+services, waits for health, and submits create-only enrollment. Do not pass
+secret values as command-line arguments. The compatibility
+`scripts/install-agent.sh` wrapper rejects secret flags and delegates to the
+same secure setup flow. The central server requires separate read/admin API
+tokens; Caddy injects them after Authentik login. Keep all API tokens out of
+browser code. The proxy setup expects the UI to be same-origin; CORS
+credentials remain disabled.
 
 ---
 
@@ -242,11 +248,11 @@ are saved only after successful queue dispatch. This workflow does not call an
 LLM or infer root cause. A future LangGraph diagnosis can replace the workflow
 behind the same job/result contract if configured and reviewed.
 
-The Redis service now uses append-only persistence. Apply the expanded,
-idempotent `sql/init.sql` before starting API, worker, and beat containers. The
-new operational endpoints and migrations have not been exercised against a
-running stack. API contract tests were added, but no tests were run during this
-work session.
+The Redis service now uses append-only persistence. `scripts/setup-central.sh`
+applies the expanded, idempotent `sql/init.sql` before starting API, worker, and
+beat containers. The preceding successful CI run exercised these endpoints and
+migrations at `8b221d0`. Changes from the current audit still need the pending
+CI run; do not claim they are verified until it completes.
 
 Metric and log pruning now use environment-configured retention; rollups remain
 a future optimization once collection volume is measured.
