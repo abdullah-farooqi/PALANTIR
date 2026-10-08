@@ -15,6 +15,11 @@ class SystemContexts:
     LOAD  = "system.load"
 
 
+class StorageContexts:
+    DISK_SPACE = "disk_space"
+    DISK_IO    = "disk.io"
+
+
 class ProcessContexts:
     CPU     = "app.cpu_utilization" # [VERIFIED] apps.cpu -> 0 rows silently
     MEMORY  = "app.mem_usage"       # [VERIFIED] apps.mem -> 0 rows silently

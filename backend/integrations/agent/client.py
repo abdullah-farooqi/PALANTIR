@@ -8,7 +8,7 @@ from core.config import settings
 
 
 class AgentCollectorClient:
-    def __init__(self, base_url: str, timeout: float = 30.0):
+    def __init__(self, base_url: str, timeout: float = 5.0):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
 

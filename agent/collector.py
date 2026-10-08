@@ -168,6 +168,21 @@ def collect_system() -> dict[str, Any]:
     mem = psutil.virtual_memory()
     swap = psutil.swap_memory()
     load = os.getloadavg() if hasattr(os, "getloadavg") else (None, None, None)
+    
+    # Per-core and total CPU telemetry
+    cpu_total = psutil.cpu_percent(interval=0.1)
+    per_core = psutil.cpu_percent(interval=None, percpu=True)
+    times = psutil.cpu_times_percent(interval=None)
+    cpu_times_dict = {
+        "user": getattr(times, "user", 0.0),
+        "system": getattr(times, "system", 0.0),
+        "idle": getattr(times, "idle", 0.0),
+        "iowait": getattr(times, "iowait", 0.0),
+        "irq": getattr(times, "irq", 0.0),
+        "softirq": getattr(times, "softirq", 0.0),
+        "steal": getattr(times, "steal", 0.0),
+    }
+
     vmstat = {}
     for line in _read_text(HOST_PROC / "vmstat", 256_000).splitlines():
         parts = line.split()
@@ -176,37 +191,121 @@ def collect_system() -> dict[str, Any]:
                 vmstat[parts[0]] = int(parts[1])
             except ValueError:
                 pass
+    meminfo = {}
+    for line in _read_text(HOST_PROC / "meminfo", 256_000).splitlines():
+        parts = line.split(":")
+        if len(parts) == 2:
+            k = parts[0].strip()
+            v_str = parts[1].strip().split()[0]
+            if v_str.isdigit():
+                meminfo[k] = int(v_str) * 1024  # Convert kB to bytes
+
+    buffers_bytes = getattr(mem, "buffers", meminfo.get("Buffers", 0))
+    cached_bytes = getattr(mem, "cached", meminfo.get("Cached", 0))
+    active_bytes = getattr(mem, "active", meminfo.get("Active", 0))
+    inactive_bytes = getattr(mem, "inactive", meminfo.get("Inactive", 0))
+    slab_bytes = getattr(mem, "slab", meminfo.get("Slab", 0))
+
+    os_release = {}
+    for os_file in [HOST_ROOT / "etc/os-release", Path("/etc/os-release")]:
+        if os_file.exists():
+            for line in _read_text(os_file, 16_000).splitlines():
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    os_release[k.strip()] = v.strip().strip('"')
+            break
+
     return _status_data({
         "cpu_count": psutil.cpu_count(),
         "cpu_logical_count": psutil.cpu_count(logical=True),
-        "memory": {"total_bytes": mem.total, "available_bytes": mem.available, "used_bytes": mem.used, "percent": mem.percent},
+        "cpu_pct": cpu_total,
+        "cpu_cores_pct": per_core,
+        "cpu_times": cpu_times_dict,
+        "memory": {
+            "total_bytes": mem.total,
+            "available_bytes": mem.available,
+            "used_bytes": mem.used,
+            "buffers_bytes": buffers_bytes,
+            "cached_bytes": cached_bytes,
+            "active_bytes": active_bytes,
+            "inactive_bytes": inactive_bytes,
+            "slab_bytes": slab_bytes,
+            "percent": mem.percent,
+        },
         "swap": {"total_bytes": swap.total, "used_bytes": swap.used, "percent": swap.percent},
         "load_average": list(load),
         "vmstat": vmstat,
+        "os_release": os_release,
     })
 
 
 def collect_storage() -> dict[str, Any]:
     filesystems = []
-    seen: set[tuple[str, str]] = set()
+    seen: set[str] = set()
+
+    SKIP_FSTYPES = {
+        "squashfs", "overlay", "tmpfs", "devtmpfs", "proc", "sysfs", "cgroup",
+        "cgroup2", "binfmt_misc", "efivarfs", "bpf", "pstore", "fusectl",
+        "configfs", "debugfs", "tracefs", "autofs", "devpts", "mqueue"
+    }
+
+    # 1. Always attempt physical host root first
+    for root_candidate in [HOST_ROOT, Path("/")]:
+        if root_candidate.exists():
+            try:
+                usage = shutil.disk_usage(root_candidate)
+                filesystems.append({
+                    "device": "/dev/root",
+                    "mountpoint": "/",
+                    "filesystem": "ext4",
+                    "options": "rw",
+                    "total_bytes": usage.total,
+                    "used_bytes": usage.used,
+                    "free_bytes": usage.free,
+                    "percent": round(usage.used / usage.total * 100, 2) if usage.total else 0,
+                    "status": "available",
+                })
+                seen.add("/")
+                break
+            except OSError:
+                pass
+
+    # 2. Add additional physical mount points if present
     try:
         partitions = psutil.disk_partitions(all=True)
     except (OSError, RuntimeError):
         partitions = []
+
     for part in partitions:
-        key = (part.device, part.mountpoint)
-        if key in seen or part.fstype in {"squashfs", "overlay", "tmpfs", "devtmpfs", "proc", "sysfs", "cgroup", "cgroup2"}:
+        mp = part.mountpoint
+        clean_mp = mp[5:] if mp.startswith("/host/") else mp
+        if clean_mp == "/host":
+            clean_mp = "/"
+        if clean_mp in seen or part.fstype in SKIP_FSTYPES:
             continue
-        seen.add(key)
-        mount_path = _proc_mount_path(part.mountpoint)
+        if clean_mp.startswith(("/proc", "/sys", "/dev", "/run", "/snap", "/etc", "/etc/")):
+            continue
+
+        target_path = Path(mp) if mp.startswith("/host/") else (HOST_ROOT / mp.lstrip("/"))
+        if not target_path.exists():
+            target_path = Path(mp)
+
         try:
-            usage = shutil.disk_usage(mount_path)
-            usage_data = {"total_bytes": usage.total, "used_bytes": usage.used, "free_bytes": usage.free, "percent": round(usage.used / usage.total * 100, 2) if usage.total else 0}
-            status = "available"
-        except OSError as exc:
-            usage_data = {"error": str(exc)}
-            status = "permission_denied" if isinstance(exc, PermissionError) else "unavailable"
-        filesystems.append({"device": part.device, "mountpoint": part.mountpoint, "filesystem": part.fstype, "options": part.opts, **usage_data, "status": status})
+            usage = shutil.disk_usage(target_path)
+            seen.add(clean_mp)
+            filesystems.append({
+                "device": part.device or clean_mp,
+                "mountpoint": clean_mp,
+                "filesystem": part.fstype,
+                "options": part.opts,
+                "total_bytes": usage.total,
+                "used_bytes": usage.used,
+                "free_bytes": usage.free,
+                "percent": round(usage.used / usage.total * 100, 2) if usage.total else 0,
+                "status": "available",
+            })
+        except OSError:
+            continue
 
     mdstat = _read_text(HOST_PROC / "mdstat", 256_000)
     raid_arrays = _parse_mdstat(mdstat)
@@ -217,22 +316,52 @@ def collect_storage() -> dict[str, Any]:
     }, "available" if filesystems or mdstat else "partial")
 
 
-def collect_network() -> dict[str, Any]:
+def _parse_proc_net_dev() -> dict[str, dict[str, int]]:
+    dev_path = HOST_PROC / "net/dev"
+    if not dev_path.exists():
+        dev_path = Path("/proc/net/dev")
     interfaces = {}
-    try:
-        for name, counters in psutil.net_io_counters(pernic=True, nowrap=True).items():
-            interfaces[name] = {
-                "bytes_sent": counters.bytes_sent,
-                "bytes_recv": counters.bytes_recv,
-                "packets_sent": counters.packets_sent,
-                "packets_recv": counters.packets_recv,
-                "errors_in": counters.errin,
-                "errors_out": counters.errout,
-                "drops_in": counters.dropin,
-                "drops_out": counters.dropout,
-            }
-    except (OSError, RuntimeError):
-        pass
+    content = _read_text(dev_path, 500_000)
+    for line in content.splitlines():
+        if ":" not in line:
+            continue
+        iface, data = line.split(":", 1)
+        iface = iface.strip()
+        parts = data.split()
+        if len(parts) >= 16:
+            try:
+                interfaces[iface] = {
+                    "bytes_recv": int(parts[0]),
+                    "packets_recv": int(parts[1]),
+                    "errors_in": int(parts[2]),
+                    "drops_in": int(parts[3]),
+                    "bytes_sent": int(parts[8]),
+                    "packets_sent": int(parts[9]),
+                    "errors_out": int(parts[10]),
+                    "drops_out": int(parts[11]),
+                }
+            except ValueError:
+                continue
+    return interfaces
+
+
+def collect_network() -> dict[str, Any]:
+    interfaces = _parse_proc_net_dev()
+    if not interfaces:
+        try:
+            for name, counters in psutil.net_io_counters(pernic=True, nowrap=True).items():
+                interfaces[name] = {
+                    "bytes_sent": counters.bytes_sent,
+                    "bytes_recv": counters.bytes_recv,
+                    "packets_sent": counters.packets_sent,
+                    "packets_recv": counters.packets_recv,
+                    "errors_in": counters.errin,
+                    "errors_out": counters.errout,
+                    "drops_in": counters.dropin,
+                    "drops_out": counters.dropout,
+                }
+        except (OSError, RuntimeError):
+            pass
     protocols = {}
     pending_headers: dict[str, list[str]] = {}
     for line in _read_text(HOST_PROC / "net/snmp", 256_000).splitlines():

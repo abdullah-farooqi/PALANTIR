@@ -9,8 +9,7 @@ CREATE TABLE IF NOT EXISTS monitored_nodes (
     netdata_url     TEXT        NOT NULL,       -- http://<ip>:19999
     collector_url   TEXT,                       -- optional PALANTIR host collector endpoint
     capabilities    JSONB,
-    os_type         TEXT        NOT NULL DEFAULT 'linux'
-                                CHECK (os_type IN ('linux', 'windows')),
+    os_type         TEXT        NOT NULL DEFAULT 'linux',
     active          BOOLEAN     NOT NULL DEFAULT TRUE,
     context_count   INT,                        -- set on registration
     alert_count     INT,                        -- set on registration

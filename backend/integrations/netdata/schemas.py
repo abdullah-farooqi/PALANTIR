@@ -22,7 +22,7 @@ class NetdataWeightsResponse(BaseModel):
 
 
 class NetdataInfoResponse(BaseModel):
-    model_config = ConfigDict(populate_by_name=True)
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
 
     version: str = ""
     uid: str = ""

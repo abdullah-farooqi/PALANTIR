@@ -43,9 +43,8 @@ class NodeRegisterRequest(BaseModel):
     os_type: str = Field(
         default="linux",
         min_length=1,
-        max_length=16,
-        pattern=r"^(linux|windows)$",
-        description="Operating system type",
+        max_length=64,
+        description="Operating system type or distro name",
     )
 
     model_config = {"extra": "forbid"}
@@ -99,6 +98,13 @@ class NodeResponse(BaseModel):
         if age_seconds <= settings.NODE_STALE_SECONDS:
             return "stale"
         return "unreachable"
+
+    @computed_field
+    @property
+    def active_alerts_count(self) -> int:
+        if not hasattr(self, "alert_events") or not self.alert_events:
+            return 0
+        return sum(1 for a in self.alert_events if getattr(a, "status", "") in {"WARNING", "CRITICAL", "active"})
 
     model_config = {"from_attributes": True}
 

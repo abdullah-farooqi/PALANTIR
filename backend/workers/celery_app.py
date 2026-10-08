@@ -20,9 +20,9 @@ celery_app.conf.update(
 )
 
 celery_app.conf.beat_schedule = {
-    "collect-metrics-60s": {
+    "collect-metrics-top-of-minute": {
         "task": "workers.metrics_tasks.collect_all_nodes",
-        "schedule": 60.0,
+        "schedule": crontab(minute="*"),
     },
     "collect-anomaly-5min": {
         "task": "workers.anomaly_tasks.evaluate_all_nodes",

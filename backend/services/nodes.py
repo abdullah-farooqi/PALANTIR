@@ -22,9 +22,7 @@ class NodeService:
         collector_url: Optional[str] = None,
     ) -> MonitoredNode:
         netdata_url = validate_netdata_url(netdata_url)
-        os_type = os_type.strip().lower()
-        if os_type not in {"linux", "windows"}:
-            raise ValueError("os_type must be either 'linux' or 'windows'")
+        os_type = os_type.strip().lower() if os_type else "linux"
         client = NetdataClient(base_url=netdata_url)
         capabilities = None
         if collector_url:
@@ -37,8 +35,30 @@ class NodeService:
                 logger.warning("Host collector unavailable during enrollment for %s: %s", hostname, exc)
                 capabilities = {"status": "unavailable", "reason": str(exc)[:300]}
         
-        # Probe connectivity
-        await client.info()
+        # Probe connectivity & discover OS details
+        try:
+            info_resp = await client.info()
+            labels = info_resp.host_labels or {}
+        except Exception as err:
+            logger.warning("v1 info probe failed for %s, trying v3: %s", hostname, err)
+            try:
+                v3_meta = await client.get_host_metadata()
+                labels = v3_meta.get("host_labels") or {}
+            except Exception as v3_err:
+                logger.error("Netdata agent probe completely failed for %s: %s", hostname, v3_err)
+                raise NetdataUnavailable(f"Failed to probe Netdata agent: {v3_err}")
+
+        # Auto-detect real distro name from Netdata host labels if generic 'linux' was passed
+        detected_os = (
+            labels.get("_os_name") or
+            labels.get("_os_id") or
+            labels.get("_os") or
+            labels.get("_os_version")
+        )
+        if detected_os and isinstance(detected_os, str):
+            os_type = detected_os.strip().lower()
+        elif os_type not in {"linux", "windows"}:
+            os_type = "linux"
 
 
         # Discover contexts

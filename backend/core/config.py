@@ -129,7 +129,7 @@ class Settings(BaseSettings):
     )
     METRICS_RETENTION_HOURS: int = Field(default=24, ge=1)
     LOG_RETENTION_DAYS: int = Field(default=7, ge=1)
-    NODE_REACHABLE_SECONDS: int = Field(default=180, ge=60)
+    NODE_REACHABLE_SECONDS: int = Field(default=180, ge=30)
     NODE_STALE_SECONDS: int = Field(default=900, ge=60)
     METRIC_STALE_SECONDS: int = Field(default=180, ge=60)
     WORKER_HEARTBEAT_STALE_SECONDS: int = Field(default=180, ge=60)

@@ -12,22 +12,61 @@ logger = logging.getLogger(__name__)
 
 @celery_app.task(bind=True, max_retries=3, default_retry_delay=10)
 def collect_all_nodes(self):
-    """Runs every 60s. One task, iterates over all active nodes."""
+    """
+    Runs at top of every minute (:00s).
+    Dynamically groups nodes into time slots based on fleet size:
+      - Fleet < 20 nodes: 1 Slot  -> All nodes poll together at top-of-minute (:00s).
+      - Fleet 20-59 nodes: 2 Slots -> Group 0 at :00s, Group 1 at :30s.
+      - Fleet >= 60 nodes: 4 Slots -> Groups at :00s, :15s, :30s, :45s.
+    """
     with get_sync_session() as session:
         record_task_start(session, "metrics_collection")
         failures = 0
         try:
-            stmt = select(MonitoredNode).where(MonitoredNode.active == True)
+            stmt = select(MonitoredNode).where(MonitoredNode.active == True).order_by(MonitoredNode.id)
             nodes = session.execute(stmt).scalars().all()
-            for node in nodes:
-                try:
-                    svc = MetricsService(node_url=node.netdata_url)
-                    svc.use_collector(node.collector_url)
-                    asyncio.run(svc.collect_and_persist(node.id, session))
-                except Exception as exc:
-                    failures += 1
-                    session.rollback()
-                    logger.warning(f"Node {node.id} ({node.hostname}) collection failed: {exc}")
+            total_nodes = len(nodes)
+
+            if total_nodes == 0:
+                record_task_finish(session, "metrics_collection", failed=False)
+                return
+
+            # Determine number of slots
+            if total_nodes < 20:
+                num_slots = 1
+            elif total_nodes < 60:
+                num_slots = 2
+            else:
+                num_slots = 4
+
+            slot_interval = 60 // num_slots
+
+            # Group nodes into slots
+            slots = {i: [] for i in range(num_slots)}
+            for idx, node in enumerate(nodes):
+                slot_idx = idx % num_slots
+                slots[slot_idx].append(node)
+
+            # Process Slot 0 immediately at :00s
+            async def _collect_batch(node_batch):
+                async def _single_node(node_item):
+                    try:
+                        svc = MetricsService(node_url=node_item.netdata_url)
+                        svc.use_collector(node_item.collector_url)
+                        await svc.collect_and_persist(node_item.id, session)
+                    except Exception as exc:
+                        logger.warning(f"Node {node_item.id} ({node_item.hostname}) collection failed: {exc}")
+
+                await asyncio.gather(*[_single_node(n) for n in node_batch], return_exceptions=True)
+
+            asyncio.run(_collect_batch(slots[0]))
+
+            # Process subsequent slots after sleeping for slot_interval seconds
+            for slot_idx in range(1, num_slots):
+                import time
+                time.sleep(slot_interval)
+                asyncio.run(_collect_batch(slots[slot_idx]))
+
             record_task_finish(
                 session,
                 "metrics_collection",

@@ -1,3 +1,4 @@
+import re
 import httpx
 from typing import Any, Dict, List, Optional, Sequence, Type, TypeVar
 from .schemas import (

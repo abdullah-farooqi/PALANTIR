@@ -36,6 +36,11 @@ celerybeat-schedule.*
 postgres_data/
 redis_data/
 
+# Frontend Build & Dependency Exclusions
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
 # IDE & Editor Files
 .idea/
 .vscode/

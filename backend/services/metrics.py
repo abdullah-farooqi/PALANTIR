@@ -6,6 +6,7 @@ from integrations.netdata.parsers import parse_rows
 from integrations.netdata.contexts import (
     NetworkContexts,
     SystemContexts,
+    StorageContexts,
     ProcessContexts,
     ContainerContexts,
 )
@@ -125,6 +126,17 @@ class MetricsService:
         )
         return parse_rows(raw)
 
+    async def collect_storage(self) -> List[Dict]:
+        raw = await self.client.get_metrics(
+            contexts=[
+                StorageContexts.DISK_SPACE,
+                StorageContexts.DISK_IO,
+            ],
+            after=-60,
+            group_by="instance",
+        )
+        return parse_rows(raw)
+
     async def collect_processes(self) -> List[Dict]:
         raw = await self.client.get_metrics(
             contexts=[
@@ -188,6 +200,7 @@ class MetricsService:
         categories = {
             "network": self.collect_network,
             "system": self.collect_system,
+            "storage": self.collect_storage,
             "processes": self.collect_processes,
             "containers": self.collect_containers,
         }
@@ -405,6 +418,15 @@ class MetricsService:
                 if payload_status in {"available", "partial"} and isinstance(payload_data, dict):
                     payload["source"] = "palantir-agent"
                     session.add(MetricSnapshot(node_id=node_id, category=category, data=payload))
+                    # Auto-update host node's exact OS distro in database if system category contains os_release
+                    if category == "system" and isinstance(payload_data.get("os_release"), dict):
+                        os_rel = payload_data["os_release"]
+                        detected = os_rel.get("ID") or os_rel.get("NAME") or os_rel.get("PRETTY_NAME")
+                        if detected:
+                            node_result = session.execute(select(MonitoredNode).where(MonitoredNode.id == node_id))
+                            node_obj = node_result.scalars().one_or_none() if hasattr(node_result, "scalars") else None
+                            if node_obj and node_obj.os_type != detected.strip().lower():
+                                node_obj.os_type = detected.strip().lower()
                     await self._record_category_status(
                         session, node_id, category, "palantir-agent", "available",
                         attempted_at=attempted_at,
