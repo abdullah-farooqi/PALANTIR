@@ -10,15 +10,28 @@ import { fetchNodeSummary } from '../hooks/useNodeData';
 
 function getOsIconAndLabel(node, sysData) {
   const osRel = (sysData && sysData.os_release) || {};
-  const osStr = [
-    node.os_type,
-    node.hostname,
-    osRel.ID,
-    osRel.NAME,
-    osRel.PRETTY_NAME,
-    osRel.ID_LIKE
-  ].filter(Boolean).join(' ').toLowerCase();
+  const osId = (osRel.ID || '').toLowerCase();
+  const osName = (osRel.NAME || '').toLowerCase();
+  const osPretty = (osRel.PRETTY_NAME || '').toLowerCase();
+  const osLike = (osRel.ID_LIKE || '').toLowerCase();
 
+  const relStr = `${osId} ${osName} ${osPretty} ${osLike}`;
+  const hostStr = (node.hostname || '').toLowerCase();
+  const nodeOs = (node.os_type || '').toLowerCase();
+
+  // 1. Precise os_release match first
+  if (relStr.includes('kali')) return { label: 'Kali Linux', img: '/img/kali.png', fallbackImg: '/img/debian.png', badgeClass: 'kali' };
+  if (relStr.includes('mint')) return { label: 'Linux Mint', img: '/img/mint.png', fallbackImg: '/img/ubuntu.png', badgeClass: 'mint' };
+  if (relStr.includes('manjaro')) return { label: 'Manjaro', img: '/img/manjaro.png', fallbackImg: '/img/arch.png', badgeClass: 'manjaro' };
+  if (relStr.includes('pop')) return { label: 'Pop!_OS', img: '/img/pop.png', fallbackImg: '/img/ubuntu.png', badgeClass: 'pop' };
+  if (relStr.includes('arch')) return { label: 'Arch Linux', img: '/img/arch.png', fallbackImg: '/img/linux.png', badgeClass: 'arch' };
+  if (relStr.includes('ubuntu')) return { label: 'Ubuntu', img: '/img/ubuntu.png', fallbackImg: '/img/linux.png', badgeClass: 'ubuntu' };
+  if (relStr.includes('debian')) return { label: 'Debian', img: '/img/debian.png', fallbackImg: '/img/linux.png', badgeClass: 'debian' };
+  if (relStr.includes('fedora') || relStr.includes('rhel') || relStr.includes('centos') || relStr.includes('rocky') || relStr.includes('alma')) return { label: 'RedHat/Fedora', img: '/img/fedora.png', fallbackImg: '/img/linux.png', badgeClass: 'redhat' };
+  if (relStr.includes('alpine')) return { label: 'Alpine', img: '/img/alpine.png', fallbackImg: '/img/linux.png', badgeClass: 'alpine' };
+
+  // 2. Fallback to hostname / node.os_type match if os_release was missing or vague
+  const osStr = `${nodeOs} ${hostStr}`;
   if (osStr.includes('kali')) return { label: 'Kali Linux', img: '/img/kali.png', fallbackImg: '/img/debian.png', badgeClass: 'kali' };
   if (osStr.includes('mint')) return { label: 'Linux Mint', img: '/img/mint.png', fallbackImg: '/img/ubuntu.png', badgeClass: 'mint' };
   if (osStr.includes('manjaro')) return { label: 'Manjaro', img: '/img/manjaro.png', fallbackImg: '/img/arch.png', badgeClass: 'manjaro' };
@@ -27,10 +40,7 @@ function getOsIconAndLabel(node, sysData) {
   if (osStr.includes('ubuntu')) return { label: 'Ubuntu', img: '/img/ubuntu.png', fallbackImg: '/img/linux.png', badgeClass: 'ubuntu' };
   if (osStr.includes('debian')) return { label: 'Debian', img: '/img/debian.png', fallbackImg: '/img/linux.png', badgeClass: 'debian' };
   if (osStr.includes('fedora') || osStr.includes('rhel') || osStr.includes('centos') || osStr.includes('rocky') || osStr.includes('alma')) return { label: 'RedHat/Fedora', img: '/img/fedora.png', fallbackImg: '/img/linux.png', badgeClass: 'redhat' };
-  if (osStr.includes('alpine')) return { label: 'Alpine', img: '/img/alpine.png', fallbackImg: '/img/linux.png', badgeClass: 'alpine' };
-  if (osStr.includes('freebsd') || osStr.includes('bsd')) return { label: 'FreeBSD', img: '/img/freebsd.png', fallbackImg: '/img/linux.png', badgeClass: 'bsd' };
-  if (osStr.includes('darwin') || osStr.includes('mac') || osStr.includes('osx')) return { label: 'macOS', img: '/img/mac.png', fallbackImg: '/img/linux.png', badgeClass: 'apple' };
-  if (osStr.includes('win')) return { label: 'Windows', img: '/img/windows.png', fallbackImg: '/img/linux.png', badgeClass: 'windows' };
+
   return { label: 'Linux OS', img: '/img/linux.png', fallbackImg: '/img/linux.png', badgeClass: 'linux' };
 }
 
@@ -100,19 +110,20 @@ function NodeCard({ node, onSelect, onRemove, CAN_WRITE }) {
       })
       .filter((val) => val !== null);
 
-    if (rawCpuValues.length >= 2) {
+    if (rawCpuValues.length >= 1) {
       const sliced = rawCpuValues.slice(-count);
       for (let i = 0; i < count; i++) {
         const idx = Math.floor((i / (count - 1)) * (sliced.length - 1));
         points.push(Math.min(100, Math.max(0, sliced[idx])));
       }
-    } else {
-      // If current CPU percentage is available from node telemetry
-      const currentCpu = sys?.cpuPct != null ? sys.cpuPct : 12;
+    } else if (sys && sys.cpuPct !== null && sys.cpuPct !== undefined) {
+      const currentCpu = Math.min(100, Math.max(0, sys.cpuPct));
       for (let i = 0; i < count; i++) {
-        const variation = Math.sin((i + node.id * 7) * 0.4) * Math.min(8, currentCpu + 2);
-        points.push(Math.min(100, Math.max(0, currentCpu + variation)));
+        points.push(currentCpu);
       }
+    } else {
+      const flatY = height / 2;
+      return { pathD: `M 0,${flatY} L ${width},${flatY}`, areaD: '', width, height };
     }
 
     const step = width / (count - 1);

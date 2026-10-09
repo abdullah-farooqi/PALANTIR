@@ -23,9 +23,9 @@ import httpx
 from fastapi import FastAPI, Header, HTTPException, Query
 
 APP_VERSION = "0.1.0"
-HOST_PROC = Path(os.getenv("HOST_PROC", "/host/proc"))
-HOST_SYS = Path(os.getenv("HOST_SYS", "/host/sys"))
-HOST_ROOT = Path(os.getenv("HOST_ROOT", "/host"))
+HOST_PROC = Path(os.getenv("HOST_PROC", "/host/proc" if Path("/host/proc").exists() else "/proc"))
+HOST_SYS = Path(os.getenv("HOST_SYS", "/host/sys" if Path("/host/sys").exists() else "/sys"))
+HOST_ROOT = Path(os.getenv("HOST_ROOT", "/host" if Path("/host").exists() else "/"))
 HOST_LOG = Path(os.getenv("HOST_LOG", "/host/var/log"))
 AGENT_TOKEN = os.getenv("PALANTIR_AGENT_TOKEN", "")
 LOG_MIN_PRIORITY = int(os.getenv("LOG_MIN_PRIORITY", "7"))
@@ -42,16 +42,36 @@ PROXMOX_CA_CERT = os.getenv("PROXMOX_CA_CERT", "")
 LOG_STATE = Path(os.getenv("LOG_STATE", "/var/lib/palantir-agent/log-offsets.json"))
 SENSITIVE_KEY = re.compile(r"password|passwd|token|secret|api[_-]?key|authorization|credential", re.IGNORECASE)
 SENSITIVE_VALUE = re.compile(r"(?i)((?:password|passwd|token|secret|api[_-]?key|authorization)(?:\s*[:=]\s*))(?:bearer\s+)?(?:['\"])?[^\s,;'\"]+")
-psutil.PROCFS_PATH = str(HOST_PROC)
+if HOST_PROC.exists():
+    psutil.PROCFS_PATH = str(HOST_PROC)
 _LOG_STATE_LOCK = threading.Lock()
 try:
     _LOG_OFFSETS: dict[str, dict[str, int]] = json.loads(LOG_STATE.read_text())
 except (OSError, json.JSONDecodeError):
     _LOG_OFFSETS = {}
 
+from collections import deque
+
 app = FastAPI(title="PALANTIR Linux Host Collector", version=APP_VERSION)
 
 CATEGORIES = ("system", "storage", "network", "services", "processes", "connections", "containers", "vms")
+
+# Per-second CPU ring buffer (60 entries = last 60 seconds)
+_CPU_HISTORY_LOCK = threading.Lock()
+_CPU_HISTORY_60S: deque[float] = deque(maxlen=60)
+
+def _cpu_sampler_loop() -> None:
+    """Runs continuously in the background sampling CPU % every 1s."""
+    while True:
+        try:
+            val = psutil.cpu_percent(interval=1.0)
+            with _CPU_HISTORY_LOCK:
+                _CPU_HISTORY_60S.append(val)
+        except Exception:
+            time.sleep(1.0)
+
+_sampler_thread = threading.Thread(target=_cpu_sampler_loop, daemon=True)
+_sampler_thread.start()
 
 
 def _now() -> str:
@@ -169,10 +189,10 @@ def collect_system() -> dict[str, Any]:
     swap = psutil.swap_memory()
     load = os.getloadavg() if hasattr(os, "getloadavg") else (None, None, None)
     
-    # Per-core and total CPU telemetry
+    # Per-core and total CPU telemetry measured over 0.1s interval
     cpu_total = psutil.cpu_percent(interval=0.1)
-    per_core = psutil.cpu_percent(interval=None, percpu=True)
-    times = psutil.cpu_times_percent(interval=None)
+    per_core = psutil.cpu_percent(interval=0.1, percpu=True)
+    times = psutil.cpu_times_percent(interval=0.1)
     cpu_times_dict = {
         "user": getattr(times, "user", 0.0),
         "system": getattr(times, "system", 0.0),
@@ -207,13 +227,26 @@ def collect_system() -> dict[str, Any]:
     slab_bytes = getattr(mem, "slab", meminfo.get("Slab", 0))
 
     os_release = {}
-    for os_file in [HOST_ROOT / "etc/os-release", Path("/etc/os-release")]:
-        if os_file.exists():
-            for line in _read_text(os_file, 16_000).splitlines():
-                if "=" in line:
-                    k, v = line.split("=", 1)
-                    os_release[k.strip()] = v.strip().strip('"')
-            break
+    os_file_candidates = [
+        HOST_ROOT / "etc/os-release",
+        HOST_ROOT / "usr/lib/os-release",
+        Path("/etc/os-release"),
+        Path("/usr/lib/os-release"),
+    ]
+    for os_file in os_file_candidates:
+        try:
+            if os_file.exists():
+                for line in _read_text(os_file, 16_000).splitlines():
+                    if "=" in line:
+                        k, v = line.split("=", 1)
+                        os_release[k.strip()] = v.strip().strip('"')
+                if os_release.get("ID") or os_release.get("NAME"):
+                    break
+        except Exception:
+            pass
+
+    with _CPU_HISTORY_LOCK:
+        cpu_history_60s = list(_CPU_HISTORY_60S)
 
     return _status_data({
         "cpu_count": psutil.cpu_count(),
@@ -221,6 +254,7 @@ def collect_system() -> dict[str, Any]:
         "cpu_pct": cpu_total,
         "cpu_cores_pct": per_core,
         "cpu_times": cpu_times_dict,
+        "cpu_history": cpu_history_60s,
         "memory": {
             "total_bytes": mem.total,
             "available_bytes": mem.available,
@@ -283,7 +317,9 @@ def collect_storage() -> dict[str, Any]:
             clean_mp = "/"
         if clean_mp in seen or part.fstype in SKIP_FSTYPES:
             continue
-        if clean_mp.startswith(("/proc", "/sys", "/dev", "/run", "/snap", "/etc", "/etc/")):
+        if clean_mp.startswith(("/proc", "/sys", "/dev", "/run", "/snap", "/etc", "/app", "/usr/lib")):
+            continue
+        if Path(mp).is_file():
             continue
 
         target_path = Path(mp) if mp.startswith("/host/") else (HOST_ROOT / mp.lstrip("/"))
@@ -404,21 +440,50 @@ def _firewall_state() -> dict[str, Any]:
         return {"status": "unavailable", "reason": str(exc)[:300]}
 
 
+_LAST_PROC_CPU: dict[int, tuple[float, float]] = {}
+
 def collect_processes() -> dict[str, Any]:
+    global _LAST_PROC_CPU
+    now = time.time()
+    new_proc_cpu: dict[int, tuple[float, float]] = {}
     rows = []
+    cores_count = psutil.cpu_count(logical=True) or 1
+    
     for proc in psutil.process_iter(attrs=["pid", "name", "status", "memory_info", "num_threads", "username", "create_time", "cpu_times"]):
         try:
             item = proc.info
+            pid = item.get("pid")
             memory = item.get("memory_info")
             cpu_times = item.get("cpu_times")
+            
+            total_cpu_time = (cpu_times.user + cpu_times.system) if cpu_times else 0.0
+            new_proc_cpu[pid] = (total_cpu_time, now)
+            
+            cpu_pct = 0.0
+            if pid in _LAST_PROC_CPU:
+                prev_time, prev_ts = _LAST_PROC_CPU[pid]
+                dt = now - prev_ts
+                if dt > 0:
+                    # Calculate Normalized Total System CPU (0% - 100%)
+                    raw_cpu = ((total_cpu_time - prev_time) / dt) * 100.0
+                    cpu_pct = min(100.0, max(0.0, raw_cpu / cores_count))
+            else:
+                create_time = item.get("create_time") or now
+                elapsed = max(0.1, now - create_time)
+                raw_cpu = (total_cpu_time / elapsed) * 100.0
+                cpu_pct = min(100.0, max(0.0, raw_cpu / cores_count))
+
             rows.append({
-                "pid": item.get("pid"), "name": item.get("name"), "status": item.get("status"),
+                "pid": pid, "name": item.get("name"), "status": item.get("status"),
                 "rss_bytes": memory.rss if memory else None, "threads": item.get("num_threads"),
                 "username": item.get("username"), "started_at": item.get("create_time"),
-                "cpu_time_seconds": (cpu_times.user + cpu_times.system) if cpu_times else None,
+                "cpu_time_seconds": total_cpu_time,
+                "cpu_pct": round(cpu_pct, 2),
             })
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
             continue
+
+    _LAST_PROC_CPU = new_proc_cpu
     rows.sort(key=lambda row: row.get("rss_bytes") or 0, reverse=True)
     oom = {}
     for line in _read_text(HOST_PROC / "vmstat", 256_000).splitlines():

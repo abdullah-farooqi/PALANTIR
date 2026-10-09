@@ -346,15 +346,17 @@ body {
 /* ------------------------------------------------------------------ tables */
 .tbl { width: 100%; border-collapse: collapse; }
 .tbl th {
-  text-align: left; font-weight: 500; color: var(--fg); background: #0b140d;
-  position: sticky; top: 0; z-index: 1; padding: 1px 8px 1px 0; white-space: nowrap; cursor: default;
-  user-select: none;
+  text-align: left; font-weight: 600; color: #a3c4aa; background: #080f0a;
+  position: sticky; top: 0; z-index: 1; padding: 6px 10px; white-space: nowrap; cursor: default;
+  user-select: none; border-bottom: 1.5px solid #142e1a; font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em;
 }
 .tbl th.sortable { cursor: pointer; }
-.tbl th.sortable:hover { color: var(--green); }
-.tbl th.num, .tbl td.num { text-align: right; padding-right: 10px; }
-.tbl td { padding: 0 8px 0 0; white-space: nowrap; max-width: 520px; overflow: hidden; text-overflow: ellipsis; }
-.tbl tbody tr:hover { background: var(--sel); }
+.tbl th.sortable:hover { color: #39e569; }
+.tbl th.num, .tbl td.num { text-align: right; padding-right: 12px; }
+.tbl td { padding: 5px 10px; white-space: nowrap; max-width: 520px; overflow: hidden; text-overflow: ellipsis; border-bottom: 1px solid rgba(20, 46, 26, 0.4); }
+.tbl tbody tr { transition: background 0.15s ease; }
+.tbl tbody tr:nth-child(even) { background: rgba(255, 255, 255, 0.015); }
+.tbl tbody tr:hover { background: rgba(30, 64, 38, 0.4) !important; }
 .tbl tbody tr.sel { background: #1b3b22; }
 .tbl tbody tr.click { cursor: pointer; }
 

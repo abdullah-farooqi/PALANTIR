@@ -67,12 +67,29 @@ export function useNodeData(nodeId, range, refreshMs, view = 'overview', section
         ...p.agent.map((c) => ({ name: `agent:${c}`, run: () => newest(nodeId, c, AGENT) })),
         ...p.netdata.map((c) => ({ name: `nd:${c}`, run: () => newest(nodeId, c, NETDATA) })),
       ];
-      if (p.cpu) tasks.push({ name: 'cpu', run: () => api.getSeries(nodeId, 'system', seriesParams(range, { source: NETDATA })) });
+      if (p.cpu) {
+        tasks.push({
+          name: 'cpu',
+          run: () =>
+            api.getSeries(nodeId, 'system', seriesParams(range, { source: NETDATA }))
+              .then((res) => {
+                if (res && res.items && res.items.length > 0) return res;
+                return api.getSeries(nodeId, 'system', seriesParams(range, { source: AGENT }));
+              })
+              .catch(() => api.getSeries(nodeId, 'system', seriesParams(range, { source: AGENT }))),
+        });
+      }
       if (p.net) {
         const netMs = Math.max(NET_MIN_MS, Math.min(range.ms, NET_MAX_MS));
         tasks.push({
           name: 'net',
           run: () => api.getSeries(nodeId, 'network', { source: AGENT, limit: 120, since: new Date(Date.now() - netMs).toISOString() }),
+        });
+      }
+      if (view === 'overview') {
+        tasks.push({
+          name: 'storageSeries',
+          run: () => api.getSeries(nodeId, 'storage', { source: AGENT, limit: 5 }),
         });
       }
 

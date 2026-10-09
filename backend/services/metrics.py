@@ -417,7 +417,41 @@ class MetricsService:
                 payload_data = payload.get("data")
                 if payload_status in {"available", "partial"} and isinstance(payload_data, dict):
                     payload["source"] = "palantir-agent"
-                    session.add(MetricSnapshot(node_id=node_id, category=category, data=payload))
+                    top_procs = None
+                    if category == "processes" and isinstance(payload_data.get("top_by_rss"), list):
+                        now_ts = datetime.now(timezone.utc).timestamp()
+                        node_proc_history = getattr(self, "_node_proc_history", {})
+                        last_history = node_proc_history.get(node_id, {})
+                        new_history = {}
+                        top_procs = []
+                        for p in payload_data["top_by_rss"]:
+                            if not isinstance(p, dict):
+                                continue
+                            pid = p.get("pid")
+                            cpu_sec = float(p.get("cpu_time_seconds") or 0.0)
+                            new_history[pid] = (cpu_sec, now_ts)
+                            cpu_pct = p.get("cpu_pct")
+                            if cpu_pct is None or cpu_pct == 0.0:
+                                if pid in last_history:
+                                    prev_sec, prev_ts = last_history[pid]
+                                    dt = now_ts - prev_ts
+                                    if dt > 0 and cpu_sec >= prev_sec:
+                                        cpu_pct = round(((cpu_sec - prev_sec) / dt) * 100.0, 2)
+                                else:
+                                    started_at = p.get("started_at")
+                                    if started_at:
+                                        elapsed = max(0.1, now_ts - float(started_at))
+                                        cpu_pct = round((cpu_sec / elapsed) * 100.0, 2)
+                            top_procs.append({
+                                "pid": pid,
+                                "name": p.get("name"),
+                                "cpu_pct": cpu_pct or 0.0,
+                                "mem_mb": round((p.get("rss_bytes") or 0) / (1024 * 1024), 2),
+                            })
+                        node_proc_history[node_id] = new_history
+                        MetricsService._node_proc_history = node_proc_history
+                    sys_cpu_pct = payload_data.get("cpu_pct") if category == "system" else None
+                    session.add(MetricSnapshot(node_id=node_id, category=category, data=payload, cpu_pct=sys_cpu_pct, top_processes=top_procs))
                     # Auto-update host node's exact OS distro in database if system category contains os_release
                     if category == "system" and isinstance(payload_data.get("os_release"), dict):
                         os_rel = payload_data["os_release"]

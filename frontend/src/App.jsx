@@ -176,7 +176,7 @@ function Dashboard() {
       />
     );
   } else if (view === 'settings') {
-    body = <SettingsTab refreshMs={refreshMs} setRefreshMs={setRefreshMs} onRefresh={refreshAll} refreshing={fleet.refreshing || nodeData.refreshing} onBack={() => changeView('fleet')} />;
+    body = <SettingsTab node={node} data={nodeData.data} refreshMs={refreshMs} setRefreshMs={setRefreshMs} onRefresh={refreshAll} refreshing={fleet.refreshing || nodeData.refreshing} onBack={() => changeView('fleet')} />;
   } else if (!node) {
     body = <Empty>Select a node.</Empty>;
   } else if (view === 'overview') {

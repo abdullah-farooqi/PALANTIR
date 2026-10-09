@@ -73,6 +73,7 @@ export function systemSummary(latest) {
     cpuPct: num(sys.cpu_pct) ?? num(a.cpu_pct),
     cores: num(a.cpu_logical_count) ?? num(a.cpu_count),
     cpuCoresPct: Array.isArray(a.cpu_cores_pct) ? a.cpu_cores_pct : [],
+    cpuHistory: Array.isArray(a.cpu_history) ? a.cpu_history : [],
     cpuTimes: a.cpu_times || {},
     cpuModel: (a.os_release && a.os_release.MODEL) || a.cpu_model || null,
     load,
@@ -103,11 +104,12 @@ export function storageSummary(latest) {
     const validFs = rawFs
       .filter((f) => f && f.mountpoint && f.status === 'available')
       .filter((f) => num(f.total_bytes) > 0)
-      .filter((f) => !/^\/(dev|proc|sys|run|snap)(\/|$)/.test(f.mountpoint))
+      .filter((f) => !/^\/(dev|proc|sys|run|snap|app|usr\/lib)(\/|$)/.test(f.mountpoint))
       .filter((f) => !/^\/host\/(proc|sys|dev|run|etc)(\/|$)/.test(f.mountpoint))
+      .filter((f) => !/\.[a-z0-9]+$/i.test(f.mountpoint))
       .map((f) => {
         let mountName = f.mountpoint;
-        if (['/etc/hostname', '/etc/hosts', '/etc/resolv.conf', '/etc/os-release', '/usr/lib/os-release'].includes(mountName) || mountName.startsWith('/etc/')) {
+        if (['/etc/hostname', '/etc/hosts', '/etc/resolv.conf', '/etc/os-release', '/usr/lib/os-release', '/app/collector.py'].includes(mountName) || mountName.startsWith('/etc/')) {
           mountName = '/';
         }
         return {
@@ -137,9 +139,24 @@ export function storageSummary(latest) {
       }
     });
 
+    // Filter disk_io to top-level block devices (exclude partitions like nvme0n1p1, vda1, zram, etc. when parent exists)
+    const rawDiskIo = Array.isArray(a.disk_io) ? a.disk_io : [];
+    const deviceNames = new Set(rawDiskIo.map((d) => d.device || d.name || '').filter(Boolean));
+    const primaryDiskIo = rawDiskIo.filter((d) => {
+      const dev = d.device || d.name || '';
+      if (!dev) return false;
+      if (/^(zram|loop|ram)/.test(dev)) return false;
+      // If it's a partition (e.g. nvme0n1p1 or sda1) and its parent disk (nvme0n1 or sda) exists, skip partition
+      const parentMatch = dev.match(/^([a-z]+|nvme\d+n\d+)p?\d+$/);
+      if (parentMatch && parentMatch[1] !== dev && deviceNames.has(parentMatch[1])) {
+        return false;
+      }
+      return true;
+    });
+
     if (uniqueFs.length > 0) {
       const rootItem = uniqueFs.find((f) => (f.mount === '/' || f.mount === '/host') && f.totalBytes > 0) || uniqueFs[0];
-      return { filesystems: [rootItem, ...uniqueFs.filter((f) => f !== rootItem)], raid: a.raid || null, diskIo: a.disk_io || [], available: true };
+      return { filesystems: [rootItem, ...uniqueFs.filter((f) => f !== rootItem)], raid: a.raid || null, diskIo: primaryDiskIo, available: true };
     }
   }
 
@@ -189,27 +206,85 @@ export function storageSummary(latest) {
     return { filesystems: netdataFs, raid: null, diskIo: [], available: true };
   }
 
-  // Final fallback: if telemetry exists at all, show root filesystem block
-  return {
-    filesystems: [{
-      mount: '/',
-      device: 'rootfs',
-      fs: 'ext4',
-      total: null,
-      used: null,
-      free: null,
-      totalBytes: null,
-      usedBytes: null,
-      freeBytes: null,
-      pct: null,
-      status: 'available',
-    }],
-    raid: null,
-    diskIo: [],
-    available: true,
+  return { filesystems: [], raid: null, diskIo: [], available: false };
+}
+
+/**
+ * Raw collector storage snapshots (/series?source=palantir-agent) -> disk I/O rates.
+ * Calculates readRate (B/s), writeRate (B/s), and iops (ops/s) from time snapshot deltas.
+ */
+export function storageFromSeries(items) {
+  const rows = (items || [])
+    .map((it) => {
+      const d = it && it.data && it.data.data;
+      const io = d && d.disk_io;
+      const t = toMs(it && it.data && it.data.observed_at) || toMs(it && it.collected_at);
+      return Array.isArray(io) && t ? { t, io } : null;
+    })
+    .filter(Boolean)
+    .sort((a, b) => a.t - b.t);
+
+  if (rows.length < 2) {
+    return { readRate: 0, writeRate: 0, iops: 0 };
+  }
+
+  const last = rows[rows.length - 1];
+  const prev = rows[rows.length - 2];
+  const dt = (last.t - prev.t) / 1000;
+  if (dt <= 0) {
+    return { readRate: 0, writeRate: 0, iops: 0 };
+  }
+
+  const filterPrimary = (ioList) => {
+    const names = new Set(ioList.map((d) => d.device || d.name || '').filter(Boolean));
+    return ioList.filter((d) => {
+      const dev = d.device || d.name || '';
+      if (!dev) return false;
+      if (/^(zram|loop|ram)/.test(dev)) return false;
+      const parentMatch = dev.match(/^([a-z]+|nvme\d+n\d+)p?\d+$/);
+      if (parentMatch && parentMatch[1] !== dev && names.has(parentMatch[1])) {
+        return false;
+      }
+      return true;
+    });
   };
 
-  return { filesystems: [], raid: null, diskIo: [], available: false };
+  const lastIo = filterPrimary(last.io);
+  const prevMap = new Map();
+  filterPrimary(prev.io).forEach((d) => {
+    const key = d.device || d.name;
+    if (key) prevMap.set(key, d);
+  });
+
+  let deltaReadBytes = 0;
+  let deltaWriteBytes = 0;
+  let deltaReadOps = 0;
+  let deltaWriteOps = 0;
+
+  lastIo.forEach((cur) => {
+    const key = cur.device || cur.name;
+    const old = prevMap.get(key);
+    if (old) {
+      if (typeof cur.read_bytes === 'number' && typeof old.read_bytes === 'number') {
+        deltaReadBytes += Math.max(0, cur.read_bytes - old.read_bytes);
+      }
+      if (typeof cur.write_bytes === 'number' && typeof old.write_bytes === 'number') {
+        deltaWriteBytes += Math.max(0, cur.write_bytes - old.write_bytes);
+      }
+      if (typeof cur.read_count === 'number' && typeof old.read_count === 'number') {
+        deltaReadOps += Math.max(0, cur.read_count - old.read_count);
+      }
+      if (typeof cur.write_count === 'number' && typeof old.write_count === 'number') {
+        deltaWriteOps += Math.max(0, cur.write_count - old.write_count);
+      }
+    }
+  });
+
+  return {
+    readRate: deltaReadBytes / dt,
+    writeRate: deltaWriteBytes / dt,
+    iops: (deltaReadOps + deltaWriteOps) / dt,
+  };
 }
 
 // ---- network ---------------------------------------------------------------------
@@ -334,14 +409,24 @@ export function netdataNetNow(latest) {
 export function processSummary(latest) {
   const p = (latest && latest.processes) || {};
   const a = agentData(latest, 'processes');
-  const apps = (Array.isArray(p.top_processes) ? p.top_processes : []).map((x) => ({
+  const topList = Array.isArray(p.top_processes) ? p.top_processes : [];
+  const topCpuMap = new Map();
+  topList.forEach((x) => {
+    if (x && x.pid !== undefined && x.pid !== null) topCpuMap.set(x.pid, num(x.cpu_pct));
+    else if (x && x.name) topCpuMap.set(x.name, num(x.cpu_pct));
+  });
+  const apps = topList.map((x) => ({
     name: x.name, cpu: num(x.cpu_pct), mem: num(x.mem_mb) !== null ? x.mem_mb * MIB : null,
   }));
   const host = a
-    ? (a.top_by_rss || []).map((x) => ({
-        pid: x.pid, name: x.name, user: x.username, status: x.status,
-        threads: num(x.threads), rss: num(x.rss_bytes), cpuTime: num(x.cpu_time_seconds),
-      }))
+    ? (a.top_by_rss || []).map((x) => {
+        const fallbackCpu = topCpuMap.get(x.pid) ?? topCpuMap.get(x.name);
+        return {
+          pid: x.pid, name: x.name, user: x.username, status: x.status,
+          threads: num(x.threads), rss: num(x.rss_bytes), cpuTime: num(x.cpu_time_seconds),
+          cpu: num(x.cpu_pct) ?? fallbackCpu ?? 0,
+        };
+      })
     : [];
   return { apps, host, count: a ? num(a.process_count) : null, oom: a ? a.oom_counters || {} : {} };
 }

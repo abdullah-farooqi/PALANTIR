@@ -1,19 +1,38 @@
 import React from 'react';
 import { REFRESH_OPTIONS } from './Layout';
-import { CAN_WRITE, UI_ROLE } from '../lib/role';
+import { Dot, Empty, ErrorLine } from './ui';
+import { AGENT } from '../lib/metrics';
+import { formatRelative } from '../lib/format';
+import { statusTone } from '../lib/events';
 
-export default function SettingsTab({ refreshMs, setRefreshMs, onRefresh, refreshing, onBack }) {
+export default function SettingsTab({ node, data, refreshMs, setRefreshMs, onRefresh, refreshing, onBack }) {
+  const cats = (data && data.status && data.status.categories) || [];
+  const age = (iso) => (iso ? formatRelative(iso) : '—');
+
+  const cell = (c, source) => {
+    const s = (c.sources || []).find((x) => x.source === source);
+    if (!s) return <span className="tone-dim">—</span>;
+    const tone = statusTone(s.status);
+    return (
+      <span title={`${s.status}${s.error_message ? ` — ${s.error_message}` : ''}`} className="row" style={{ gap: 5 }}>
+        <Dot tone={tone} />
+        <span className={tone === 'dim' ? 'tone-dim' : ''}>{s.status === 'available' ? age(s.last_success_at) : s.status.replace('_', ' ')}</span>
+      </span>
+    );
+  };
+
   return (
-    <div className="settings-page-wrapper" style={{ padding: '24px 32px', maxWidth: '900px', margin: '0 auto' }}>
+    <div className="settings-page-wrapper" style={{ padding: '24px 32px', maxWidth: '960px', margin: '0 auto' }}>
       <div className="settings-header-bar" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '24px' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
           <button className="btn primary sm" onClick={onBack} style={{ fontSize: '14px', padding: '6px 14px' }}>
             ← Back to Fleet Grid
           </button>
-          <h2 style={{ fontSize: '24px', fontWeight: 800, color: '#39e569', margin: 0 }}>System Control & Settings</h2>
+          <h2 style={{ fontSize: '24px', fontWeight: 800, color: '#39e569', margin: 0 }}>System Settings & Sources</h2>
         </div>
       </div>
 
+      {/* Card 1: Telemetry Refresh Settings */}
       <div className="settings-card-section" style={{ background: '#080d09', border: '1.5px solid #193822', borderRadius: '16px', padding: '24px', marginBottom: '24px', boxShadow: '0 0 20px rgba(20,50,25,0.25)' }}>
         <h3 style={{ fontSize: '18px', fontWeight: 700, color: '#fff', marginTop: 0, marginBottom: '8px' }}>
           Telemetry Polling Refresh Rate
@@ -63,20 +82,42 @@ export default function SettingsTab({ refreshMs, setRefreshMs, onRefresh, refres
         </div>
       </div>
 
+      {/* Card 2: Collector Pipeline & Sources Status */}
       <div className="settings-card-section" style={{ background: '#080d09', border: '1.5px solid #193822', borderRadius: '16px', padding: '24px', boxShadow: '0 0 20px rgba(20,50,25,0.25)' }}>
         <h3 style={{ fontSize: '18px', fontWeight: 700, color: '#fff', marginTop: 0, marginBottom: '8px' }}>
-          System Role & Authorization
+          Telemetry Collection Sources
         </h3>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '16px', marginTop: '16px' }}>
-          <div style={{ background: 'rgba(50, 40, 20, 0.8)', border: '1px solid #7a612d', padding: '10px 18px', borderRadius: '10px', color: '#e5c07b', fontWeight: 800, fontSize: '16px' }}>
-            ROLE: {UI_ROLE === 'none' ? 'GUEST' : UI_ROLE.toUpperCase()}
+        <p style={{ color: '#7a9680', fontSize: '13.5px', marginBottom: '16px' }}>
+          Status of telemetry categories collected via Netdata agent and Palantir host collector.
+        </p>
+
+        {data && data.errors && data.errors.status && <ErrorLine warn>collection-status: {data.errors.status}</ErrorLine>}
+
+        {cats.length === 0 ? (
+          <Empty>No collection status telemetry available yet.</Empty>
+        ) : (
+          <div className="box-scroll" style={{ overflowX: 'auto', marginBottom: 16 }}>
+            <table className="tbl">
+              <thead>
+                <tr>
+                  <th />
+                  {cats.map((c) => <th key={c.category}>{c.label || c.category}</th>)}
+                </tr>
+              </thead>
+              <tbody>
+                <tr><td className="tone-dim" style={{ fontWeight: 700, color: '#a3c4aa' }}>netdata</td>{cats.map((c) => <td key={c.category}>{cell(c, 'netdata')}</td>)}</tr>
+                <tr><td className="tone-dim" style={{ fontWeight: 700, color: '#a3c4aa' }}>collector</td>{cats.map((c) => <td key={c.category}>{cell(c, AGENT)}</td>)}</tr>
+              </tbody>
+            </table>
           </div>
-          <div style={{ color: '#8aa690', fontSize: '13.5px' }}>
-            {CAN_WRITE
-              ? 'Administrator privilege active: Full access to add, configure, and manage target host nodes.'
-              : 'Read-only access mode: Viewing telemetry metrics and diagnostic logs.'}
+        )}
+
+        {node && (
+          <div style={{ paddingTop: 12, borderTop: '1px solid #142e1a', color: '#728c78', fontSize: 12, fontFamily: 'JetBrains Mono, monospace' }}>
+            <div>last contact: <span style={{ color: '#d8dee9' }}>{formatRelative(node.last_seen_at)}</span> • last collection: <span style={{ color: '#d8dee9' }}>{formatRelative(node.last_collection_at)}</span></div>
+            <div style={{ marginTop: 4 }}>netdata: <span style={{ color: '#06b6d4' }}>{node.netdata_url}</span> {node.collector_url ? `• collector: ${node.collector_url}` : ''}</div>
           </div>
-        </div>
+        )}
       </div>
     </div>
   );

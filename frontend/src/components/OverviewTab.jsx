@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Box, Chips, DataTable, Dot, Empty, ErrorLine, DotGraph, MeterRow, Meter } from './ui';
 import {
-  AGENT, RANGES, agentData, isVirtualIface, netdataNetNow, networkFromSeries, processSummary, seriesToPoints, storageSummary, systemSummary,
+  AGENT, RANGES, agentData, isVirtualIface, netdataNetNow, networkFromSeries, processSummary, seriesToPoints, storageFromSeries, storageSummary, systemSummary,
 } from '../lib/metrics';
 import {
   formatBits, formatBytes, formatCount, formatDuration, formatPercent, formatRate, formatRelative, formatNumber,
@@ -146,18 +146,48 @@ function CpuBox({ data, range, setRange }) {
   const values = useMemo(() => points.map((p) => p.v), [points]);
   const peak = values.length ? Math.max(...values) : null;
   const avg = values.length ? values.reduce((a, b) => a + b, 0) / values.length : null;
-  const topCpu = useMemo(() => proc.apps.filter((a) => (a.cpu || 0) > 0).slice(0, 6), [proc.apps]);
+  const topCpu = useMemo(() => {
+    const rawList = proc.host && proc.host.length > 0 ? proc.host : proc.apps || [];
+    if (rawList.length === 0) return [];
 
-  const coreCount = sys.cores || (sys.cpuCoresPct && sys.cpuCoresPct.length) || 4;
+    const map = new Map();
+    rawList.forEach((item) => {
+      const prog = item.name || 'unknown';
+      const cpuVal = item.cpu || 0;
+      const memVal = item.rss ?? item.mem ?? 0;
+      if (!map.has(prog)) {
+        map.set(prog, { cpu: 0, mem: 0 });
+      }
+      const existing = map.get(prog);
+      existing.cpu += cpuVal;
+      existing.mem += memVal;
+    });
+
+    const combined = [];
+    map.forEach((val, name) => {
+      combined.push({ name, cpu: Math.min(100.0, val.cpu), mem: val.mem });
+    });
+
+    // Rank strictly by instantaneous CPU % first, then by Memory footprint
+    combined.sort((a, b) => b.cpu - a.cpu || b.mem - a.mem);
+    return combined.slice(0, 6);
+  }, [proc.host, proc.apps]);
+
+  const maxAppCpu = useMemo(() => Math.max(1, ...topCpu.map((a) => a.cpu || 0)), [topCpu]);
+
+  const coreCount = sys.cores || (sys.cpuCoresPct && sys.cpuCoresPct.length) || 0;
   const coresList = useMemo(() => {
     if (sys.cpuCoresPct && sys.cpuCoresPct.length > 0) {
-      return sys.cpuCoresPct.map((pct, idx) => ({ id: idx + 1, pct }));
+      return sys.cpuCoresPct.map((pct, idx) => ({ id: idx + 1, pct: Math.min(100, Math.max(0, pct)) }));
     }
-    const basePct = sys.cpuPct || 0;
-    return Array.from({ length: coreCount }).map((_, idx) => ({
-      id: idx + 1,
-      pct: Math.min(100, Math.max(0, Math.round(basePct + (Math.sin(idx * 1.5) * 4)))),
-    }));
+    const basePct = sys.cpuPct;
+    if (basePct !== null && basePct !== undefined && coreCount > 0) {
+      return Array.from({ length: coreCount }).map((_, idx) => ({
+        id: idx + 1,
+        pct: Math.min(100, Math.max(0, Math.round(basePct))),
+      }));
+    }
+    return [];
   }, [sys.cpuCoresPct, sys.cpuPct, coreCount]);
 
   const cpuHeaderTitle = sys.cpuModel ? `CPU • ${sys.cpuModel} (${coreCount} Cores)` : `CPU (${coreCount} Cores)`;
@@ -216,16 +246,24 @@ function CpuBox({ data, range, setRange }) {
             </div>
           </div>
           <div style={{ borderTop: '1px solid #142e1a', paddingTop: 8, marginTop: 8, fontSize: 10.5, fontFamily: 'JetBrains Mono, monospace' }}>
-            <div style={{ color: '#728c78', display: 'flex', justifyContent: 'space-between', width: '100%', marginBottom: 4 }}>
-              <span>Load:</span>
-              <span style={{ color: '#39e569', fontWeight: 700 }}>
-                {l1} <span style={{ color: '#4a6350', fontWeight: 400 }}>(1m)</span> &nbsp;{l5} <span style={{ color: '#4a6350', fontWeight: 400 }}>(5m)</span> &nbsp;{l15} <span style={{ color: '#4a6350', fontWeight: 400 }}>(15m)</span>
-              </span>
+            <div style={{ color: '#728c78', display: 'flex', alignItems: 'center', gap: 6, width: '100%', marginBottom: 5 }}>
+              <span style={{ color: '#728c78', fontWeight: 600 }}>Load:</span>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 12, flex: 1, justifyContent: 'flex-end' }}>
+                <span style={{ color: '#39e569', fontWeight: 700 }}>
+                  {l1} <span style={{ color: '#4a6350', fontWeight: 400, fontSize: 9.5 }}>(1m)</span>
+                </span>
+                <span style={{ color: '#39e569', fontWeight: 700 }}>
+                  {l5} <span style={{ color: '#4a6350', fontWeight: 400, fontSize: 9.5 }}>(5m)</span>
+                </span>
+                <span style={{ color: '#39e569', fontWeight: 700 }}>
+                  {l15} <span style={{ color: '#4a6350', fontWeight: 400, fontSize: 9.5 }}>(15m)</span>
+                </span>
+              </div>
             </div>
             <div style={{ color: '#728c78', display: 'flex', justifyContent: 'space-between', width: '100%', flexWrap: 'nowrap', whiteSpace: 'nowrap' }}>
-              <span>Peak/Avg: <span style={{ color: '#d8dee9', fontWeight: 600 }}>{formatPercent(peak, 0)} / {formatPercent(avg, 0)}</span></span>
-              <span>Tasks: <span style={{ color: '#d8dee9', fontWeight: 600 }}>{formatCount(proc.count)}</span></span>
-              <span>OOM: <span className={sys.vmstat.oom_kill > 0 ? 'tone-red' : ''} style={{ color: sys.vmstat.oom_kill > 0 ? '#f0616d' : '#d8dee9', fontWeight: 600 }}>{formatCount(sys.vmstat.oom_kill || 0)}</span></span>
+              <span>Current: <span style={{ color: '#39e569', fontWeight: 700 }}>{sys.cpuPct != null ? formatPercent(sys.cpuPct, 0) : '—'}</span></span>
+              <span>Avg: <span style={{ color: '#22d3ee', fontWeight: 600 }}>{formatPercent(avg, 0)}</span></span>
+              <span>Max: <span style={{ color: '#fbbf24', fontWeight: 600 }}>{formatPercent(peak, 0)}</span></span>
             </div>
           </div>
         </div>
@@ -250,8 +288,8 @@ function CpuBox({ data, range, setRange }) {
                       <div style={{ flex: 1, minWidth: 40 }}>
                         <Meter pct={pctVal} tone="cool" style={{ height: 5 }} />
                       </div>
-                      <span style={{ color: '#4dd0e1', fontFamily: 'JetBrains Mono, monospace', fontWeight: 700, fontSize: 11, width: 44, textAlign: 'right', flexShrink: 0 }}>
-                        {formatNumber(a.cpu, 1)}%
+                      <span style={{ color: '#4dd0e1', fontFamily: 'JetBrains Mono, monospace', fontWeight: 700, fontSize: 11, width: 46, textAlign: 'right', flexShrink: 0 }}>
+                        {a.cpu > 0 && a.cpu < 0.1 ? a.cpu.toFixed(2) : formatNumber(a.cpu, 1)}%
                       </span>
                     </div>
                   );
@@ -322,19 +360,25 @@ function MemBox({ data }) {
   const memTotalPct = Math.min(100, Math.round(((mem.used || 0) / total) * 100));
 
   const topRamApps = useMemo(() => {
-    if (proc.host && proc.host.length > 0) {
-      return proc.host
-        .filter((p) => (p.rss || 0) > 0)
-        .slice(0, 4)
-        .map((p) => ({ name: p.name, rss: p.rss }));
-    }
-    if (proc.apps && proc.apps.length > 0) {
-      return proc.apps
-        .filter((a) => (a.mem || 0) > 0)
-        .slice(0, 4)
-        .map((a) => ({ name: a.name, rss: a.mem }));
-    }
-    return [];
+    const rawList = proc.host && proc.host.length > 0 ? proc.host : proc.apps || [];
+    if (rawList.length === 0) return [];
+
+    const map = new Map();
+    rawList.forEach((item) => {
+      const prog = item.name || 'unknown';
+      const memVal = item.rss ?? item.mem ?? 0;
+      if (!map.has(prog)) {
+        map.set(prog, 0);
+      }
+      map.set(prog, map.get(prog) + memVal);
+    });
+
+    const combined = [];
+    map.forEach((totalRss, name) => {
+      if (totalRss > 0) combined.push({ name, rss: totalRss });
+    });
+
+    return combined.sort((a, b) => b.rss - a.rss).slice(0, 4);
   }, [proc.host, proc.apps]);
 
   const maxAppRss = useMemo(() => Math.max(1, ...topRamApps.map((a) => a.rss || 0)), [topRamApps]);
@@ -413,10 +457,15 @@ function DisksBox({ data }) {
   const st = useMemo(() => storageSummary(data.latest), [data.latest]);
   const diskIo = st.diskIo || [];
 
-  // Compute total disk read/write bytes & IOPS from diskIo array
-  const totalReadBytes = useMemo(() => diskIo.reduce((acc, d) => acc + (d.read_bytes || 0), 0), [diskIo]);
-  const totalWriteBytes = useMemo(() => diskIo.reduce((acc, d) => acc + (d.write_bytes || 0), 0), [diskIo]);
-  const totalOps = useMemo(() => diskIo.reduce((acc, d) => acc + (d.read_count || 0) + (d.write_count || 0), 0), [diskIo]);
+  // Compute real-time rates and IOPS from snapshot deltas across storageSeries
+  const ioRates = useMemo(() => {
+    const items = data.storageSeries && data.storageSeries.items ? data.storageSeries.items : [];
+    return storageFromSeries(items);
+  }, [data.storageSeries]);
+
+  const readRate = ioRates.readRate;
+  const writeRate = ioRates.writeRate;
+  const iops = ioRates.iops;
 
   const fsList = st.filesystems || [];
 
@@ -437,13 +486,13 @@ function DisksBox({ data }) {
               const pctVal = p !== null ? Math.round(p) : 0;
 
               // Color logic: bright green (<70%), amber/yellow (70-90%), red (>=90%)
-              let barColor = '#22c55e'; // Bright green
+              let barColor = '#22c55e'; // Bright green (<70%)
               let textColor = '#39e569';
               if (pctVal >= 90) {
-                barColor = '#f0616d'; // Bright red
+                barColor = '#f0616d'; // Bright red (>=90%)
                 textColor = '#f0616d';
               } else if (pctVal >= 70) {
-                barColor = '#f59e0b'; // Amber / Yellow
+                barColor = '#f59e0b'; // Amber / Yellow (70-90%)
                 textColor = '#fbbf24';
               }
 
@@ -496,55 +545,58 @@ function DisksBox({ data }) {
           <div style={{ fontSize: 11, fontWeight: 800, color: '#39e569', letterSpacing: '0.05em', marginBottom: 8 }}>
             I/O ACTIVITY
           </div>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 6, fontSize: 11, fontFamily: 'JetBrains Mono, monospace' }}>
-            {/* Read Rate Row */}
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-              <span style={{ color: '#728c78', width: 50, fontWeight: 600 }}>Read:</span>
-              <span style={{ color: '#22d3ee', fontWeight: 700, width: 90, flexShrink: 0 }}>
-                {totalReadBytes > 0 ? formatRate((totalReadBytes % 50000000) / 10) : '0.0 B/s'}
-              </span>
-              <div style={{ flex: 1, minWidth: 40 }}>
-                <SegmentedBar pct={totalReadBytes > 0 ? 25 : 0} tone="cool" height={5} />
-              </div>
-            </div>
-
-            {/* Write Rate Row */}
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-              <span style={{ color: '#728c78', width: 50, fontWeight: 600 }}>Write:</span>
-              <span style={{ color: '#fbbf24', fontWeight: 700, width: 90, flexShrink: 0 }}>
-                {totalWriteBytes > 0 ? formatRate((totalWriteBytes % 80000000) / 10) : '0.0 B/s'}
-              </span>
-              <div style={{ flex: 1, minWidth: 40 }}>
-                {/* Amber / Yellow tone matching system telemetry accents */}
-                <div
-                  role="progressbar"
-                  aria-valuenow={totalWriteBytes > 0 ? 45 : 0}
-                  aria-valuemin={0}
-                  aria-valuemax={100}
-                  style={{
-                    position: 'relative',
-                    height: 5,
-                    borderRadius: 3,
-                    width: '100%',
-                    background: '#0a120c',
-                    overflow: 'hidden',
-                    WebkitMaskImage: 'repeating-linear-gradient(90deg, #000 0 4px, transparent 4px 6px)',
-                    maskImage: 'repeating-linear-gradient(90deg, #000 0 4px, transparent 4px 6px)',
-                  }}
-                >
-                  <div style={{ position: 'absolute', top: 0, bottom: 0, left: 0, width: `${totalWriteBytes > 0 ? 45 : 0}%`, background: '#f59e0b' }} />
+          {diskIo.length === 0 ? (
+            <Empty>No active disk I/O telemetry.</Empty>
+          ) : (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6, fontSize: 11, fontFamily: 'JetBrains Mono, monospace' }}>
+              {/* Read Rate Row */}
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <span style={{ color: '#728c78', width: 50, fontWeight: 600 }}>Read:</span>
+                <span style={{ color: '#22d3ee', fontWeight: 700, width: 90, flexShrink: 0 }}>
+                  {formatRate(readRate)}
+                </span>
+                <div style={{ flex: 1, minWidth: 40 }}>
+                  <SegmentedBar pct={readRate > 0 ? Math.min(100, (readRate / (100 * 1024 * 1024)) * 100) : 0} tone="cool" height={5} />
                 </div>
               </div>
-            </div>
 
-            {/* IOPS Row */}
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 2 }}>
-              <span style={{ color: '#728c78', width: 50, fontWeight: 600 }}>IOPS:</span>
-              <span style={{ color: '#39e569', fontWeight: 700 }}>
-                {totalOps > 0 ? `${(totalOps % 300) + 12} ops/s` : '0 ops/s'}
-              </span>
+              {/* Write Rate Row */}
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <span style={{ color: '#728c78', width: 50, fontWeight: 600 }}>Write:</span>
+                <span style={{ color: '#fbbf24', fontWeight: 700, width: 90, flexShrink: 0 }}>
+                  {formatRate(writeRate)}
+                </span>
+                <div style={{ flex: 1, minWidth: 40 }}>
+                  <div
+                    role="progressbar"
+                    aria-valuenow={writeRate > 0 ? Math.min(100, (writeRate / (100 * 1024 * 1024)) * 100) : 0}
+                    aria-valuemin={0}
+                    aria-valuemax={100}
+                    style={{
+                      position: 'relative',
+                      height: 5,
+                      borderRadius: 3,
+                      width: '100%',
+                      background: '#0a120c',
+                      overflow: 'hidden',
+                      WebkitMaskImage: 'repeating-linear-gradient(90deg, #000 0 4px, transparent 4px 6px)',
+                      maskImage: 'repeating-linear-gradient(90deg, #000 0 4px, transparent 4px 6px)',
+                    }}
+                  >
+                    <div style={{ position: 'absolute', top: 0, bottom: 0, left: 0, width: `${writeRate > 0 ? Math.min(100, (writeRate / (100 * 1024 * 1024)) * 100) : 0}%`, background: '#f59e0b' }} />
+                  </div>
+                </div>
+              </div>
+
+              {/* IOPS Row */}
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 2 }}>
+                <span style={{ color: '#728c78', width: 50, fontWeight: 600 }}>IOPS:</span>
+                <span style={{ color: '#39e569', fontWeight: 700 }}>
+                  {iops > 0 ? `${formatCount(Math.round(iops))} ops/s` : '0 ops/s'}
+                </span>
+              </div>
             </div>
-          </div>
+          )}
         </div>
       </div>
     </Box>
@@ -576,8 +628,9 @@ function NetBox({ data }) {
     return [];
   }, [net.names, data.latest]);
 
-  // Dynamic Peak calculation for auto-scaling Y-axis
-  const peakVal = Math.max(1024, ...rxV, ...txV);
+  // Dynamic Peak calculation for auto-scaling Y-axis (scale strictly to non-zero network traffic)
+  const maxRxTx = Math.max(0, ...rxV, ...txV);
+  const peakVal = maxRxTx > 0 ? maxRxTx : 64;
   const scale = peakVal * 1.15;
   const GUTTER_W = 54;
 
@@ -701,62 +754,368 @@ function NetBox({ data }) {
   );
 }
 
-// ------------------------------------------------------------------ [4] proc
+// Helper for mapping numeric UIDs to clean usernames
+const mapUsername = (user) => {
+  if (user === null || user === undefined || user === '') return '—';
+  const u = String(user).trim();
+  if (u === '0' || u === 'root') return 'root';
+  if (u === '1000' || u === 'user') return 'user';
+  if (u === '70' || u === 'postgres') return 'postgres';
+  if (u === '957' || u === 'libvirt-qemu') return 'libvirt-qemu';
+  if (u === '101' || u === 'systemd-resolve') return 'systemd-resolve';
+  if (/^\d+$/.test(u)) return `uid:${u}`;
+  return u;
+};
+
+// Micro badge / dot indicator for process state
+const renderStateBadge = (stateStr) => {
+  if (!stateStr) return <span className="tone-dim">—</span>;
+  const s = String(stateStr).trim().toUpperCase();
+  const first = s.charAt(0);
+
+  if (first === 'R') {
+    return (
+      <span className="badge" style={{ background: 'rgba(6, 182, 212, 0.15)', borderColor: '#06b6d4', color: '#22d3ee', fontWeight: 700, padding: '1px 5px', borderRadius: 4 }}>
+        R
+      </span>
+    );
+  }
+  if (first === 'S') {
+    return (
+      <span className="badge" style={{ background: 'rgba(34, 197, 94, 0.12)', borderColor: '#15803d', color: '#4ade80', fontWeight: 600, padding: '1px 5px', borderRadius: 4 }}>
+        S
+      </span>
+    );
+  }
+  if (first === 'Z') {
+    return (
+      <span className="badge" style={{ background: 'rgba(239, 68, 68, 0.2)', borderColor: '#ef4444', color: '#f87171', fontWeight: 800, padding: '1px 5px', borderRadius: 4 }}>
+        Z
+      </span>
+    );
+  }
+  if (first === 'D' || first === 'T' || first === 'I') {
+    return (
+      <span className="badge" style={{ background: 'rgba(229, 192, 123, 0.15)', borderColor: '#e5c07b', color: '#facc15', fontWeight: 600, padding: '1px 5px', borderRadius: 4 }}>
+        {first}
+      </span>
+    );
+  }
+  return <span className="badge tone-dim">{first}</span>;
+};
+
+// ------------------------------------------------------------------ [5] proc
 function ProcBox({ data }) {
   const proc = useMemo(() => processSummary(data.latest), [data.latest]);
   const [mode, setMode] = useState(proc.host.length > 0 ? 'host' : 'apps');
   const [filter, setFilter] = useState('');
+  const [expandedGroups, setExpandedGroups] = useState(new Set());
+
+  const toggleGroup = (groupName) => {
+    setExpandedGroups((prev) => {
+      const next = new Set(prev);
+      if (next.has(groupName)) next.delete(groupName);
+      else next.add(groupName);
+      return next;
+    });
+  };
+
+  // Group processes by program name for [apps] tab
+  const { groupedApps, sortedGroupList } = useMemo(() => {
+    const rawList = proc.host.length > 0 ? proc.host : proc.apps;
+    const map = new Map();
+
+    rawList.forEach((item) => {
+      const prog = item.name || 'unknown';
+      if (!map.has(prog)) {
+        map.set(prog, {
+          name: prog,
+          procs: [],
+          totalMem: 0,
+          totalCpu: 0,
+          totalThreads: 0,
+          users: new Set(),
+        });
+      }
+      const g = map.get(prog);
+      g.procs.push(item);
+      const memVal = item.rss ?? item.mem ?? 0;
+      g.totalMem += memVal;
+      g.totalCpu += item.cpu ?? 0;
+      g.totalThreads += item.threads ?? 1;
+      if (item.user) g.users.add(item.user);
+    });
+
+    const groupList = [];
+    map.forEach((g) => {
+      groupList.push({
+        isGroup: true,
+        key: `group-${g.name}`,
+        name: g.name,
+        count: g.procs.length,
+        mem: g.totalMem,
+        cpu: g.totalCpu,
+        threads: g.totalThreads,
+        user: [...g.users].map(mapUsername).join(', ') || 'user',
+        children: g.procs,
+      });
+    });
+
+    // Sort parent groups by Memory descending by default
+    groupList.sort((a, b) => b.mem - a.mem);
+
+    // Build flat row list preserving exact tree hierarchy
+    const result = [];
+    groupList.forEach((group) => {
+      const isExpanded = expandedGroups.has(group.name);
+      result.push({
+        ...group,
+        isExpanded,
+      });
+
+      if (isExpanded) {
+        // Sort children by RAM descending within group
+        const sortedChildren = [...group.children].sort((a, b) => (b.rss ?? b.mem ?? 0) - (a.rss ?? a.mem ?? 0));
+        sortedChildren.forEach((child, idx) => {
+          result.push({
+            isChild: true,
+            parentName: group.name,
+            key: `child-${group.name}-${child.pid || idx}`,
+            pid: child.pid || '—',
+            name: child.name,
+            user: child.user,
+            threads: child.threads ?? 1,
+            mem: child.rss ?? child.mem ?? 0,
+            cpuTime: child.cpuTime,
+            status: child.status,
+            cpu: child.cpu,
+          });
+        });
+      }
+    });
+
+    return { groupedApps: result, sortedGroupList: groupList };
+  }, [proc.host, proc.apps, expandedGroups]);
+
+  const totalProcCount = mode === 'host' ? (proc.count ?? proc.host.length) : proc.host.length || proc.apps.length;
+  const oomKillsCount = mode === 'host' ? Object.values(proc.oom || {}).reduce((a, b) => a + (Number(b) || 0), 0) : 0;
 
   const appCols = [
-    { key: 'name', label: 'Program' },
-    { key: 'cpu', label: 'Cpu%', num: true, render: (r) => <span className="tone-cyan">{formatNumber(r.cpu, 2)}</span> },
-    { key: 'mem', label: 'MemB', num: true, render: (r) => formatBytes(r.mem) },
-  ];
-  const hostCols = [
-    { key: 'pid', label: 'Pid:', num: true },
-    { key: 'name', label: 'Program:' },
-    { key: 'user', label: 'User:' },
-    { key: 'threads', label: 'Threads', num: true },
-    { key: 'rss', label: 'MemB', num: true, render: (r) => formatBytes(r.rss) },
-    { key: 'cpuTime', label: 'CPU time', num: true, render: (r) => (r.cpuTime === null ? '—' : formatDuration(r.cpuTime * 1000)) },
-    { key: 'status', label: 'State' },
+    {
+      key: 'name',
+      label: 'Program',
+      sortable: false,
+      value: (r) => r.name,
+      render: (r) => {
+        if (r.isChild) {
+          return (
+            <span style={{ paddingLeft: 20, color: '#94a3b8', fontSize: 11.5, fontFamily: 'JetBrains Mono, monospace' }}>
+              └ PID {r.pid}
+            </span>
+          );
+        }
+        return (
+          <div
+            onClick={(e) => {
+              e.stopPropagation();
+              toggleGroup(r.name);
+            }}
+            style={{ cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 6, fontWeight: 700, color: '#e2e8f0', userSelect: 'none' }}
+          >
+            <span style={{ color: '#39e569', fontSize: 11, width: 12, display: 'inline-block' }}>{r.isExpanded ? '▼' : '▶'}</span>
+            <span>{r.name}</span>
+            <span style={{ fontSize: 10.5, fontWeight: 600, color: '#728c78', background: 'rgba(20, 46, 26, 0.6)', padding: '1px 6px', borderRadius: 4 }}>
+              ({r.count} procs)
+            </span>
+          </div>
+        );
+      },
+    },
+    {
+      key: 'threads',
+      label: 'Threads',
+      num: true,
+      sortable: false,
+      value: (r) => r.threads,
+      render: (r) => <span style={{ color: r.isChild ? '#64748b' : '#cbd5e1', fontWeight: 600 }}>{r.threads ?? '—'}</span>,
+    },
+    {
+      key: 'mem',
+      label: 'MEM',
+      num: true,
+      sortable: false,
+      value: (r) => r.mem,
+      render: (r) => <span style={{ color: r.isChild ? '#0284c7' : '#06b6d4', fontWeight: 700 }}>{formatBytes(r.mem)}</span>,
+    },
   ];
 
-  const rows = mode === 'host' ? proc.host : proc.apps;
+  const hostCols = [
+    {
+      key: 'pid',
+      label: 'PID',
+      num: false,
+      value: (r) => r.pid,
+      render: (r) => <span style={{ color: '#6b7a6f', fontFamily: 'JetBrains Mono, monospace', fontSize: 11.5 }}>{r.pid}</span>,
+    },
+    {
+      key: 'name',
+      label: 'Program',
+      value: (r) => r.name,
+      render: (r) => (
+        <span
+          style={{
+            fontWeight: 600,
+            color: '#e2e8f0',
+            display: 'inline-block',
+            maxWidth: 180,
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            verticalAlign: 'bottom',
+          }}
+          title={r.name}
+        >
+          {r.name}
+        </span>
+      ),
+    },
+    {
+      key: 'user',
+      label: 'User',
+      value: (r) => mapUsername(r.user),
+      render: (r) => <span style={{ color: '#94a3b8', fontFamily: 'JetBrains Mono, monospace', fontSize: 11.5 }}>{mapUsername(r.user)}</span>,
+    },
+    {
+      key: 'threads',
+      label: 'Threads',
+      num: true,
+      value: (r) => r.threads,
+      render: (r) => <span style={{ color: '#cbd5e1', fontWeight: 600 }}>{r.threads ?? '—'}</span>,
+    },
+    {
+      key: 'rss',
+      label: 'MEM',
+      num: true,
+      value: (r) => r.rss,
+      render: (r) => <span style={{ color: '#06b6d4', fontWeight: 700 }}>{formatBytes(r.rss)}</span>,
+    },
+    {
+      key: 'cpu',
+      label: 'CPU %',
+      num: true,
+      value: (r) => r.cpu,
+      render: (r) => (
+        <span style={{ color: '#22d3ee', fontWeight: 700 }}>
+          {r.cpu > 0 && r.cpu < 0.1 ? r.cpu.toFixed(2) : formatNumber(r.cpu || 0, 1)}%
+        </span>
+      ),
+    },
+    {
+      key: 'status',
+      label: 'State',
+      num: true,
+      value: (r) => r.status,
+      render: (r) => renderStateBadge(r.status),
+    },
+  ];
+
+  const displayRows = mode === 'host' ? proc.host : groupedApps;
+
   return (
     <Box
       n={5}
-      title="proc"
+      title="PROCESS TABLE"
       controls={
-        <>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
           <Chips
             value={mode}
             onChange={setMode}
             options={[
               { value: 'host', label: 'host', title: 'Process list from the PALANTIR host collector (by RSS)' },
-              { value: 'apps', label: 'apps', title: 'Per-application CPU/memory from Netdata' },
+              { value: 'apps', label: 'apps', title: 'Per-application aggregated process grouping' },
             ]}
           />
-          <input className="in" style={{ width: 130, marginLeft: 6 }} placeholder="filter…" value={filter} onChange={(e) => setFilter(e.target.value)} />
-        </>
+          <input
+            className="in"
+            style={{
+              width: 140,
+              background: '#040805',
+              border: '1px solid #1a3821',
+              borderRadius: 6,
+              padding: '2px 8px',
+              fontSize: 11.5,
+              color: '#d8dee9',
+              outline: 'none',
+              fontFamily: 'JetBrains Mono, monospace',
+            }}
+            placeholder="filter..."
+            value={filter}
+            onChange={(e) => setFilter(e.target.value)}
+          />
+        </div>
       }
-      right={`${rows.length}/${mode === 'host' ? proc.count ?? rows.length : rows.length}`}
+      right={
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <span
+            style={{
+              background: 'rgba(18, 38, 22, 0.8)',
+              border: '1px solid #1c4524',
+              borderRadius: 4,
+              padding: '1px 7px',
+              fontSize: 11,
+              fontWeight: 700,
+              color: '#39e569',
+              letterSpacing: '0.03em',
+            }}
+          >
+            Tasks: {displayRows.length}/{totalProcCount}
+          </span>
+          {mode === 'host' && (
+            <span
+              style={{
+                background: oomKillsCount > 0 ? 'rgba(239, 68, 68, 0.15)' : 'rgba(15, 28, 18, 0.6)',
+                border: oomKillsCount > 0 ? '1px solid #ef4444' : '1px solid #193822',
+                borderRadius: 4,
+                padding: '1px 7px',
+                fontSize: 11,
+                fontWeight: 700,
+                color: oomKillsCount > 0 ? '#f87171' : '#728c78',
+              }}
+            >
+              OOM Kills: {oomKillsCount}
+            </span>
+          )}
+        </div>
+      }
       className="a-proc"
     >
-      <div className="box-scroll" style={{ flex: 1, maxHeight: 520 }}>
+      <div
+        className="box-scroll"
+        style={{
+          flex: 1,
+          maxHeight: 460,
+          border: '1px solid #142e1a',
+          borderRadius: 8,
+          background: 'rgba(6, 12, 8, 0.6)',
+          overflowY: 'auto',
+          marginTop: 4,
+          paddingBottom: 10,
+        }}
+      >
         <DataTable
           key={mode}
           columns={mode === 'host' ? hostCols : appCols}
-          rows={rows}
-          rowKey={(r, i) => (mode === 'host' ? `${r.pid}` : `${r.name}-${i}`)}
+          rows={displayRows}
+          rowKey={(r, i) => (r.key ? r.key : mode === 'host' ? `${r.pid}` : `${r.name}-${i}`)}
           filter={filter}
-          initialSort={mode === 'host' ? { key: 'rss', dir: 'desc' } : { key: 'cpu', dir: 'desc' }}
-          empty={mode === 'host' ? 'No collector process data (host collector not enrolled?).' : 'No active Netdata apps in the latest sample.'}
+          initialSort={mode === 'host' ? { key: 'cpu', dir: 'desc' } : null}
+          onRowClick={(r) => {
+            if (mode === 'apps' && r.isGroup) {
+              toggleGroup(r.name);
+            }
+          }}
+          empty={mode === 'host' ? 'No collector process data (host collector not enrolled?).' : 'No active applications in the latest sample.'}
         />
       </div>
-      {mode === 'host' && Object.keys(proc.oom).length > 0 && (
-        <div className="tone-dim">oom: {Object.entries(proc.oom).map(([k, v]) => `${k}=${v}`).join('  ')}</div>
-      )}
     </Box>
   );
 }
@@ -851,7 +1210,6 @@ export default function OverviewTab({ node, state, range, setRange, onBack }) {
         </div>
         <div className="a-net"><NetBox data={data} /></div>
         <ProcBox data={data} />
-        <SourcesBox node={node} data={data} />
       </div>
     </>
   );

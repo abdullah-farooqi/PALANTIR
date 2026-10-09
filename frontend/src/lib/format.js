@@ -100,18 +100,28 @@ export function formatBytes(bytes) {
   return `${i === 0 ? Math.round(v) : v >= 100 ? v.toFixed(0) : v >= 10 ? v.toFixed(1) : v.toFixed(2)} ${DEC_UNITS[i]}`;
 }
 
-// Standard decimal network speed formatting (KB/s and MB/s)
+// Standard network speed formatting (B/s, KB/s, MB/s, GB/s, TB/s)
 export function formatNetworkSpeed(bytesOrKbPerSec) {
   if (bytesOrKbPerSec === null || bytesOrKbPerSec === undefined || !Number.isFinite(Number(bytesOrKbPerSec))) return '—';
-  let kb = Number(bytesOrKbPerSec);
-  // If value looks like raw bytes (> 10,000 or fractional), convert to KB
-  if (kb > 10000 || (kb > 0 && kb < 1 && kb % 1 !== 0)) {
-    kb = kb / 1000;
+  let bytesPerSec = Number(bytesOrKbPerSec);
+  
+  // If input looks like raw bytes per second vs KB/s
+  // Convert to B/s base
+  if (bytesPerSec < 10000 && bytesPerSec % 1 === 0 && bytesPerSec > 0) {
+    // Input is already in KB/s (from legacy helpers)
+    bytesPerSec = bytesPerSec * 1000;
   }
-  if (kb >= 1000) {
-    return `${(kb / 1000).toFixed(1)} MB/s`;
+
+  const units = ['B/s', 'KB/s', 'MB/s', 'GB/s', 'TB/s'];
+  let v = bytesPerSec;
+  let i = 0;
+  while (v >= 1000 && i < units.length - 1) {
+    v /= 1000;
+    i += 1;
   }
-  return `${Math.round(kb)} KB/s`;
+
+  if (i === 0) return `${Math.round(v)} ${units[i]}`;
+  return `${v >= 100 ? v.toFixed(0) : v >= 10 ? v.toFixed(1) : v.toFixed(2)} ${units[i]}`;
 }
 
 export const formatRate = formatNetworkSpeed;
