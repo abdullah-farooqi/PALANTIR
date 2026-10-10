@@ -4,92 +4,67 @@ from datetime import datetime, timezone
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from core.security import validate_netdata_url
-from integrations.netdata.client import NetdataClient
-from integrations.netdata.exceptions import NetdataUnavailable
 from integrations.agent.client import AgentCollectorClient
 from models.node import MonitoredNode
 
 logger = logging.getLogger(__name__)
 
 
+class CollectorUnavailable(Exception):
+    """The PALANTIR host collector could not be reached or returned an unusable response."""
+
+
 class NodeService:
     @staticmethod
     async def register_node(
         hostname: str,
-        netdata_url: str,
-        os_type: str,
         session: AsyncSession,
         collector_url: Optional[str] = None,
+        os_type: str = "linux",
+        netdata_url: Optional[str] = None,
     ) -> MonitoredNode:
-        netdata_url = validate_netdata_url(netdata_url)
-        os_type = os_type.strip().lower() if os_type else "linux"
-        client = NetdataClient(base_url=netdata_url)
-        capabilities = None
-        if collector_url:
-            collector_url = validate_netdata_url(collector_url)
-            try:
-                collector = AgentCollectorClient(collector_url)
-                await collector.info()
-                capabilities = await collector.capabilities()
-            except Exception as exc:
-                logger.warning("Host collector unavailable during enrollment for %s: %s", hostname, exc)
-                capabilities = {"status": "unavailable", "reason": str(exc)[:300]}
-        
-        # Probe connectivity & discover OS details
-        try:
-            info_resp = await client.info()
-            labels = info_resp.host_labels or {}
-        except Exception as err:
-            logger.warning("v1 info probe failed for %s, trying v3: %s", hostname, err)
-            try:
-                v3_meta = await client.get_host_metadata()
-                labels = v3_meta.get("host_labels") or {}
-            except Exception as v3_err:
-                logger.error("Netdata agent probe completely failed for %s: %s", hostname, v3_err)
-                raise NetdataUnavailable(f"Failed to probe Netdata agent: {v3_err}")
+        """Register (or update) a node.  The host collector is the only telemetry source.
 
-        # Auto-detect real distro name from Netdata host labels if generic 'linux' was passed
-        detected_os = (
-            labels.get("_os_name") or
-            labels.get("_os_id") or
-            labels.get("_os") or
-            labels.get("_os_version")
-        )
+        `netdata_url` is a legacy argument kept so older clients keep working.  It is no longer
+        contacted; the database column is still NOT NULL, so when no legacy URL is supplied the
+        collector URL is stored there (the UI only uses it to show the node's address).
+        """
+        if not collector_url:
+            raise ValueError("collector_url is required")
+        collector_url = validate_netdata_url(collector_url)  # generic, SSRF-safe URL validator
+        legacy_url = validate_netdata_url(netdata_url) if netdata_url else collector_url
+        os_type = os_type.strip().lower() if os_type else "linux"
+
+        try:
+            collector = AgentCollectorClient(collector_url)
+            info = await collector.info()
+        except Exception as exc:
+            logger.warning("Host collector unreachable during enrollment for %s: %s", hostname, exc)
+            raise CollectorUnavailable(str(exc)[:300]) from exc
+        try:
+            capabilities = await collector.capabilities()
+        except Exception as exc:  # the node is still usable; the next poll refreshes capabilities
+            logger.warning("Could not read collector capabilities for %s: %s", hostname, exc)
+            capabilities = None
+
+        # Use the real distro reported by the host instead of the generic "linux" placeholder.
+        os_release = info.get("os_release") if isinstance(info.get("os_release"), dict) else {}
+        detected_os = os_release.get("ID") or os_release.get("NAME")
         if detected_os and isinstance(detected_os, str):
             os_type = detected_os.strip().lower()
         elif os_type not in {"linux", "windows"}:
             os_type = "linux"
 
-
-        # Discover contexts
-        try:
-            contexts = await client.get_contexts()
-            context_count = len(contexts)
-        except Exception as e:
-            logger.warning(f"Could not discover contexts on registration for {hostname}: {e}")
-            context_count = None
-
-        # Discover alerts
-        try:
-            alerts = await client.get_alerts(all_definitions=True)
-            alert_count = len(alerts.get("alarms", {}))
-        except Exception as e:
-            logger.warning(f"Could not discover alerts on registration for {hostname}: {e}")
-            alert_count = None
-
-        # Check if node exists
         stmt = select(MonitoredNode).where(MonitoredNode.hostname == hostname)
         existing = (await session.execute(stmt)).scalar_one_or_none()
 
         if existing:
-            existing.netdata_url = netdata_url
-            if collector_url is not None:
-                existing.collector_url = collector_url
+            existing.netdata_url = legacy_url
+            existing.collector_url = collector_url
+            if capabilities is not None:
                 existing.capabilities = capabilities
             existing.os_type = os_type
             existing.active = True
-            existing.context_count = context_count
-            existing.alert_count = alert_count
             existing.last_seen_at = datetime.now(timezone.utc)
             await session.commit()
             await session.refresh(existing)
@@ -97,13 +72,13 @@ class NodeService:
 
         node = MonitoredNode(
             hostname=hostname,
-            netdata_url=netdata_url,
+            netdata_url=legacy_url,
             collector_url=collector_url,
             capabilities=capabilities,
             os_type=os_type,
             active=True,
-            context_count=context_count,
-            alert_count=alert_count,
+            context_count=None,
+            alert_count=None,
         )
         session.add(node)
         await session.commit()

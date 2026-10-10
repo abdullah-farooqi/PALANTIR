@@ -88,7 +88,7 @@ export default function SettingsTab({ node, data, refreshMs, setRefreshMs, onRef
           Telemetry Collection Sources
         </h3>
         <p style={{ color: '#7a9680', fontSize: '13.5px', marginBottom: '16px' }}>
-          Status of telemetry categories collected via Netdata agent and Palantir host collector.
+          Status of telemetry categories collected by the PALANTIR host collector.
         </p>
 
         {data && data.errors && data.errors.status && <ErrorLine warn>collection-status: {data.errors.status}</ErrorLine>}
@@ -105,7 +105,6 @@ export default function SettingsTab({ node, data, refreshMs, setRefreshMs, onRef
                 </tr>
               </thead>
               <tbody>
-                <tr><td className="tone-dim" style={{ fontWeight: 700, color: '#a3c4aa' }}>netdata</td>{cats.map((c) => <td key={c.category}>{cell(c, 'netdata')}</td>)}</tr>
                 <tr><td className="tone-dim" style={{ fontWeight: 700, color: '#a3c4aa' }}>collector</td>{cats.map((c) => <td key={c.category}>{cell(c, AGENT)}</td>)}</tr>
               </tbody>
             </table>
@@ -115,7 +114,7 @@ export default function SettingsTab({ node, data, refreshMs, setRefreshMs, onRef
         {node && (
           <div style={{ paddingTop: 12, borderTop: '1px solid #142e1a', color: '#728c78', fontSize: 12, fontFamily: 'JetBrains Mono, monospace' }}>
             <div>last contact: <span style={{ color: '#d8dee9' }}>{formatRelative(node.last_seen_at)}</span> • last collection: <span style={{ color: '#d8dee9' }}>{formatRelative(node.last_collection_at)}</span></div>
-            <div style={{ marginTop: 4 }}>netdata: <span style={{ color: '#06b6d4' }}>{node.netdata_url}</span> {node.collector_url ? `• collector: ${node.collector_url}` : ''}</div>
+            <div style={{ marginTop: 4 }}>collector: <span style={{ color: '#06b6d4' }}>{node.collector_url || 'not configured'}</span></div>
           </div>
         )}
       </div>

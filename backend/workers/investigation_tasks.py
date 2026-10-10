@@ -29,7 +29,7 @@ def _set_progress(session, investigation_id: int, progress: int) -> AgentInvesti
 
 def _evidence(session, investigation: AgentInvestigation, node: MonitoredNode, now: datetime) -> dict:
     since = now - timedelta(hours=min(settings.METRICS_RETENTION_HOURS, 24))
-    source = func.coalesce(MetricSnapshot.data["source"].as_string(), "netdata")
+    source = func.coalesce(MetricSnapshot.data["source"].as_string(), "palantir-agent")
     metric_rows = session.execute(
         select(
             MetricSnapshot.category,
@@ -41,7 +41,11 @@ def _evidence(session, investigation: AgentInvestigation, node: MonitoredNode, n
             MetricSnapshot.load_avg,
             MetricSnapshot.swap_used_mb,
         )
-        .where(MetricSnapshot.node_id == node.id, MetricSnapshot.collected_at >= since)
+        .where(
+            MetricSnapshot.node_id == node.id,
+            MetricSnapshot.collected_at >= since,
+            MetricSnapshot.data["sample"].as_string().is_(None),  # ignore per-second CPU sample rows
+        )
         .order_by(MetricSnapshot.collected_at.desc(), MetricSnapshot.id.desc())
         .limit(200)
     ).all()

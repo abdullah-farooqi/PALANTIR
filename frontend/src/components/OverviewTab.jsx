@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Box, Chips, DataTable, Dot, Empty, ErrorLine, DotGraph, MeterRow, Meter } from './ui';
 import {
-  AGENT, RANGES, agentData, isVirtualIface, netdataNetNow, networkFromSeries, processSummary, seriesToPoints, storageFromSeries, storageSummary, systemSummary,
+  AGENT, RANGES, agentData, isVirtualIface, networkNow, networkFromSeries, processSummary, seriesToPoints, storageFromSeries, storageSummary, systemSummary,
 } from '../lib/metrics';
 import {
   formatBits, formatBytes, formatCount, formatDuration, formatPercent, formatRate, formatRelative, formatNumber,
@@ -153,7 +153,8 @@ function CpuBox({ data, range, setRange }) {
     const map = new Map();
     rawList.forEach((item) => {
       const prog = item.name || 'unknown';
-      const cpuVal = item.cpu || 0;
+      if (item.cpu === null || item.cpu === undefined) return; // not measured yet: never counted as 0
+      const cpuVal = item.cpu;
       const memVal = item.rss ?? item.mem ?? 0;
       if (!map.has(prog)) {
         map.set(prog, { cpu: 0, mem: 0 });
@@ -180,17 +181,11 @@ function CpuBox({ data, range, setRange }) {
     if (sys.cpuCoresPct && sys.cpuCoresPct.length > 0) {
       return sys.cpuCoresPct.map((pct, idx) => ({ id: idx + 1, pct: Math.min(100, Math.max(0, pct)) }));
     }
-    const basePct = sys.cpuPct;
-    if (basePct !== null && basePct !== undefined && coreCount > 0) {
-      return Array.from({ length: coreCount }).map((_, idx) => ({
-        id: idx + 1,
-        pct: Math.min(100, Math.max(0, Math.round(basePct))),
-      }));
-    }
     return [];
-  }, [sys.cpuCoresPct, sys.cpuPct, coreCount]);
+  }, [sys.cpuCoresPct]);
 
-  const cpuHeaderTitle = sys.cpuModel ? `CPU • ${sys.cpuModel} (${coreCount} Cores)` : `CPU (${coreCount} Cores)`;
+  const coresLabel = coreCount > 0 ? ` (${coreCount} Cores)` : '';
+  const cpuHeaderTitle = sys.cpuModel ? `CPU • ${sys.cpuModel}${coresLabel}` : `CPU${coresLabel}`;
 
   // Legend and time controls placed cleanly inline in Box controls
   const controls = (
@@ -219,7 +214,7 @@ function CpuBox({ data, range, setRange }) {
         {/* Left Column (~50%): Stacked Main Timeline Graph */}
         <div style={{ display: 'flex', flexDirection: 'column', height: '100%', justifyContent: 'space-between' }}>
           {points.length === 0 ? (
-            <Empty>No CPU telemetry samples in this window yet — collection runs every 60 s.</Empty>
+            <Empty>No data available</Empty>
           ) : (
             <StackedCpuGraph points={points} height={215} />
           )}
@@ -229,8 +224,9 @@ function CpuBox({ data, range, setRange }) {
         <div style={{ display: 'flex', flexDirection: 'column', height: '100%', justifyContent: 'space-between', background: 'rgba(10, 20, 13, 0.5)', border: '1px solid #142e1a', borderRadius: 8, padding: '10px 12px' }}>
           <div>
             <div style={{ fontSize: 11, fontWeight: 800, color: '#39e569', letterSpacing: '0.05em', marginBottom: 8 }}>
-              CORES ({coreCount})
+              CORES{coreCount > 0 ? ` (${coreCount})` : ''}
             </div>
+            {coresList.length === 0 && <Empty>No data available</Empty>}
             <div style={{ display: 'grid', gridTemplateColumns: coreCount > 8 ? 'repeat(2, 1fr)' : '1fr', gap: '4px 10px', maxHeight: 165, overflowY: 'auto', paddingRight: 2 }}>
               {coresList.map((c) => (
                 <div key={c.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', fontSize: 11 }}>
@@ -275,7 +271,7 @@ function CpuBox({ data, range, setRange }) {
               TOP APPS BY CPU
             </div>
             {topCpu.length === 0 ? (
-              <Empty>No active application CPU load reported.</Empty>
+              <Empty>No data available</Empty>
             ) : (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
                 {topCpu.map((a) => {
@@ -324,9 +320,8 @@ function SegmentedBar({ pct, tone = 'usage', height = 10, style = {} }) {
   );
 }
 
-function MultiSegmentRamBar({ usedPct = 0, buffCachePct = 0, height = 12 }) {
+function MultiSegmentRamBar({ usedPct = 0, height = 10 }) {
   const uPct = Math.max(0, Math.min(100, usedPct));
-  const bcPct = Math.max(0, Math.min(100 - uPct, buffCachePct));
   return (
     <div
       style={{
@@ -341,7 +336,6 @@ function MultiSegmentRamBar({ usedPct = 0, buffCachePct = 0, height = 12 }) {
       }}
     >
       <div style={{ position: 'absolute', top: 0, bottom: 0, left: 0, width: `${uPct}%`, background: '#22c55e' }} />
-      <div style={{ position: 'absolute', top: 0, bottom: 0, left: `${uPct}%`, width: `${bcPct}%`, background: '#06b6d4' }} />
     </div>
   );
 }
@@ -351,13 +345,13 @@ function MemBox({ data }) {
   const proc = useMemo(() => processSummary(data.latest), [data.latest]);
   const { mem, swap } = sys;
 
-  const total = mem.total || 1;
-  const appUsed = Math.max(0, (mem.used || 0) - (mem.buffers || 0) - (mem.cached || 0));
+  const hasMem = mem.total !== null && mem.total > 0 && mem.used !== null;
+  const total = hasMem ? mem.total : 1;
+  // `used` is "total - available": it already EXCLUDES reclaimable cache, so the cache is drawn on top of it.
+  const usedPct = hasMem ? Math.min(100, (mem.used / total) * 100) : 0;
   const buffCache = (mem.buffers || 0) + (mem.cached || 0);
-
-  const usedPct = Math.min(100, (appUsed / total) * 100);
-  const buffCachePct = Math.min(100 - usedPct, (buffCache / total) * 100);
-  const memTotalPct = Math.min(100, Math.round(((mem.used || 0) / total) * 100));
+  const buffCachePct = hasMem ? Math.min(100 - usedPct, (buffCache / total) * 100) : 0;
+  const memTotalPct = hasMem ? Math.min(100, Math.round(mem.pct ?? usedPct)) : null;
 
   const topRamApps = useMemo(() => {
     const rawList = proc.host && proc.host.length > 0 ? proc.host : proc.apps || [];
@@ -388,6 +382,8 @@ function MemBox({ data }) {
       <div style={{ display: 'flex', flexDirection: 'column', height: '100%', justifyContent: 'space-between', gap: 12 }}>
         {/* Upper Section: RAM & Swap */}
         <div style={{ display: 'flex', flexDirection: 'column', gap: 10, height: 110, justifyContent: 'center' }}>
+          {!hasMem ? <Empty>No data available</Empty> : (
+          <>
           {/* RAM Header & Bar */}
           <div>
             <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, fontWeight: 700, fontFamily: 'JetBrains Mono, monospace', marginBottom: 4 }}>
@@ -399,7 +395,7 @@ function MemBox({ data }) {
               </span>
             </div>
             <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-              <MultiSegmentRamBar usedPct={usedPct} buffCachePct={buffCachePct} height={10} />
+              <MultiSegmentRamBar usedPct={memTotalPct ?? usedPct} height={10} />
               <span style={{ color: '#39e569', fontFamily: 'JetBrains Mono, monospace', fontWeight: 800, fontSize: 11, minWidth: 32, textAlign: 'right' }}>
                 {memTotalPct}%
               </span>
@@ -407,17 +403,25 @@ function MemBox({ data }) {
           </div>
 
           {/* Swap Header & Bar */}
+          {swap.total === null ? (
+            <div style={{ fontSize: 11, fontWeight: 700, fontFamily: 'JetBrains Mono, monospace', color: '#728c78' }}>Swap: no data available</div>
+          ) : swap.total === 0 ? (
+            <div style={{ fontSize: 11, fontWeight: 700, fontFamily: 'JetBrains Mono, monospace', color: '#728c78' }}>Swap: not configured</div>
+          ) : (
           <div>
             <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, fontWeight: 700, fontFamily: 'JetBrains Mono, monospace', marginBottom: 4 }}>
               <span style={{ color: '#728c78' }}>
-                Swap: <span style={{ color: '#d8dee9' }}>{formatBytes(swap.used)} / {formatBytes(swap.total || 0)}</span>
+                Swap: <span style={{ color: '#d8dee9' }}>{formatBytes(swap.used)} / {formatBytes(swap.total)}</span>
               </span>
               <span style={{ color: swap.pct > 70 ? '#f0616d' : '#728c78' }}>
-                {swap.pct !== null ? `${Math.round(swap.pct)}%` : '0%'}
+                {swap.pct !== null ? `${Math.round(swap.pct)}%` : '—'}
               </span>
             </div>
             <SegmentedBar pct={swap.pct || 0} tone={swap.pct > 70 ? 'usage' : 'cool'} height={8} />
           </div>
+          )}
+          </>
+          )}
         </div>
 
         {/* Lower Section: TOP APPS BY RAM */}
@@ -426,7 +430,7 @@ function MemBox({ data }) {
             TOP APPS BY RAM
           </div>
           {topRamApps.length === 0 ? (
-            <Empty>No active process memory data.</Empty>
+            <Empty>No data available</Empty>
           ) : (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
               {topRamApps.map((a, idx) => {
@@ -459,13 +463,31 @@ function DisksBox({ data }) {
 
   // Compute real-time rates and IOPS from snapshot deltas across storageSeries
   const ioRates = useMemo(() => {
+    if (st.ioNow) return st.ioNow;
     const items = data.storageSeries && data.storageSeries.items ? data.storageSeries.items : [];
     return storageFromSeries(items);
-  }, [data.storageSeries]);
+  }, [data.storageSeries, st.ioNow]);
 
   const readRate = ioRates.readRate;
   const writeRate = ioRates.writeRate;
   const iops = ioRates.iops;
+  const busyPct = ioRates.busyPct;
+
+  // Track real peak read and write rates observed
+  const [peakRead, setPeakRead] = useState(null);
+  const [peakWrite, setPeakWrite] = useState(null);
+
+  useEffect(() => {
+    if (typeof readRate === 'number' && readRate > 0) {
+      setPeakRead((prev) => (prev === null ? readRate : Math.max(prev, readRate)));
+    }
+  }, [readRate]);
+
+  useEffect(() => {
+    if (typeof writeRate === 'number' && writeRate > 0) {
+      setPeakWrite((prev) => (prev === null ? writeRate : Math.max(prev, writeRate)));
+    }
+  }, [writeRate]);
 
   const fsList = st.filesystems || [];
 
@@ -475,23 +497,23 @@ function DisksBox({ data }) {
         {/* Upper Section: Mount Point Storage Usage */}
         <div style={{ display: 'flex', flexDirection: 'column', gap: 8, height: 110, justifyContent: 'center', overflowY: 'auto', paddingRight: 2 }}>
           {fsList.length === 0 ? (
-            <Empty>No filesystems reported.</Empty>
+            <Empty>No data available</Empty>
           ) : (
             fsList.slice(0, 3).map((f) => {
-              const tot = f.total ?? f.totalBytes ?? 1;
-              const usd = f.used ?? f.usedBytes ?? 0;
-              const fre = f.free ?? f.freeBytes ?? 0;
+              const tot = f.total ?? f.totalBytes ?? null;
+              const usd = f.used ?? f.usedBytes ?? null;
+              const fre = f.free ?? f.freeBytes ?? null;
               let p = f.pct;
-              if (p === null && tot && usd !== null) p = Math.min(100, (usd / tot) * 100);
-              const pctVal = p !== null ? Math.round(p) : 0;
+              if ((p === null || p === undefined) && tot && usd !== null) p = Math.min(100, (usd / tot) * 100);
+              const pctVal = p !== null && p !== undefined ? Math.round(p) : null;
 
               // Color logic: bright green (<70%), amber/yellow (70-90%), red (>=90%)
               let barColor = '#22c55e'; // Bright green (<70%)
               let textColor = '#39e569';
-              if (pctVal >= 90) {
+              if (pctVal !== null && pctVal >= 90) {
                 barColor = '#f0616d'; // Bright red (>=90%)
                 textColor = '#f0616d';
-              } else if (pctVal >= 70) {
+              } else if (pctVal !== null && pctVal >= 70) {
                 barColor = '#f59e0b'; // Amber / Yellow (70-90%)
                 textColor = '#fbbf24';
               }
@@ -500,7 +522,7 @@ function DisksBox({ data }) {
                 <div key={f.mount + f.device}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, fontWeight: 700, fontFamily: 'JetBrains Mono, monospace', marginBottom: 2 }}>
                     <span style={{ color: '#d8dee9' }}>
-                      {f.mount} <span style={{ color: '#6b7a6f', fontWeight: 500 }}>({f.fs || 'ext4'})</span>
+                      {f.mount} {f.fs && <span style={{ color: '#6b7a6f', fontWeight: 500 }}>({f.fs})</span>}
                     </span>
                     <span style={{ color: textColor }}>
                       {formatBytes(usd)} / {formatBytes(tot)}
@@ -524,10 +546,10 @@ function DisksBox({ data }) {
                         maskImage: 'repeating-linear-gradient(90deg, #000 0 4px, transparent 4px 6px)',
                       }}
                     >
-                      <div style={{ position: 'absolute', top: 0, bottom: 0, left: 0, width: `${pctVal}%`, background: barColor }} />
+                      <div style={{ position: 'absolute', top: 0, bottom: 0, left: 0, width: `${pctVal ?? 0}%`, background: barColor }} />
                     </div>
                     <span style={{ color: textColor, fontFamily: 'JetBrains Mono, monospace', fontWeight: 800, fontSize: 11, minWidth: 32, textAlign: 'right' }}>
-                      {pctVal}%
+                      {pctVal !== null ? `${pctVal}%` : '—'}
                     </span>
                   </div>
                   <div style={{ fontSize: 10.5, color: '#6b7a6f', fontFamily: 'JetBrains Mono, monospace', marginTop: 3, display: 'flex', justifyContent: 'space-between' }}>
@@ -546,53 +568,39 @@ function DisksBox({ data }) {
             I/O ACTIVITY
           </div>
           {diskIo.length === 0 ? (
-            <Empty>No active disk I/O telemetry.</Empty>
+            <Empty>No data available</Empty>
           ) : (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 6, fontSize: 11, fontFamily: 'JetBrains Mono, monospace' }}>
-              {/* Read Rate Row */}
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                <span style={{ color: '#728c78', width: 50, fontWeight: 600 }}>Read:</span>
-                <span style={{ color: '#22d3ee', fontWeight: 700, width: 90, flexShrink: 0 }}>
-                  {formatRate(readRate)}
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 12, textAlign: 'left', fontFamily: 'JetBrains Mono, monospace' }}>
+              {/* Column 1: READ */}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+                <span style={{ fontSize: 10, fontWeight: 700, color: '#6b7a6f', letterSpacing: '0.06em' }}>READ</span>
+                <span style={{ fontSize: 13, fontWeight: 800, color: '#22d3ee' }}>
+                  {typeof readRate === 'number' ? formatRate(readRate) : '—'}
                 </span>
-                <div style={{ flex: 1, minWidth: 40 }}>
-                  <SegmentedBar pct={readRate > 0 ? Math.min(100, (readRate / (100 * 1024 * 1024)) * 100) : 0} tone="cool" height={5} />
-                </div>
+                <span style={{ fontSize: 10, color: '#4a6350', fontWeight: 500 }}>
+                  {peakRead !== null ? `peak: ${formatRate(peakRead)}` : 'peak: —'}
+                </span>
               </div>
 
-              {/* Write Rate Row */}
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                <span style={{ color: '#728c78', width: 50, fontWeight: 600 }}>Write:</span>
-                <span style={{ color: '#fbbf24', fontWeight: 700, width: 90, flexShrink: 0 }}>
-                  {formatRate(writeRate)}
+              {/* Column 2: WRITE */}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+                <span style={{ fontSize: 10, fontWeight: 700, color: '#6b7a6f', letterSpacing: '0.06em' }}>WRITE</span>
+                <span style={{ fontSize: 13, fontWeight: 800, color: '#fbbf24' }}>
+                  {typeof writeRate === 'number' ? formatRate(writeRate) : '—'}
                 </span>
-                <div style={{ flex: 1, minWidth: 40 }}>
-                  <div
-                    role="progressbar"
-                    aria-valuenow={writeRate > 0 ? Math.min(100, (writeRate / (100 * 1024 * 1024)) * 100) : 0}
-                    aria-valuemin={0}
-                    aria-valuemax={100}
-                    style={{
-                      position: 'relative',
-                      height: 5,
-                      borderRadius: 3,
-                      width: '100%',
-                      background: '#0a120c',
-                      overflow: 'hidden',
-                      WebkitMaskImage: 'repeating-linear-gradient(90deg, #000 0 4px, transparent 4px 6px)',
-                      maskImage: 'repeating-linear-gradient(90deg, #000 0 4px, transparent 4px 6px)',
-                    }}
-                  >
-                    <div style={{ position: 'absolute', top: 0, bottom: 0, left: 0, width: `${writeRate > 0 ? Math.min(100, (writeRate / (100 * 1024 * 1024)) * 100) : 0}%`, background: '#f59e0b' }} />
-                  </div>
-                </div>
+                <span style={{ fontSize: 10, color: '#4a6350', fontWeight: 500 }}>
+                  {peakWrite !== null ? `peak: ${formatRate(peakWrite)}` : 'peak: —'}
+                </span>
               </div>
 
-              {/* IOPS Row */}
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 2 }}>
-                <span style={{ color: '#728c78', width: 50, fontWeight: 600 }}>IOPS:</span>
-                <span style={{ color: '#39e569', fontWeight: 700 }}>
-                  {iops > 0 ? `${formatCount(Math.round(iops))} ops/s` : '0 ops/s'}
+              {/* Column 3: IOPS */}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+                <span style={{ fontSize: 10, fontWeight: 700, color: '#6b7a6f', letterSpacing: '0.06em' }}>IOPS</span>
+                <span style={{ fontSize: 13, fontWeight: 800, color: '#39e569' }}>
+                  {typeof iops === 'number' ? `${formatCount(Math.round(iops))} ops/s` : '—'}
+                </span>
+                <span style={{ fontSize: 10, color: '#4a6350', fontWeight: 500 }}>
+                  {typeof busyPct === 'number' ? `busy: ${busyPct}%` : 'busy: —'}
                 </span>
               </div>
             </div>
@@ -607,13 +615,13 @@ function DisksBox({ data }) {
 function NetBox({ data }) {
   const [iface, setIface] = useState('all');
   const net = useMemo(() => networkFromSeries(data.net && data.net.items, iface), [data.net, iface]);
-  const now = useMemo(() => netdataNetNow(data.latest), [data.latest]);
+  const now = useMemo(() => networkNow(data.latest), [data.latest]);
   const rxV = net.points.map((p) => p.rx);
   const txV = net.points.map((p) => p.tx);
   const hasPoints = net.points.length > 1;
   const last = net.points[net.points.length - 1];
-  const rxNow = hasPoints ? last.rx : now && now.rx;
-  const txNow = hasPoints ? last.tx : now && now.tx;
+  const rxNow = now && now.rx !== null && iface === 'all' ? now.rx : hasPoints ? last.rx : null;
+  const txNow = now && now.tx !== null && iface === 'all' ? now.tx : hasPoints ? last.tx : null;
   const rxTop = rxV.length ? Math.max(...rxV) : null;
   const txTop = txV.length ? Math.max(...txV) : null;
 
@@ -630,13 +638,13 @@ function NetBox({ data }) {
 
   // Dynamic Peak calculation for auto-scaling Y-axis (scale strictly to non-zero network traffic)
   const maxRxTx = Math.max(0, ...rxV, ...txV);
-  const peakVal = maxRxTx > 0 ? maxRxTx : 64;
+  const peakVal = maxRxTx > 0 ? maxRxTx : 1;
   const scale = peakVal * 1.15;
   const GUTTER_W = 54;
 
   // Active interface details detection (prioritize physical Wi-Fi/Ethernet from collector names)
   const physicalIfaceName = useMemo(() => {
-    if (names.length === 0) return 'wlo1';
+    if (names.length === 0) return null;
     // Find wireless interface first if present (wlo1, wlan0, wlp3s0, etc.)
     const wifiMatch = names.find((n) => /^(wlan|wlo|wlp|wls)/i.test(n));
     if (wifiMatch) return wifiMatch;
@@ -646,8 +654,8 @@ function NetBox({ data }) {
   }, [names]);
 
   const activeIfaceName = iface === 'all' ? physicalIfaceName : iface;
-  const isWifi = /^(wlan|wlo|wlp|wls)/i.test(activeIfaceName);
-  const ifaceTypeLabel = isWifi ? 'Wi-Fi Wireless' : 'Ethernet Full Duplex';
+  const isWifi = !!activeIfaceName && /^(wlan|wlo|wlp|wls)/i.test(activeIfaceName);
+  const ifaceTypeLabel = !activeIfaceName ? null : isWifi ? 'Wi-Fi Wireless' : 'Wired';
 
   return (
     <Box
@@ -674,13 +682,13 @@ function NetBox({ data }) {
               {/* Y-Axis Label Column inside Gutter */}
               <div style={{ position: 'absolute', top: 0, left: 0, width: GUTTER_W - 4, height: '100%', pointerEvents: 'none', fontFamily: 'JetBrains Mono, monospace' }}>
                 <span style={{ position: 'absolute', top: 2, right: 4, color: '#06b6d4', fontSize: 9.5, fontWeight: 700 }}>
-                  {formatRate(rxTop || scale / 2)}
+                  {formatRate(rxTop)}
                 </span>
                 <span style={{ position: 'absolute', top: '50%', right: 4, transform: 'translateY(-50%)', color: '#527a5a', fontSize: 9.5, fontWeight: 700 }}>
                   0 KB/s
                 </span>
                 <span style={{ position: 'absolute', bottom: 2, right: 4, color: '#22c55e', fontSize: 9.5, fontWeight: 700 }}>
-                  {formatRate(txTop || scale / 2)}
+                  {formatRate(txTop)}
                 </span>
               </div>
 
@@ -688,7 +696,7 @@ function NetBox({ data }) {
             </div>
           ) : (
             <Empty>
-              {data.net ? 'Need at least two collector snapshots (one per minute) to compute bandwidth.' : 'Network history needs the host collector (palantir-agent).'}
+              No data available
             </Empty>
           )}
         </div>
@@ -712,7 +720,7 @@ function NetBox({ data }) {
                 </div>
                 <div style={{ display: 'flex', justifyContent: 'space-between' }}>
                   <span style={{ color: '#728c78' }}>Total:</span>
-                  <span style={{ color: '#a3c4aa', fontWeight: 600 }}>{formatBytes(net.totals.totalRx)}</span>
+                  <span style={{ color: '#a3c4aa', fontWeight: 600 }}>{formatBytes(net.totals.totalRx ?? (now && now.totalRx))}</span>
                 </div>
               </div>
             </div>
@@ -733,7 +741,7 @@ function NetBox({ data }) {
                 </div>
                 <div style={{ display: 'flex', justifyContent: 'space-between' }}>
                   <span style={{ color: '#728c78' }}>Total:</span>
-                  <span style={{ color: '#a3c4aa', fontWeight: 600 }}>{formatBytes(net.totals.totalTx)}</span>
+                  <span style={{ color: '#a3c4aa', fontWeight: 600 }}>{formatBytes(net.totals.totalTx ?? (now && now.totalTx))}</span>
                 </div>
               </div>
             </div>
@@ -742,10 +750,10 @@ function NetBox({ data }) {
           {/* Interface Footer Line */}
           <div style={{ borderTop: '1px solid #142e1a', paddingTop: 8, marginTop: 8, fontSize: 10.5, color: '#728c78', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
             <span>
-              Interface: <span style={{ color: '#39e569', fontWeight: 700 }}>{activeIfaceName}</span>
+              Interface: <span style={{ color: '#39e569', fontWeight: 700 }}>{activeIfaceName || '—'}</span>
             </span>
             <span style={{ color: '#6b7a6f' }}>
-              ({ifaceTypeLabel})
+              {ifaceTypeLabel ? `(${ifaceTypeLabel})` : ''}
             </span>
           </div>
         </div>
@@ -832,7 +840,7 @@ function ProcBox({ data }) {
           name: prog,
           procs: [],
           totalMem: 0,
-          totalCpu: 0,
+          totalCpu: null,
           totalThreads: 0,
           users: new Set(),
         });
@@ -841,7 +849,7 @@ function ProcBox({ data }) {
       g.procs.push(item);
       const memVal = item.rss ?? item.mem ?? 0;
       g.totalMem += memVal;
-      g.totalCpu += item.cpu ?? 0;
+      if (item.cpu !== null && item.cpu !== undefined) g.totalCpu = (g.totalCpu ?? 0) + item.cpu;
       g.totalThreads += item.threads ?? 1;
       if (item.user) g.users.add(item.user);
     });
@@ -1005,7 +1013,7 @@ function ProcBox({ data }) {
       value: (r) => r.cpu,
       render: (r) => (
         <span style={{ color: '#22d3ee', fontWeight: 700 }}>
-          {r.cpu > 0 && r.cpu < 0.1 ? r.cpu.toFixed(2) : formatNumber(r.cpu || 0, 1)}%
+          {r.cpu === null || r.cpu === undefined ? '—' : `${r.cpu > 0 && r.cpu < 0.1 ? r.cpu.toFixed(2) : formatNumber(r.cpu, 1)}%`}
         </span>
       ),
     },
@@ -1113,7 +1121,7 @@ function ProcBox({ data }) {
               toggleGroup(r.name);
             }
           }}
-          empty={mode === 'host' ? 'No collector process data (host collector not enrolled?).' : 'No active applications in the latest sample.'}
+          empty="No data available"
         />
       </div>
     </Box>
@@ -1150,7 +1158,6 @@ function SourcesBox({ node, data }) {
               </tr>
             </thead>
             <tbody>
-              <tr><td className="tone-dim">netdata</td>{cats.map((c) => <td key={c.category}>{cell(c, 'netdata')}</td>)}</tr>
               <tr><td className="tone-dim">collector</td>{cats.map((c) => <td key={c.category}>{cell(c, AGENT)}</td>)}</tr>
             </tbody>
           </table>
@@ -1158,7 +1165,7 @@ function SourcesBox({ node, data }) {
       )}
       {node && (
         <div className="tone-dim" style={{ marginTop: 4 }}>
-          last contact {formatRelative(node.last_seen_at)} • last collection {formatRelative(node.last_collection_at)} • netdata {node.netdata_url}
+          last contact {formatRelative(node.last_seen_at)} • last collection {formatRelative(node.last_collection_at)}
           {node.collector_url ? ` • collector ${node.collector_url}` : ' • no collector configured'}
         </div>
       )}
@@ -1196,7 +1203,7 @@ export default function OverviewTab({ node, state, range, setRange, onBack }) {
             </svg>
           </button>
           <span style={{ fontSize: '1.25rem', fontWeight: 800, color: '#fff' }}>{node?.hostname || 'Host Details'}</span>
-          <span className="tone-dim" style={{ fontSize: '0.9rem' }}>{node?.netdata_url ? node.netdata_url.replace(/^https?:\/\//, '').split(':')[0] : ''}</span>
+          <span className="tone-dim" style={{ fontSize: '0.9rem' }}>{(node?.collector_url || node?.netdata_url) ? (node.collector_url || node.netdata_url).replace(/^https?:\/\//, '').split(':')[0] : ''}</span>
         </div>
       </div>
       {state.error && <ErrorLine warn>refresh failed: {state.error}</ErrorLine>}

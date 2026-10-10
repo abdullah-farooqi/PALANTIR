@@ -32,7 +32,6 @@ export default function AddNodeModal({ onClose, onCreated }) {
     const cleanIp = hostIp.trim().replace(/^https?:\/\//i, '').replace(/\/.*$/, '');
     const payload = {
       hostname: hostname.trim(),
-      netdata_url: formatUrl(cleanIp, 19999),
       collector_url: formatUrl(cleanIp, 20000),
       os_type: 'linux',
     };

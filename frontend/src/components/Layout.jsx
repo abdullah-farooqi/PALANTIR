@@ -92,7 +92,7 @@ export function NodeBar({ nodes, selectedId, onSelect, onAdd, onRemove, onViewGr
       <span className="tone-dim">active node:</span>
       {nodes.length === 0 && <span className="tone-dim">none registered yet</span>}
       {nodes.map((n) => (
-        <button key={n.id} className={`nodetab ${n.id === selectedId && currentView !== 'fleet' ? 'on' : ''}`} onClick={() => onSelect(n.id)} title={`${n.netdata_url}${n.collector_url ? `\ncollector ${n.collector_url}` : ''}\nlast contact ${formatRelative(n.last_seen_at)}`}>
+        <button key={n.id} className={`nodetab ${n.id === selectedId && currentView !== 'fleet' ? 'on' : ''}`} onClick={() => onSelect(n.id)} title={`${n.collector_url || n.netdata_url}\nlast contact ${formatRelative(n.last_seen_at)}`}>
           <Dot tone={statusTone(n.reachability)} />
           {n.hostname}
         </button>

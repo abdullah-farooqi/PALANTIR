@@ -4,7 +4,7 @@ import { usePolling } from '../hooks/usePolling';
 import { Dot, Meter, MeterRow, Box, Empty, ErrorLine } from './ui';
 import { formatBytes, formatPercent, formatRelative, formatCount, formatNetworkSpeed } from '../lib/format';
 import { statusTone } from '../lib/events';
-import { systemSummary, storageSummary, netdataNetNow } from '../lib/metrics';
+import { systemSummary, storageSummary, networkNow } from '../lib/metrics';
 
 import { fetchNodeSummary } from '../hooks/useNodeData';
 
@@ -58,7 +58,7 @@ function NodeCard({ node, onSelect, onRemove, CAN_WRITE }) {
   const history = summary ? summary.history || [] : [];
   const sys = useMemo(() => (latest ? systemSummary(latest) : null), [latest]);
   const st = useMemo(() => (latest ? storageSummary(latest) : null), [latest]);
-  const net = useMemo(() => (latest ? netdataNetNow(latest) : null), [latest]);
+  const net = useMemo(() => (latest ? networkNow(latest) : null), [latest]);
 
   // Primary Storage Partition Usage
   const rootFs = useMemo(() => {
@@ -83,77 +83,40 @@ function NodeCard({ node, onSelect, onRemove, CAN_WRITE }) {
   }
 
   const osInfo = getOsIconAndLabel(node, sys);
-  const ipAddress = node.netdata_url ? node.netdata_url.replace(/^https?:\/\//, '').split(':')[0] : '—';
+  const addressUrl = node.collector_url || node.netdata_url;
+  const ipAddress = addressUrl ? addressUrl.replace(/^https?:\/\//, '').split(':')[0] : '—';
 
-  // Build sparkline path points directly from real historical CPU telemetry
+  // Sparkline from real CPU samples only. No samples -> null (the card says "no data").
   const sparklineData = useMemo(() => {
     const width = 320;
     const height = 60;
-    const count = 30;
+    const count = 60;
 
-    if (!isOnline) {
-      const flatY = height / 2;
-      const flatPath = `M 0,${flatY} L ${width},${flatY}`;
-      return { pathD: flatPath, areaD: '', width, height };
-    }
-
-    const points = [];
-    
-    // Extract numerical CPU percentage values from returned series items
     const rawCpuValues = (history || [])
-      .map((item) => {
-        if (!item) return null;
-        if (typeof item.cpu_pct === 'number') return item.cpu_pct;
-        if (item.data && typeof item.data.cpu_pct === 'number') return item.data.cpu_pct;
-        if (item.metrics && typeof item.metrics.cpu_pct === 'number') return item.metrics.cpu_pct;
-        return null;
-      })
+      .slice()
+      .reverse() // API returns newest first
+      .map((item) => (item && item.metrics && typeof item.metrics.cpu_pct === 'number' ? item.metrics.cpu_pct : null))
       .filter((val) => val !== null);
 
-    if (rawCpuValues.length >= 1) {
-      const sliced = rawCpuValues.slice(-count);
-      for (let i = 0; i < count; i++) {
-        const idx = Math.floor((i / (count - 1)) * (sliced.length - 1));
-        points.push(Math.min(100, Math.max(0, sliced[idx])));
-      }
-    } else if (sys && sys.cpuPct !== null && sys.cpuPct !== undefined) {
-      const currentCpu = Math.min(100, Math.max(0, sys.cpuPct));
-      for (let i = 0; i < count; i++) {
-        points.push(currentCpu);
-      }
-    } else {
-      const flatY = height / 2;
-      return { pathD: `M 0,${flatY} L ${width},${flatY}`, areaD: '', width, height };
-    }
+    if (!isOnline || rawCpuValues.length < 2) return null;
 
-    const step = width / (count - 1);
-    const maxVal = Math.max(...points, 10);
-    const minVal = Math.min(...points);
+    const sliced = rawCpuValues.slice(-count);
+    const points = sliced.map((v) => Math.min(100, Math.max(0, v)));
+    const step = width / (points.length - 1);
+    const coords = points.map((val, idx) => ({ x: idx * step, y: height - 6 - (val / 100) * (height - 12) }));
 
     let pathD = '';
-    const coords = points.map((val, idx) => {
-      const x = idx * step;
-      const normY = maxVal === minVal ? 0.5 : (val - minVal) / (maxVal - minVal);
-      const y = height - normY * (height - 16) - 8;
-      return { x, y };
-    });
-
     coords.forEach((pt, i) => {
       if (i === 0) pathD += `M ${pt.x},${pt.y}`;
-      else {
-        const prev = coords[i - 1];
-        const cx = (prev.x + pt.x) / 2;
-        pathD += ` C ${cx},${prev.y} ${cx},${pt.y} ${pt.x},${pt.y}`;
-      }
+      else pathD += ` L ${pt.x},${pt.y}`;
     });
-
     const areaD = `${pathD} L ${width},${height} L 0,${height} Z`;
     return { pathD, areaD, width, height };
-  }, [history, sys, isOnline, node.id]);
+  }, [history, isOnline]);
 
   // Standardize network upload/download formatting (KB/s & MB/s)
-  const netRxFormatted = net && net.rx != null ? formatNetworkSpeed(net.rx) : (net && net.totalRx != null ? formatNetworkSpeed(net.totalRx) : '—');
-  const netTxFormatted = net && net.tx != null ? formatNetworkSpeed(net.tx) : (net && net.totalTx != null ? formatNetworkSpeed(net.totalTx) : '—');
+  const netRxFormatted = net && net.rx != null ? formatNetworkSpeed(net.rx) : null;
+  const netTxFormatted = net && net.tx != null ? formatNetworkSpeed(net.tx) : null;
 
   return (
     <div
@@ -204,7 +167,7 @@ function NodeCard({ node, onSelect, onRemove, CAN_WRITE }) {
 
       {/* 2. Middle Section: Visual Activity Graph or Offline Telemetry Warning */}
       <div className="cyber-activity-section">
-        {isOnline ? (
+        {isOnline && sparklineData ? (
           <>
             <div className="cyber-graph-wrapper">
               <svg viewBox={`0 0 ${sparklineData.width} ${sparklineData.height}`} className="cyber-sparkline-svg" preserveAspectRatio="none">
@@ -230,9 +193,9 @@ function NodeCard({ node, onSelect, onRemove, CAN_WRITE }) {
           </>
         ) : (
           <div className="offline-telemetry-block" style={{ height: '60px', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', width: '100%', background: 'rgba(5, 10, 7, 0.4)', borderRadius: '8px', border: '1px solid rgba(40, 60, 45, 0.3)' }}>
-            <span style={{ fontSize: '11px', fontWeight: '800', color: '#64748b', letterSpacing: '0.08em' }}>NO TELEMETRY SIGNAL</span>
+            <span style={{ fontSize: '11px', fontWeight: '800', color: '#64748b', letterSpacing: '0.08em' }}>{isOnline ? 'NO DATA AVAILABLE' : 'NO TELEMETRY SIGNAL'}</span>
             <span style={{ fontSize: '10.5px', color: '#475569', marginTop: '3px' }}>
-              {node.last_seen_at ? `Last seen ${formatRelative(node.last_seen_at)}` : 'Connection lost'}
+              {isOnline ? 'CPU history not reported yet' : node.last_seen_at ? `Last seen ${formatRelative(node.last_seen_at)}` : 'Connection lost'}
             </span>
           </div>
         )}
@@ -249,7 +212,7 @@ function NodeCard({ node, onSelect, onRemove, CAN_WRITE }) {
           <div className="cyber-progress-track">
             <div
               className="cyber-progress-fill fill-cpu"
-              style={{ width: `${isOnline ? Math.min(100, sys?.cpuPct || 0) : 0}%` }}
+              style={{ width: `${isOnline && sys?.cpuPct != null ? Math.min(100, sys.cpuPct) : 0}%` }}
             />
           </div>
         </div>
@@ -263,7 +226,7 @@ function NodeCard({ node, onSelect, onRemove, CAN_WRITE }) {
           <div className="cyber-progress-track">
             <div
               className="cyber-progress-fill fill-ram"
-              style={{ width: `${isOnline ? Math.min(100, sys?.mem?.pct || 0) : 0}%` }}
+              style={{ width: `${isOnline && sys?.mem?.pct != null ? Math.min(100, sys.mem.pct) : 0}%` }}
             />
           </div>
         </div>
@@ -285,10 +248,10 @@ function NodeCard({ node, onSelect, onRemove, CAN_WRITE }) {
         <div className="cyber-metric-card">
           <div className="metric-header">
             <span className="metric-tag tag-net">Network</span>
-            <span className="metric-value">{isOnline ? `${netRxFormatted} ↑` : '—'}</span>
+            <span className="metric-value">{isOnline && netRxFormatted ? `${netRxFormatted} ↓` : '—'}</span>
           </div>
           <div className="metric-subtext subtext-right">
-            {isOnline ? `${netTxFormatted} ↓` : '—'}
+            {isOnline && netTxFormatted ? `${netTxFormatted} ↑` : '—'}
           </div>
         </div>
       </div>
@@ -318,7 +281,7 @@ export default function FleetGridTab({ nodes, query, setQuery, onSelectNode, onA
       result = result.filter(
         (n) =>
           n.hostname.toLowerCase().includes(q) ||
-          (n.netdata_url && n.netdata_url.toLowerCase().includes(q)) ||
+          ((n.collector_url || n.netdata_url) && (n.collector_url || n.netdata_url).toLowerCase().includes(q)) ||
           (n.os_type && n.os_type.toLowerCase().includes(q))
       );
     }

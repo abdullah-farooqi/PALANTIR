@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import platform
@@ -13,6 +14,7 @@ import subprocess
 import time
 import glob
 import threading
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -50,32 +52,331 @@ try:
 except (OSError, json.JSONDecodeError):
     _LOG_OFFSETS = {}
 
-from collections import deque
 
 app = FastAPI(title="PALANTIR Linux Host Collector", version=APP_VERSION)
 
 CATEGORIES = ("system", "storage", "network", "services", "processes", "connections", "containers", "vms")
 
-# Per-second CPU ring buffer (60 entries = last 60 seconds)
-_CPU_HISTORY_LOCK = threading.Lock()
-_CPU_HISTORY_60S: deque[float] = deque(maxlen=60)
+# --------------------------------------------------------------------------------------
+# Sampling configuration (all optional environment variables)
+# --------------------------------------------------------------------------------------
+# CPU is sampled continuously (default every 1 s) from /proc/stat deltas.  Every number the
+# API reports for CPU (total, per core, user/system/iowait split, per-second history) comes
+# from these same samples, so they always agree with each other and with tools such as the
+# GNOME System Monitor / top / htop, which also use 1 s deltas.  Nothing is ever measured
+# over a tiny ad-hoc window at request time (that is what produced spurious 100 % cores).
+CPU_SAMPLE_INTERVAL = max(0.5, float(os.getenv("CPU_SAMPLE_INTERVAL", "1")))   # seconds between CPU samples
+CPU_SAMPLE_BUFFER = max(60, int(os.getenv("CPU_SAMPLE_BUFFER", "900")))        # samples kept in memory (15 min @ 1 s)
+CPU_CURRENT_WINDOW = max(1, int(os.getenv("CPU_CURRENT_WINDOW", "5")))         # samples averaged for "current" CPU
+RATE_SAMPLE_SECONDS = max(2.0, float(os.getenv("RATE_SAMPLE_SECONDS", "5")))   # process / network / disk rates
+PID_REUSE_TOLERANCE_SECONDS = 5.0                                              # create_time jitter vs. PID reuse
 
-def _cpu_sampler_loop() -> None:
-    """Runs continuously in the background sampling CPU % every 1s."""
-    while True:
-        try:
-            val = psutil.cpu_percent(interval=1.0)
-            with _CPU_HISTORY_LOCK:
-                _CPU_HISTORY_60S.append(val)
-        except Exception:
-            time.sleep(1.0)
-
-_sampler_thread = threading.Thread(target=_cpu_sampler_loop, daemon=True)
-_sampler_thread.start()
+_CPU_FIELDS = ("user", "nice", "system", "idle", "iowait", "irq", "softirq", "steal")
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _read_text(path: Path, limit: int = 2_000_000) -> str:
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as stream:
+            return stream.read(limit)
+    except (OSError, PermissionError):
+        return ""
+
+
+def _mean(values: list[float]) -> float | None:
+    return sum(values) / len(values) if values else None
+
+
+def _read_cpu_stat() -> dict[str, tuple[float, ...]] | None:
+    """Cumulative CPU time counters: {"cpu": (...), "cpu0": (...), ...} or None when unreadable."""
+    counters: dict[str, tuple[float, ...]] = {}
+    for line in _read_text(HOST_PROC / "stat", 1_000_000).splitlines():
+        if not line.startswith("cpu"):
+            continue
+        parts = line.split()
+        name = parts[0]
+        if name != "cpu" and not name[3:].isdigit():
+            continue
+        try:
+            values = [float(item) for item in parts[1:9]]
+        except ValueError:
+            continue
+        if len(values) < 8:
+            values += [0.0] * (8 - len(values))
+        counters[name] = tuple(values)
+    if "cpu" in counters:
+        return counters
+    # /proc/stat unreadable: fall back to psutil (it reads the same counters)
+    try:
+        total = psutil.cpu_times()
+        per_core = psutil.cpu_times(percpu=True)
+    except Exception:
+        return None
+    pick = lambda item: tuple(float(getattr(item, field, 0.0) or 0.0) for field in _CPU_FIELDS)  # noqa: E731
+    counters = {"cpu": pick(total)}
+    for index, item in enumerate(per_core):
+        counters[f"cpu{index}"] = pick(item)
+    return counters
+
+
+def _cpu_delta(previous: tuple[float, ...], current: tuple[float, ...]) -> dict[str, float] | None:
+    """Percentages for one interval, or None if the counters went backwards / nothing elapsed."""
+    delta = [now - before for now, before in zip(current, previous)]
+    if any(item < 0 for item in delta):
+        return None  # counter reset or CPU hot-plug
+    user, nice, system, idle, iowait, irq, softirq, steal = delta
+    total = user + nice + system + idle + iowait + irq + softirq + steal
+    if total <= 0:
+        return None
+    busy = total - idle - iowait  # iowait is time the CPU could not do anything else: idle, like top/psutil
+
+    def pct(value: float) -> float:
+        return round(max(0.0, min(100.0, value * 100.0 / total)), 2)
+
+    return {
+        "cpu_pct": pct(busy),
+        "user": pct(user), "nice": pct(nice), "system": pct(system), "idle": pct(idle),
+        "iowait": pct(iowait), "irq": pct(irq), "softirq": pct(softirq), "steal": pct(steal),
+    }
+
+
+def _note_sampler_error(sampler: Any, name: str, exc: Exception) -> None:
+    message = f"{type(exc).__name__}: {exc}"
+    if sampler.last_error != message:  # log each distinct failure once, not every second
+        print(f"[palantir-collector] {name} sampler error: {message}", flush=True)
+    sampler.last_error = message
+
+
+class _CpuSampler:
+    """Background thread: one timestamped CPU sample per interval, kept in a ring buffer."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._samples: deque[dict[str, Any]] = deque(maxlen=CPU_SAMPLE_BUFFER)
+        self._previous: dict[str, tuple[float, ...]] | None = None
+        self._thread: threading.Thread | None = None
+        self.last_error: str | None = None
+
+    def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._thread = threading.Thread(target=self._run, name="palantir-cpu-sampler", daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        next_tick = time.monotonic()
+        while True:
+            try:
+                self.tick()
+                self.last_error = None
+            except Exception as exc:
+                _note_sampler_error(self, "cpu", exc)
+            next_tick += CPU_SAMPLE_INTERVAL
+            delay = next_tick - time.monotonic()
+            if delay < -10 * CPU_SAMPLE_INTERVAL:  # the host was suspended / we fell far behind: re-sync
+                next_tick = time.monotonic()
+                delay = 0.0
+            time.sleep(max(0.0, delay))
+
+    def tick(self) -> dict[str, Any] | None:
+        current = _read_cpu_stat()
+        stamp = time.time()
+        if current is None:
+            self._previous = None
+            return None
+        previous, self._previous = self._previous, current
+        if previous is None or "cpu" not in previous:
+            return None
+        total = _cpu_delta(previous["cpu"], current["cpu"])
+        if total is None:
+            return None
+        cores: list[float | None] = []
+        for name in sorted((key for key in current if key != "cpu"), key=lambda key: int(key[3:])):
+            stats = _cpu_delta(previous[name], current[name]) if name in previous else None
+            cores.append(stats["cpu_pct"] if stats else None)
+        sample = {
+            "t": round(stamp, 3),
+            "cpu_pct": total["cpu_pct"],
+            "cores": cores,
+            "times": {key: value for key, value in total.items() if key != "cpu_pct"},
+        }
+        with self._lock:
+            self._samples.append(sample)
+        return sample
+
+    # ---- readers -------------------------------------------------------------------------
+    def current(self, window: int = CPU_CURRENT_WINDOW) -> dict[str, Any] | None:
+        """Mean of the last `window` samples, or None when sampling is not producing fresh data."""
+        with self._lock:
+            recent = list(self._samples)[-max(1, window):]
+        if not recent:
+            return None
+        if time.time() - recent[-1]["t"] > max(5.0, 4 * CPU_SAMPLE_INTERVAL):
+            return None  # sampler stalled: report "no data" instead of a stale number
+        cores: list[float] = []
+        width = max(len(sample["cores"]) for sample in recent)
+        for index in range(width):
+            values = [s["cores"][index] for s in recent if index < len(s["cores"]) and s["cores"][index] is not None]
+            if values:
+                cores.append(round(sum(values) / len(values), 2))
+        times = {key: round(_mean([s["times"][key] for s in recent]) or 0.0, 2) for key in recent[-1]["times"]}
+        return {
+            "cpu_pct": round(_mean([s["cpu_pct"] for s in recent]) or 0.0, 2),
+            "cores": cores,
+            "times": times,
+            "window_samples": len(recent),
+            "t": recent[-1]["t"],
+        }
+
+    def history(self, count: int = 60) -> list[float]:
+        with self._lock:
+            return [sample["cpu_pct"] for sample in list(self._samples)[-count:]]
+
+    def count(self) -> int:
+        with self._lock:
+            return len(self._samples)
+
+    def since(self, since: float, limit: int) -> list[dict[str, Any]]:
+        with self._lock:
+            fresh = [sample for sample in self._samples if sample["t"] > since]
+        return [{"t": sample["t"], "cpu_pct": sample["cpu_pct"]} for sample in fresh[-limit:]]
+
+
+class _RateSampler:
+    """Background thread: per-process CPU %, per-interface network and per-disk I/O *rates*.
+
+    Every rate is a counter delta divided by the real elapsed time between two reads, so a
+    value is only reported once two reads exist.  Unknown stays None - it is never guessed.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+        # pid -> (create_time, cpu_seconds) / pid -> (create_time, % of one core)
+        self._proc_prev: dict[int, tuple[float, float]] = {}
+        self._proc_rates: dict[int, tuple[float, float]] = {}
+        self._net_prev: dict[str, dict[str, int]] = {}
+        self._net_rates: dict[str, dict[str, float]] = {}
+        self._disk_prev: dict[str, Any] = {}
+        self._disk_rates: dict[str, dict[str, float]] = {}
+        self._last_ts: float | None = None
+        self._updated_at: float | None = None
+        self.last_error: str | None = None
+
+    def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._thread = threading.Thread(target=self._run, name="palantir-rate-sampler", daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        next_tick = time.monotonic()
+        while True:
+            try:
+                self.tick()
+                self.last_error = None
+            except Exception as exc:
+                _note_sampler_error(self, "rate", exc)
+            next_tick += RATE_SAMPLE_SECONDS
+            delay = next_tick - time.monotonic()
+            if delay < -10 * RATE_SAMPLE_SECONDS:
+                next_tick = time.monotonic()
+                delay = 0.0
+            time.sleep(max(0.0, delay))
+
+    def tick(self) -> None:
+        stamp = time.monotonic()
+        wall = time.time()
+        proc_now: dict[int, tuple[float, float]] = {}
+        for proc in psutil.process_iter(attrs=["pid", "cpu_times", "create_time"]):
+            info = proc.info
+            times = info.get("cpu_times")
+            created = info.get("create_time")
+            if times is None or created is None:
+                continue
+            proc_now[info["pid"]] = (float(created), float(times.user + times.system))
+        net_now = _parse_proc_net_dev()
+        try:
+            disk_now = psutil.disk_io_counters(perdisk=True, nowrap=True) or {}
+        except (OSError, RuntimeError):
+            disk_now = {}
+
+        with self._lock:
+            elapsed = (stamp - self._last_ts) if self._last_ts is not None else None
+            if elapsed and elapsed > 0.5:
+                proc_rates: dict[int, tuple[float, float]] = {}
+                for pid, (created, cpu_seconds) in proc_now.items():
+                    previous = self._proc_prev.get(pid)
+                    if previous is None:
+                        continue  # appeared since the last read: genuinely not measurable yet
+                    # create_time is derived from the boot time and drifts by a fraction of a second between
+                    # reads, so it must be compared with a tolerance - an exact match silently dropped
+                    # real processes.  A different start time means the PID was reused: skip it.
+                    if abs(created - previous[0]) > PID_REUSE_TOLERANCE_SECONDS or cpu_seconds < previous[1]:
+                        continue
+                    proc_rates[pid] = (created, (cpu_seconds - previous[1]) * 100.0 / elapsed)  # % of ONE core
+                net_rates: dict[str, dict[str, float]] = {}
+                for name, counters in net_now.items():
+                    before = self._net_prev.get(name)
+                    if not before:
+                        continue
+                    rates: dict[str, float] = {}
+                    for label, key in (("rx_bytes_per_sec", "bytes_recv"), ("tx_bytes_per_sec", "bytes_sent"),
+                                       ("rx_packets_per_sec", "packets_recv"), ("tx_packets_per_sec", "packets_sent")):
+                        change = counters.get(key, 0) - before.get(key, 0)
+                        if change >= 0:  # negative = counter reset (reboot / interface re-created)
+                            rates[label] = round(change / elapsed, 2)
+                    if rates:
+                        net_rates[name] = rates
+                disk_rates: dict[str, dict[str, float]] = {}
+                for name, counters in disk_now.items():
+                    before = self._disk_prev.get(name)
+                    if before is None:
+                        continue
+                    rates = {}
+                    for label, attribute in (("read_bytes_per_sec", "read_bytes"), ("write_bytes_per_sec", "write_bytes"),
+                                             ("read_iops", "read_count"), ("write_iops", "write_count")):
+                        change = getattr(counters, attribute, 0) - getattr(before, attribute, 0)
+                        if change >= 0:
+                            rates[label] = round(change / elapsed, 2)
+                    busy_now = getattr(counters, "busy_time", None)
+                    busy_before = getattr(before, "busy_time", None)
+                    if busy_now is not None and busy_before is not None:
+                        busy_ms_diff = busy_now - busy_before
+                        if busy_ms_diff >= 0 and elapsed > 0:
+                            rates["busy_pct"] = round(min(100.0, (busy_ms_diff / (elapsed * 1000.0)) * 100.0), 1)
+                    if rates:
+                        disk_rates[name] = rates
+                self._proc_rates, self._net_rates, self._disk_rates = proc_rates, net_rates, disk_rates
+                self._updated_at = wall
+            self._proc_prev, self._net_prev, self._disk_prev, self._last_ts = proc_now, net_now, dict(disk_now), stamp
+
+    def fresh(self) -> bool:
+        return self._updated_at is not None and time.time() - self._updated_at <= max(30.0, 4 * RATE_SAMPLE_SECONDS)
+
+    def process_rates(self) -> dict[int, tuple[float, float]]:
+        with self._lock:
+            return dict(self._proc_rates) if self.fresh() else {}
+
+    def network_rates(self) -> dict[str, dict[str, float]]:
+        with self._lock:
+            return {name: dict(rates) for name, rates in self._net_rates.items()} if self.fresh() else {}
+
+    def disk_rates(self) -> dict[str, dict[str, float]]:
+        with self._lock:
+            return {name: dict(rates) for name, rates in self._disk_rates.items()} if self.fresh() else {}
+
+
+_CPU_SAMPLER = _CpuSampler()
+_RATE_SAMPLER = _RateSampler()
+
+
+def _start_samplers() -> None:
+    _CPU_SAMPLER.start()
+    _RATE_SAMPLER.start()
 
 
 def _redact_text(value: str) -> str:
@@ -104,16 +405,8 @@ def _safe_fields(fields: dict[str, Any]) -> dict[str, Any]:
 
 
 def _guard(token: str | None) -> None:
-    if AGENT_TOKEN and token != AGENT_TOKEN:
+    if AGENT_TOKEN and not (token and hmac.compare_digest(token.encode(), AGENT_TOKEN.encode())):
         raise HTTPException(status_code=403, detail="Invalid agent token")
-
-
-def _read_text(path: Path, limit: int = 2_000_000) -> str:
-    try:
-        with path.open("r", encoding="utf-8", errors="replace") as stream:
-            return stream.read(limit)
-    except (OSError, PermissionError):
-        return ""
 
 
 def _status_data(data: Any, capability: str = "available") -> dict[str, Any]:
@@ -135,8 +428,10 @@ def _disk_io() -> list[dict[str, Any]]:
         stats = psutil.disk_io_counters(perdisk=True, nowrap=True)
     except (OSError, RuntimeError):
         stats = None
-    return [
-        {
+    rates = _RATE_SAMPLER.disk_rates()
+    rows = []
+    for name, item in sorted((stats or {}).items()):
+        row = {
             "device": name,
             "read_bytes": item.read_bytes,
             "write_bytes": item.write_bytes,
@@ -145,8 +440,9 @@ def _disk_io() -> list[dict[str, Any]]:
             "read_time_ms": item.read_time,
             "write_time_ms": item.write_time,
         }
-        for name, item in sorted((stats or {}).items())
-    ]
+        row.update(rates.get(name, {}))  # *_per_sec / *_iops, only present when measured
+        rows.append(row)
+    return rows
 
 
 def _parse_mdstat(mdstat: str) -> list[dict[str, Any]]:
@@ -184,26 +480,56 @@ def _parse_mdstat(mdstat: str) -> list[dict[str, Any]]:
     return arrays
 
 
+def _read_loadavg() -> list[float]:
+    """1/5/15 minute load averages from the HOST's /proc/loadavg (empty list when unavailable)."""
+    parts = _read_text(HOST_PROC / "loadavg", 512).split()
+    try:
+        return [float(item) for item in parts[:3]] if len(parts) >= 3 else []
+    except ValueError:
+        return []
+
+
+_CPU_MODEL_CACHE: list[str | None] = []
+
+
+def _cpu_model() -> str | None:
+    if _CPU_MODEL_CACHE:
+        return _CPU_MODEL_CACHE[0]
+    found: dict[str, str] = {}
+    for line in _read_text(HOST_PROC / "cpuinfo", 1_000_000).splitlines():
+        key, _, value = line.partition(":")
+        key, value = key.strip().lower(), re.sub(r"\s+", " ", value.strip())
+        if value and key in {"model name", "hardware", "model", "cpu model"} and key not in found:
+            found[key] = value
+    # x86 reports the marketing name in "model name"; a bare "model" there is a numeric id, ARM boards use Hardware/Model.
+    model = found.get("model name") or found.get("hardware") or found.get("cpu model")
+    if model is None and found.get("model") and not found["model"].isdigit():
+        model = found["model"]
+    _CPU_MODEL_CACHE.append(model)
+    return model
+
+
+def _read_os_release() -> dict[str, str]:
+    for os_file in (HOST_ROOT / "etc/os-release", HOST_ROOT / "usr/lib/os-release", Path("/etc/os-release"), Path("/usr/lib/os-release")):
+        text = _read_text(os_file, 16_000)
+        if not text:
+            continue
+        values: dict[str, str] = {}
+        for line in text.splitlines():
+            if "=" in line:
+                key, value = line.split("=", 1)
+                values[key.strip()] = value.strip().strip('"')
+        if values.get("ID") or values.get("NAME"):
+            return values
+    return {}
+
+
 def collect_system() -> dict[str, Any]:
     mem = psutil.virtual_memory()
     swap = psutil.swap_memory()
-    load = os.getloadavg() if hasattr(os, "getloadavg") else (None, None, None)
-    
-    # Per-core and total CPU telemetry measured over 0.1s interval
-    cpu_total = psutil.cpu_percent(interval=0.1)
-    per_core = psutil.cpu_percent(interval=0.1, percpu=True)
-    times = psutil.cpu_times_percent(interval=0.1)
-    cpu_times_dict = {
-        "user": getattr(times, "user", 0.0),
-        "system": getattr(times, "system", 0.0),
-        "idle": getattr(times, "idle", 0.0),
-        "iowait": getattr(times, "iowait", 0.0),
-        "irq": getattr(times, "irq", 0.0),
-        "softirq": getattr(times, "softirq", 0.0),
-        "steal": getattr(times, "steal", 0.0),
-    }
+    cpu = _CPU_SAMPLER.current()
 
-    vmstat = {}
+    vmstat: dict[str, int] = {}
     for line in _read_text(HOST_PROC / "vmstat", 256_000).splitlines():
         parts = line.split()
         if len(parts) == 2 and parts[0] in {"oom_kill", "pgmajfault", "pswpin", "pswpout"}:
@@ -211,137 +537,123 @@ def collect_system() -> dict[str, Any]:
                 vmstat[parts[0]] = int(parts[1])
             except ValueError:
                 pass
-    meminfo = {}
+
+    meminfo: dict[str, int] = {}
     for line in _read_text(HOST_PROC / "meminfo", 256_000).splitlines():
-        parts = line.split(":")
-        if len(parts) == 2:
-            k = parts[0].strip()
-            v_str = parts[1].strip().split()[0]
-            if v_str.isdigit():
-                meminfo[k] = int(v_str) * 1024  # Convert kB to bytes
+        key, _, rest = line.partition(":")
+        fields = rest.split()
+        if fields and fields[0].isdigit():
+            meminfo[key.strip()] = int(fields[0]) * 1024  # kB -> bytes
 
-    buffers_bytes = getattr(mem, "buffers", meminfo.get("Buffers", 0))
-    cached_bytes = getattr(mem, "cached", meminfo.get("Cached", 0))
-    active_bytes = getattr(mem, "active", meminfo.get("Active", 0))
-    inactive_bytes = getattr(mem, "inactive", meminfo.get("Inactive", 0))
-    slab_bytes = getattr(mem, "slab", meminfo.get("Slab", 0))
+    logical = len(cpu["cores"]) if cpu and cpu["cores"] else (psutil.cpu_count(logical=True) or None)
+    physical = psutil.cpu_count(logical=False) or logical
 
-    os_release = {}
-    os_file_candidates = [
-        HOST_ROOT / "etc/os-release",
-        HOST_ROOT / "usr/lib/os-release",
-        Path("/etc/os-release"),
-        Path("/usr/lib/os-release"),
-    ]
-    for os_file in os_file_candidates:
-        try:
-            if os_file.exists():
-                for line in _read_text(os_file, 16_000).splitlines():
-                    if "=" in line:
-                        k, v = line.split("=", 1)
-                        os_release[k.strip()] = v.strip().strip('"')
-                if os_release.get("ID") or os_release.get("NAME"):
-                    break
-        except Exception:
-            pass
-
-    with _CPU_HISTORY_LOCK:
-        cpu_history_60s = list(_CPU_HISTORY_60S)
-
-    return _status_data({
-        "cpu_count": psutil.cpu_count(),
-        "cpu_logical_count": psutil.cpu_count(logical=True),
-        "cpu_pct": cpu_total,
-        "cpu_cores_pct": per_core,
-        "cpu_times": cpu_times_dict,
-        "cpu_history": cpu_history_60s,
+    data = {
+        "cpu_count": physical,
+        "cpu_logical_count": logical,
+        "cpu_model": _cpu_model(),
+        # Current CPU = mean of the last few 1-second samples. None (not 0) when unavailable.
+        "cpu_pct": cpu["cpu_pct"] if cpu else None,
+        "cpu_cores_pct": cpu["cores"] if cpu else [],
+        "cpu_times": cpu["times"] if cpu else {},
+        "cpu_window_seconds": round(cpu["window_samples"] * CPU_SAMPLE_INTERVAL, 1) if cpu else None,
+        # last 60 one-second samples, oldest first
+        "cpu_history": _CPU_SAMPLER.history(60),
+        "cpu_history_interval_seconds": CPU_SAMPLE_INTERVAL,
         "memory": {
             "total_bytes": mem.total,
             "available_bytes": mem.available,
-            "used_bytes": mem.used,
-            "buffers_bytes": buffers_bytes,
-            "cached_bytes": cached_bytes,
-            "active_bytes": active_bytes,
-            "inactive_bytes": inactive_bytes,
-            "slab_bytes": slab_bytes,
+            "used_bytes": mem.used,  # total - available, i.e. what is really in use
+            "free_bytes": mem.free,
+            "buffers_bytes": getattr(mem, "buffers", meminfo.get("Buffers")),
+            "cached_bytes": getattr(mem, "cached", meminfo.get("Cached")),
+            "active_bytes": getattr(mem, "active", meminfo.get("Active")),
+            "inactive_bytes": getattr(mem, "inactive", meminfo.get("Inactive")),
+            "slab_bytes": getattr(mem, "slab", meminfo.get("Slab")),
             "percent": mem.percent,
         },
-        "swap": {"total_bytes": swap.total, "used_bytes": swap.used, "percent": swap.percent},
-        "load_average": list(load),
+        "swap": {
+            "total_bytes": swap.total,
+            "used_bytes": swap.used,
+            "percent": swap.percent if swap.total else None,  # no swap configured -> no percentage
+        },
+        "load_average": _read_loadavg(),
         "vmstat": vmstat,
-        "os_release": os_release,
-    })
+        "os_release": _read_os_release(),
+    }
+    return _status_data(data, "available" if cpu else "partial")
+
+
+_PSEUDO_FS = {
+    "squashfs", "overlay", "tmpfs", "devtmpfs", "ramfs", "proc", "sysfs", "cgroup", "cgroup2", "binfmt_misc",
+    "efivarfs", "bpf", "pstore", "fusectl", "configfs", "debugfs", "tracefs", "autofs", "devpts", "mqueue",
+    "hugetlbfs", "securityfs", "selinuxfs", "nsfs", "rpc_pipefs", "fuse.gvfsd-fuse", "fuse.portal", "fuse.lxcfs",
+    "iso9660", "udf", "aufs",
+}
+_NETWORK_FS = {"nfs", "nfs4", "cifs", "smb3", "smbfs", "ceph", "glusterfs", "fuse.sshfs", "9p", "virtiofs"}
+_SKIP_MOUNT_PREFIXES = ("/proc", "/sys", "/dev", "/run", "/snap", "/var/snap", "/var/lib/docker", "/var/lib/containers",
+                        "/var/lib/kubelet", "/var/lib/lxd", "/var/lib/lxcfs")
+
+
+def _unescape_mount(value: str) -> str:
+    return re.sub(r"\\([0-7]{3})", lambda match: chr(int(match.group(1), 8)), value)
+
+
+def _host_mounts() -> list[dict[str, str]]:
+    """Mounted filesystems of the HOST (PID 1's mount namespace), not of this container."""
+    for source in (HOST_PROC / "1/mounts", HOST_PROC / "mounts"):
+        text = _read_text(source, 1_000_000)
+        if text.strip():
+            break
+    else:
+        text = ""
+    mounts: list[dict[str, str]] = []
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        mounts.append({"device": _unescape_mount(parts[0]), "mountpoint": _unescape_mount(parts[1]), "filesystem": parts[2], "options": parts[3]})
+    if mounts:
+        return mounts
+    try:
+        return [{"device": p.device, "mountpoint": p.mountpoint, "filesystem": p.fstype, "options": p.opts}
+                for p in psutil.disk_partitions(all=False)]
+    except (OSError, RuntimeError):
+        return []
 
 
 def collect_storage() -> dict[str, Any]:
-    filesystems = []
-    seen: set[str] = set()
-
-    SKIP_FSTYPES = {
-        "squashfs", "overlay", "tmpfs", "devtmpfs", "proc", "sysfs", "cgroup",
-        "cgroup2", "binfmt_misc", "efivarfs", "bpf", "pstore", "fusectl",
-        "configfs", "debugfs", "tracefs", "autofs", "devpts", "mqueue"
-    }
-
-    # 1. Always attempt physical host root first
-    for root_candidate in [HOST_ROOT, Path("/")]:
-        if root_candidate.exists():
-            try:
-                usage = shutil.disk_usage(root_candidate)
-                filesystems.append({
-                    "device": "/dev/root",
-                    "mountpoint": "/",
-                    "filesystem": "ext4",
-                    "options": "rw",
-                    "total_bytes": usage.total,
-                    "used_bytes": usage.used,
-                    "free_bytes": usage.free,
-                    "percent": round(usage.used / usage.total * 100, 2) if usage.total else 0,
-                    "status": "available",
-                })
-                seen.add("/")
-                break
-            except OSError:
-                pass
-
-    # 2. Add additional physical mount points if present
-    try:
-        partitions = psutil.disk_partitions(all=True)
-    except (OSError, RuntimeError):
-        partitions = []
-
-    for part in partitions:
-        mp = part.mountpoint
-        clean_mp = mp[5:] if mp.startswith("/host/") else mp
-        if clean_mp == "/host":
-            clean_mp = "/"
-        if clean_mp in seen or part.fstype in SKIP_FSTYPES:
+    filesystems: list[dict[str, Any]] = []
+    seen_devices: set[str] = set()
+    candidates = sorted(_host_mounts(), key=lambda item: (len(item["mountpoint"]), item["mountpoint"]))
+    for mount in candidates:
+        mountpoint, device, fstype = mount["mountpoint"], mount["device"], mount["filesystem"]
+        if fstype in _PSEUDO_FS or mountpoint.startswith(_SKIP_MOUNT_PREFIXES):
             continue
-        if clean_mp.startswith(("/proc", "/sys", "/dev", "/run", "/snap", "/etc", "/app", "/usr/lib")):
+        is_block = device.startswith("/dev/") and not re.match(r"^/dev/(loop|zram|ram)\d*", device)
+        if not (is_block or fstype in _NETWORK_FS or fstype == "zfs"):
             continue
-        if Path(mp).is_file():
-            continue
-
-        target_path = Path(mp) if mp.startswith("/host/") else (HOST_ROOT / mp.lstrip("/"))
-        if not target_path.exists():
-            target_path = Path(mp)
-
+        if device in seen_devices:
+            continue  # bind mounts / btrfs subvolumes of a device we already reported
         try:
-            usage = shutil.disk_usage(target_path)
-            seen.add(clean_mp)
-            filesystems.append({
-                "device": part.device or clean_mp,
-                "mountpoint": clean_mp,
-                "filesystem": part.fstype,
-                "options": part.opts,
-                "total_bytes": usage.total,
-                "used_bytes": usage.used,
-                "free_bytes": usage.free,
-                "percent": round(usage.used / usage.total * 100, 2) if usage.total else 0,
-                "status": "available",
-            })
+            usage = shutil.disk_usage(_proc_mount_path(mountpoint))
         except OSError:
             continue
+        if usage.total <= 0:
+            continue
+        seen_devices.add(device)
+        capacity = usage.used + usage.free  # same basis as `df`: reserved blocks are not counted
+        filesystems.append({
+            "device": device,
+            "mountpoint": mountpoint,
+            "filesystem": fstype,
+            "options": mount["options"],
+            "total_bytes": usage.total,
+            "used_bytes": usage.used,
+            "free_bytes": usage.free,
+            "percent": round(usage.used / capacity * 100, 2) if capacity else None,
+            "status": "available",
+        })
 
     mdstat = _read_text(HOST_PROC / "mdstat", 256_000)
     raid_arrays = _parse_mdstat(mdstat)
@@ -349,15 +661,26 @@ def collect_storage() -> dict[str, Any]:
         "filesystems": filesystems,
         "disk_io": _disk_io(),
         "raid": {"detected": bool(raid_arrays), "arrays": raid_arrays, "mdstat_raw": mdstat},
-    }, "available" if filesystems or mdstat else "partial")
+    }, "available" if filesystems else "partial")
+
+
+def _host_net_file(name: str) -> str:
+    """Contents of /proc/net/<name> as seen by the HOST.
+
+    /host/proc/net is a symlink to `self/net`, i.e. the *collector container's own* network
+    namespace (it only has eth0).  PID 1 lives in the host namespace, so /host/proc/1/net/<name>
+    is the real host view (wlan0, enp3s0, ...).  Falls back to the container view if unreadable.
+    """
+    for path in (HOST_PROC / "1" / "net" / name, HOST_PROC / "net" / name, Path("/proc/net") / name):
+        text = _read_text(path, 4_000_000)
+        if text.strip():
+            return text
+    return ""
 
 
 def _parse_proc_net_dev() -> dict[str, dict[str, int]]:
-    dev_path = HOST_PROC / "net/dev"
-    if not dev_path.exists():
-        dev_path = Path("/proc/net/dev")
     interfaces = {}
-    content = _read_text(dev_path, 500_000)
+    content = _host_net_file("dev")
     for line in content.splitlines():
         if ":" not in line:
             continue
@@ -398,9 +721,12 @@ def collect_network() -> dict[str, Any]:
                 }
         except (OSError, RuntimeError):
             pass
+    rates = _RATE_SAMPLER.network_rates()
+    for name, counters in interfaces.items():
+        counters.update(rates.get(name, {}))  # rx/tx_bytes_per_sec, rx/tx_packets_per_sec when measured
     protocols = {}
     pending_headers: dict[str, list[str]] = {}
-    for line in _read_text(HOST_PROC / "net/snmp", 256_000).splitlines():
+    for line in _host_net_file("snmp").splitlines():
         fields = line.split()
         if len(fields) > 1 and fields[0].endswith(":"):
             protocol = fields[0][:-1]
@@ -410,13 +736,16 @@ def collect_network() -> dict[str, Any]:
                 continue
             names = pending_headers.pop(protocol)
             protocols[protocol] = {
-                name: int(value) if value.isdigit() else value
+                name: int(value) if value.lstrip("-").isdigit() else value
                 for name, value in zip(names, columns)
             }
-    return _status_data({"interfaces": interfaces, "protocol_counters": protocols, "firewall": _firewall_state()})
+    return _status_data(
+        {"interfaces": interfaces, "protocol_counters": protocols, "firewall": _firewall_state()},
+        "available" if interfaces else "partial",
+    )
 
 
-def _firewall_state() -> dict[str, Any]:
+def _firewall_state_uncached() -> dict[str, Any]:
     # Report rules only when the host's nft binary and network namespace are usable.
     nft = shutil.which("nft")
     nsenter = shutil.which("nsenter")
@@ -440,51 +769,57 @@ def _firewall_state() -> dict[str, Any]:
         return {"status": "unavailable", "reason": str(exc)[:300]}
 
 
-_LAST_PROC_CPU: dict[int, tuple[float, float]] = {}
+
+_FIREWALL_CACHE: dict[str, Any] = {"at": 0.0, "value": None}
+_FIREWALL_TTL_SECONDS = 300.0
+
+
+def _firewall_state() -> dict[str, Any]:
+    # `nft list ruleset` is comparatively expensive; the ruleset rarely changes, so reuse it for a few minutes.
+    now = time.monotonic()
+    if _FIREWALL_CACHE["value"] is not None and now - _FIREWALL_CACHE["at"] < _FIREWALL_TTL_SECONDS:
+        return _FIREWALL_CACHE["value"]
+    value = _firewall_state_uncached()
+    _FIREWALL_CACHE.update(at=now, value=value)
+    return value
+
 
 def collect_processes() -> dict[str, Any]:
-    global _LAST_PROC_CPU
-    now = time.time()
-    new_proc_cpu: dict[int, tuple[float, float]] = {}
-    rows = []
-    cores_count = psutil.cpu_count(logical=True) or 1
-    
+    rates = _RATE_SAMPLER.process_rates()  # % of ONE core, from two real reads; empty until measured
+    cores = len(_CPU_SAMPLER.current()["cores"] or []) if _CPU_SAMPLER.current() else 0
+    cores = cores or psutil.cpu_count(logical=True) or 1
+    rows: list[dict[str, Any]] = []
     for proc in psutil.process_iter(attrs=["pid", "name", "status", "memory_info", "num_threads", "username", "create_time", "cpu_times"]):
         try:
             item = proc.info
             pid = item.get("pid")
             memory = item.get("memory_info")
             cpu_times = item.get("cpu_times")
-            
-            total_cpu_time = (cpu_times.user + cpu_times.system) if cpu_times else 0.0
-            new_proc_cpu[pid] = (total_cpu_time, now)
-            
-            cpu_pct = 0.0
-            if pid in _LAST_PROC_CPU:
-                prev_time, prev_ts = _LAST_PROC_CPU[pid]
-                dt = now - prev_ts
-                if dt > 0:
-                    # Calculate Normalized Total System CPU (0% - 100%)
-                    raw_cpu = ((total_cpu_time - prev_time) / dt) * 100.0
-                    cpu_pct = min(100.0, max(0.0, raw_cpu / cores_count))
-            else:
-                create_time = item.get("create_time") or now
-                elapsed = max(0.1, now - create_time)
-                raw_cpu = (total_cpu_time / elapsed) * 100.0
-                cpu_pct = min(100.0, max(0.0, raw_cpu / cores_count))
-
+            created = item.get("create_time")
+            total_cpu_time = (cpu_times.user + cpu_times.system) if cpu_times else None
+            measured = rates.get(pid)
+            core_pct = None
+            if measured is not None and created is not None and abs(float(created) - measured[0]) <= PID_REUSE_TOLERANCE_SECONDS:
+                core_pct = measured[1]
             rows.append({
                 "pid": pid, "name": item.get("name"), "status": item.get("status"),
                 "rss_bytes": memory.rss if memory else None, "threads": item.get("num_threads"),
-                "username": item.get("username"), "started_at": item.get("create_time"),
+                "username": item.get("username"), "started_at": created,
                 "cpu_time_seconds": total_cpu_time,
-                "cpu_pct": round(cpu_pct, 2),
+                # cpu_pct: share of the WHOLE machine (0-100, comparable with the system CPU figure).
+                # cpu_core_pct: share of one core, like `top` (can exceed 100 for multi-threaded processes).
+                # Both are None - not 0 - for a process that has not been measured twice yet.
+                "cpu_pct": round(min(100.0, core_pct / cores), 2) if core_pct is not None else None,
+                "cpu_core_pct": round(core_pct, 2) if core_pct is not None else None,
             })
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
             continue
 
-    _LAST_PROC_CPU = new_proc_cpu
-    rows.sort(key=lambda row: row.get("rss_bytes") or 0, reverse=True)
+    by_rss = sorted(rows, key=lambda row: row.get("rss_bytes") or 0, reverse=True)[:100]
+    by_cpu = sorted((row for row in rows if row["cpu_core_pct"]), key=lambda row: row["cpu_core_pct"], reverse=True)[:40]
+    selected = {row["pid"]: row for row in (*by_rss, *by_cpu)}  # a busy small process must not be dropped
+    top = sorted(selected.values(), key=lambda row: row.get("rss_bytes") or 0, reverse=True)
+
     oom = {}
     for line in _read_text(HOST_PROC / "vmstat", 256_000).splitlines():
         key, _, value = line.partition(" ")
@@ -493,29 +828,98 @@ def collect_processes() -> dict[str, Any]:
                 oom[key] = int(value.strip())
             except ValueError:
                 pass
-    return _status_data({"process_count": len(rows), "top_by_rss": rows[:100], "oom_counters": oom})
+    return _status_data(
+        {"process_count": len(rows), "top_by_rss": top, "oom_counters": oom, "cpu_rates_measured": bool(rates)},
+        "available" if rows else "partial",
+    )
+
+
+_TCP_STATES = {"01": "ESTABLISHED", "02": "SYN_SENT", "03": "SYN_RECV", "04": "FIN_WAIT1", "05": "FIN_WAIT2",
+               "06": "TIME_WAIT", "07": "CLOSE", "08": "CLOSE_WAIT", "09": "LAST_ACK", "0A": "LISTEN", "0B": "CLOSING"}
+_MAX_SOCKETS = 5000
+
+
+def _decode_socket_address(value: str, ipv6: bool) -> tuple[str, int] | None:
+    try:
+        host, port = value.split(":")
+        raw = bytes.fromhex(host)
+        if ipv6:
+            raw = b"".join(raw[i:i + 4][::-1] for i in range(0, 16, 4))
+            return socket.inet_ntop(socket.AF_INET6, raw), int(port, 16)
+        return socket.inet_ntop(socket.AF_INET, raw[::-1]), int(port, 16)
+    except (ValueError, OSError):
+        return None
+
+
+def _socket_inode_owners(wanted: set[str]) -> dict[str, int]:
+    """Map socket inode -> pid with ONE pass over /proc/<pid>/fd."""
+    owners: dict[str, int] = {}
+    try:
+        entries = [entry for entry in os.scandir(HOST_PROC) if entry.name.isdigit()]
+    except OSError:
+        return owners
+    for entry in entries:
+        if len(owners) >= len(wanted):
+            break
+        try:
+            for fd in os.scandir(f"{entry.path}/fd"):
+                try:
+                    target = os.readlink(fd.path)
+                except OSError:
+                    continue
+                if target.startswith("socket:[") and target[8:-1] in wanted:
+                    owners.setdefault(target[8:-1], int(entry.name))
+        except (OSError, PermissionError):
+            continue
+    return owners
 
 
 def collect_connections() -> dict[str, Any]:
+    # Read the HOST's socket tables (not this container's) and resolve owners in a single pass.
+    parsed: list[dict[str, Any]] = []
+    for table, kind, ipv6 in (("tcp", "tcp", False), ("tcp6", "tcp", True), ("udp", "udp", False), ("udp6", "udp", True)):
+        for line in _host_net_file(table).splitlines()[1:]:
+            fields = line.split()
+            if len(fields) < 10:
+                continue
+            local = _decode_socket_address(fields[1], ipv6)
+            remote = _decode_socket_address(fields[2], ipv6)
+            if local is None:
+                continue
+            connected = remote is not None and remote[1] != 0
+            parsed.append({
+                "family": "ipv6" if ipv6 else "ipv4", "type": kind, "local": local,
+                "remote": remote if connected else None,
+                "state": _TCP_STATES.get(fields[3].upper(), "UNKNOWN") if kind == "tcp" else "NONE",
+                "inode": fields[9],
+            })
+            if len(parsed) >= _MAX_SOCKETS:
+                break
+    if not parsed:
+        return _status_data({"count": 0, "truncated": False, "sockets": []}, "partial")
+
+    owners = _socket_inode_owners({row["inode"] for row in parsed if row["inode"] != "0"})
+    names: dict[int, str | None] = {}
+
+    def process_name(pid: int | None) -> str | None:
+        if pid is None:
+            return None
+        if pid not in names:
+            text = _read_text(HOST_PROC / str(pid) / "comm", 256).strip()
+            names[pid] = text or None
+        return names[pid]
+
     rows = []
-    for proc in psutil.process_iter(attrs=["pid", "name"]):
-        try:
-            for conn in proc.net_connections(kind="inet"):
-                if not conn.laddr:
-                    continue
-                rows.append({
-                    "pid": proc.pid, "process": proc.info.get("name"),
-                    "family": "ipv6" if conn.family == socket.AF_INET6 else "ipv4",
-                    "type": "tcp" if conn.type == socket.SOCK_STREAM else "udp",
-                    "local_address": conn.laddr.ip, "local_port": conn.laddr.port,
-                    "remote_address": conn.raddr.ip if conn.raddr else None,
-                    "remote_port": conn.raddr.port if conn.raddr else None,
-                    "state": conn.status,
-                })
-        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, OSError):
-            continue
-    rows = rows[:5000]
-    return _status_data({"count": len(rows), "truncated": len(rows) >= 5000, "sockets": rows})
+    for row in parsed:
+        pid = owners.get(row["inode"])
+        rows.append({
+            "pid": pid, "process": process_name(pid), "family": row["family"], "type": row["type"],
+            "local_address": row["local"][0], "local_port": row["local"][1],
+            "remote_address": row["remote"][0] if row["remote"] else None,
+            "remote_port": row["remote"][1] if row["remote"] else None,
+            "state": row["state"],
+        })
+    return _status_data({"count": len(rows), "truncated": len(rows) >= _MAX_SOCKETS, "sockets": rows})
 
 
 def _systemd_services() -> tuple[list[dict[str, str]], str]:
@@ -784,7 +1188,15 @@ def discover_capabilities() -> dict[str, Any]:
         "reason": None if ((shutil.which("virsh") and Path("/host/run/libvirt/libvirt-sock").exists()) or (PROXMOX_API_URL and PROXMOX_API_TOKEN)) else "libvirt socket or Proxmox API credentials are unavailable",
     }
     capabilities["firewall"] = _firewall_state()
+    cpu_now = _CPU_SAMPLER.current()
+    capabilities["cpu_sampling"] = {
+        "status": "available" if cpu_now else "unavailable",
+        "interval_seconds": CPU_SAMPLE_INTERVAL,
+        "buffer_seconds": round(CPU_SAMPLE_BUFFER * CPU_SAMPLE_INTERVAL),
+        "reason": None if cpu_now else "CPU counters could not be sampled (/proc/stat unreadable or sampler not yet warmed up)",
+    }
     return capabilities
+
 
 
 def _parse_file_log(raw: str, path: str, inode: int, offset: int) -> dict[str, Any]:
@@ -949,6 +1361,7 @@ def collect_logs(since: float, limit: int) -> dict[str, Any]:
     return _status_data(payload, status)
 
 
+
 @app.get("/healthz")
 def healthz() -> dict[str, str]:
     return {"status": "ok"}
@@ -957,7 +1370,15 @@ def healthz() -> dict[str, str]:
 @app.get("/api/v1/info")
 def info(x_palantir_agent_token: str | None = Header(default=None)) -> dict[str, Any]:
     _guard(x_palantir_agent_token)
-    return {"name": "PALANTIR Linux Host Collector", "version": APP_VERSION, "hostname": socket.gethostname(), "os": platform.platform(), "schema_version": 1}
+    return {
+        "name": "PALANTIR Linux Host Collector",
+        "version": APP_VERSION,
+        "hostname": socket.gethostname(),
+        "os": platform.platform(),
+        "os_release": _read_os_release(),
+        "cpu_model": _cpu_model(),
+        "schema_version": 1,
+    }
 
 
 @app.get("/api/v1/capabilities")
@@ -979,6 +1400,52 @@ def metrics(category: str, x_palantir_agent_token: str | None = Header(default=N
         return {"category": category, **_status_data({"error": str(exc)[:300]}, "unavailable")}
 
 
+@app.get("/api/v1/diagnostics")
+def diagnostics(x_palantir_agent_token: str | None = Header(default=None)) -> dict[str, Any]:
+    """Why is a number missing?  Shows what the collector can actually read on this host."""
+    _guard(x_palantir_agent_token)
+    cpu_now = _CPU_SAMPLER.current()
+    return {
+        "version": APP_VERSION,
+        "host_proc": str(HOST_PROC),
+        "host_root": str(HOST_ROOT),
+        "proc_stat_readable": bool(_read_text(HOST_PROC / "stat", 4096)),
+        "host_net_namespace_readable": bool(_read_text(HOST_PROC / "1" / "net" / "dev", 4096)),
+        "host_mounts_readable": bool(_read_text(HOST_PROC / "1" / "mounts", 4096)),
+        "cpu_sampler": {
+            "thread_alive": bool(_CPU_SAMPLER._thread and _CPU_SAMPLER._thread.is_alive()),
+            "samples_buffered": _CPU_SAMPLER.count(),
+            "current_cpu_pct": cpu_now["cpu_pct"] if cpu_now else None,
+            "last_error": _CPU_SAMPLER.last_error,
+        },
+        "rate_sampler": {
+            "thread_alive": bool(_RATE_SAMPLER._thread and _RATE_SAMPLER._thread.is_alive()),
+            "fresh": _RATE_SAMPLER.fresh(),
+            "processes_measured": len(_RATE_SAMPLER.process_rates()),
+            "last_error": _RATE_SAMPLER.last_error,
+        },
+        "interfaces": sorted(_parse_proc_net_dev()),
+    }
+
+
+@app.get("/api/v1/samples/cpu")
+def cpu_samples(
+    since: float = Query(default=0, ge=0, description="Only samples newer than this Unix time (seconds)"),
+    limit: int = Query(default=900, ge=1, le=CPU_SAMPLE_BUFFER),
+    x_palantir_agent_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Per-second total-CPU samples ({t, cpu_pct}), oldest first. `now` lets the caller correct for clock skew."""
+    _guard(x_palantir_agent_token)
+    samples = _CPU_SAMPLER.since(since, limit)
+    return {
+        "schema_version": 1,
+        "status": "available" if samples or _CPU_SAMPLER.current() else "unavailable",
+        "now": time.time(),
+        "interval_seconds": CPU_SAMPLE_INTERVAL,
+        "samples": samples,
+    }
+
+
 @app.get("/api/v1/logs")
 def logs(
     since: float = Query(default=0, ge=0),
@@ -987,3 +1454,6 @@ def logs(
 ) -> dict[str, Any]:
     _guard(x_palantir_agent_token)
     return collect_logs(since, limit)
+
+
+_start_samplers()

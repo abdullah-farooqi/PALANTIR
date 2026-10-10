@@ -12,7 +12,12 @@ from services.nodes import NodeService
 
 router = APIRouter(prefix="/nodes/{node_id}/metrics", tags=["Metrics"])
 SERIES_FIELDS = ("cpu_pct", "ram_used_mb", "ram_total_mb", "load_avg", "swap_used_mb")
-VALID_SOURCES = {"netdata", "palantir-agent"}
+VALID_SOURCES = {"netdata", "palantir-agent"}  # "netdata" only matches legacy rows still inside retention
+
+
+def _is_full_snapshot():
+    """True for regular snapshots; per-second CPU sample rows carry data->>'sample'."""
+    return MetricSnapshot.data["sample"].as_string().is_(None)
 
 
 class MetricSnapshotItem(BaseModel):
@@ -58,25 +63,26 @@ async def get_latest_metrics_all(
             .where(
                 MetricSnapshot.node_id == node_id,
                 MetricSnapshot.category == cat,
+                _is_full_snapshot(),  # skip the per-second CPU sample rows
             )
             .order_by(MetricSnapshot.collected_at.desc(), MetricSnapshot.id.desc())
-            .limit(200)
+            .limit(20)
         )
         snapshots = (await session.execute(stmt)).scalars().all()
         snap = snapshots[0] if snapshots else None
         sources: Dict[str, List[Any]] = {}
         for item in snapshots:
-            source = item.data.get("source", "netdata") if isinstance(item.data, dict) else "unknown"
+            source = item.data.get("source", "palantir-agent") if isinstance(item.data, dict) else "unknown"
             sources.setdefault(str(source), []).append(item.data)
         result[cat] = {
             "collected_at": snap.collected_at.isoformat() if snap else None,
             "data": snap.data if snap else None,
-            "cpu_pct": next((item.cpu_pct for item in snapshots if isinstance(item.data, dict) and item.data.get("source") == "netdata" and item.cpu_pct is not None), snap.cpu_pct if snap else None),
-            "ram_used_mb": next((item.ram_used_mb for item in snapshots if isinstance(item.data, dict) and item.data.get("source") == "netdata" and item.ram_used_mb is not None), snap.ram_used_mb if snap else None),
-            "ram_total_mb": next((item.ram_total_mb for item in snapshots if isinstance(item.data, dict) and item.data.get("source") == "netdata" and item.ram_total_mb is not None), snap.ram_total_mb if snap else None),
-            "load_avg": next((item.load_avg for item in snapshots if isinstance(item.data, dict) and item.data.get("source") == "netdata" and item.load_avg is not None), snap.load_avg if snap else None),
-            "swap_used_mb": next((item.swap_used_mb for item in snapshots if isinstance(item.data, dict) and item.data.get("source") == "netdata" and item.swap_used_mb is not None), snap.swap_used_mb if snap else None),
-            "top_processes": next((item.top_processes for item in snapshots if isinstance(item.data, dict) and item.data.get("source") == "netdata" and item.top_processes is not None), snap.top_processes if snap else None),
+            "cpu_pct": snap.cpu_pct if snap else None,
+            "ram_used_mb": snap.ram_used_mb if snap else None,
+            "ram_total_mb": snap.ram_total_mb if snap else None,
+            "load_avg": snap.load_avg if snap else None,
+            "swap_used_mb": snap.swap_used_mb if snap else None,
+            "top_processes": snap.top_processes if snap else None,
             "sources": sources,
         }
     return result
@@ -105,6 +111,7 @@ async def get_latest_metrics_by_category(
         .where(
             MetricSnapshot.node_id == node_id,
             MetricSnapshot.category == category,
+            _is_full_snapshot(),
         )
         .order_by(MetricSnapshot.collected_at.desc(), MetricSnapshot.id.desc())
         .limit(limit)
@@ -137,6 +144,8 @@ async def get_metric_series(
     limit: int = Query(default=250, ge=1, le=1000),
     cursor: Optional[str] = None,
     bucket_seconds: Optional[int] = Query(default=None, ge=10, le=86400),
+    kind: str = Query(default="all", pattern="^(all|full|samples)$",
+                      description="full = regular snapshots only, samples = per-second CPU rows only"),
     session: AsyncSession = Depends(get_session),
 ) -> Dict[str, Any]:
     valid_categories = {"network", "system", "storage", "services", "processes", "connections", "containers", "vms"}
@@ -161,7 +170,7 @@ async def get_metric_series(
         raise HTTPException(status_code=400, detail="Requested window begins before metric retention")
     if until - since > timedelta(hours=retention_hours):
         raise HTTPException(status_code=400, detail="Requested window exceeds metric retention")
-    source_expr = func.coalesce(MetricSnapshot.data["source"].as_string(), "netdata")
+    source_expr = func.coalesce(MetricSnapshot.data["source"].as_string(), "palantir-agent")
     filters = [
         MetricSnapshot.node_id == node_id,
         MetricSnapshot.category == category,
@@ -170,6 +179,10 @@ async def get_metric_series(
     ]
     if source:
         filters.append(source_expr == source)
+    if kind == "full":
+        filters.append(_is_full_snapshot())
+    elif kind == "samples":
+        filters.append(MetricSnapshot.data["sample"].as_string().is_not(None))
 
     try:
         if bucket_seconds is None:

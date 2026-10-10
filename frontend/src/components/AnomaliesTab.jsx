@@ -39,15 +39,15 @@ export default function AnomaliesTab({ anomalies, hostname, onInvestigate, onOpe
     <div className="space-y-4">
       <SectionTitle
         icon={ShieldAlert}
-        title="ML anomaly events"
-        subtitle="Raised when at least 2 watched contexts exceed the 70% anomaly threshold (10 min cooldown)."
+        title="Anomaly events"
+        subtitle="Raised when at least 2 watched metrics (CPU, memory, load) stay far above their recent baseline (10 min cooldown)."
         right={<Badge tone="amber">{anomalies.length} events</Badge>}
       />
 
       {anomalies.length === 0 ? (
-        <EmptyState icon={CheckCircle2} tone="green" title="No anomalies detected">
-          Nothing has crossed the anomaly threshold on {hostname}. Netdata's ML engine needs about 15 minutes of
-          data after a fresh start before it can score anything.
+        <EmptyState icon={CheckCircle2} tone="green" title="No anomaly events recorded">
+          No anomaly event has been recorded for {hostname}. Detection needs about 30 minutes of collected
+          history before it can score anything.
         </EmptyState>
       ) : (
         anomalies.map((a) => {

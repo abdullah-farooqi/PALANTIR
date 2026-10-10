@@ -5,17 +5,17 @@ from core.api_auth import require_read
 router = APIRouter(prefix="/metrics", tags=["Metric schema"])
 
 _FIELDS = [
-    {"name": "cpu_pct", "type": "number", "unit": "%", "label": "CPU utilization", "sources": ["netdata"]},
-    {"name": "ram_used_mb", "type": "number", "unit": "MiB", "label": "Memory used", "sources": ["netdata"]},
-    {"name": "ram_total_mb", "type": "number", "unit": "MiB", "label": "Total memory", "sources": ["netdata"]},
-    {"name": "load_avg", "type": "number", "unit": "load average", "label": "System load", "sources": ["netdata"]},
-    {"name": "swap_used_mb", "type": "number", "unit": "MiB", "label": "Swap used", "sources": ["netdata"]},
+    {"name": "cpu_pct", "type": "number", "unit": "%", "label": "CPU utilization", "sources": ["palantir-agent"]},
+    {"name": "ram_used_mb", "type": "number", "unit": "MiB", "label": "Memory used", "sources": ["palantir-agent"]},
+    {"name": "ram_total_mb", "type": "number", "unit": "MiB", "label": "Total memory", "sources": ["palantir-agent"]},
+    {"name": "load_avg", "type": "number", "unit": "load average", "label": "System load", "sources": ["palantir-agent"]},
+    {"name": "swap_used_mb", "type": "number", "unit": "MiB", "label": "Swap used", "sources": ["palantir-agent"]},
     {
         "name": "top_processes",
         "type": "array<object>",
         "unit": None,
         "label": "Top processes",
-        "sources": ["netdata"],
+        "sources": ["palantir-agent"],
         "items": {
             "name": {"type": "string", "unit": None},
             "cpu_pct": {"type": "number", "unit": "%"},
@@ -28,7 +28,6 @@ _CATEGORIES = (
     "system", "storage", "network", "services", "processes",
     "connections", "containers", "vms",
 )
-_NETDATA_CATEGORIES = {"system", "network", "processes", "containers"}
 
 
 @router.get("/schema", dependencies=[Depends(require_read)])
@@ -49,8 +48,7 @@ async def get_metric_schema():
             {
                 "name": category,
                 "sources": {
-                    "netdata": "supported" if category in _NETDATA_CATEGORIES else "unsupported",
-                    "palantir-agent": "optional; availability depends on host integrations and permissions",
+                    "palantir-agent": "availability depends on host integrations and permissions",
                 },
                 "typed_fields": _FIELDS,
                 "data_contract": "Source-specific JSON object; fields outside typed_fields remain collector-defined.",

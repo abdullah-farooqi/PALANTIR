@@ -10,11 +10,10 @@ from core.api_auth import require_admin, require_node_enrollment, require_read
 from core.security import validate_netdata_url
 from models.node import MonitoredNode
 from models.category_status import CategoryCollectionStatus
-from services.nodes import NodeService
+from services.nodes import CollectorUnavailable, NodeService
 from services.collection_status import summarize_category_statuses
 from core.config import settings
 from core.cursors import decode_cursor, encode_cursor
-from integrations.netdata.exceptions import NetdataUnavailable
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/nodes", tags=["Nodes"])
@@ -28,17 +27,17 @@ class NodeRegisterRequest(BaseModel):
         pattern=r"^[a-zA-Z0-9_\.\-]+$",
         description="Node hostname",
     )
-    netdata_url: str = Field(
-        ...,
-        min_length=7,
-        max_length=2048,
-        description="Base URL of the Netdata agent",
-    )
-    collector_url: Optional[str] = Field(
+    netdata_url: Optional[str] = Field(
         default=None,
         min_length=7,
         max_length=2048,
-        description="Optional base URL of the PALANTIR Linux host collector",
+        description="Deprecated and ignored (Netdata is no longer used); accepted so older clients keep working",
+    )
+    collector_url: str = Field(
+        ...,
+        min_length=7,
+        max_length=2048,
+        description="Base URL of the PALANTIR Linux host collector",
     )
     os_type: str = Field(
         default="linux",
@@ -51,7 +50,9 @@ class NodeRegisterRequest(BaseModel):
 
     @field_validator("netdata_url")
     @classmethod
-    def validate_url(cls, v: str) -> str:
+    def validate_url(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
         try:
             return validate_netdata_url(v)
         except ValueError as err:
@@ -59,9 +60,7 @@ class NodeRegisterRequest(BaseModel):
 
     @field_validator("collector_url")
     @classmethod
-    def validate_collector_url(cls, v: Optional[str]) -> Optional[str]:
-        if v is None:
-            return None
+    def validate_collector_url(cls, v: str) -> str:
         try:
             return validate_netdata_url(v)
         except ValueError as err:
@@ -76,7 +75,7 @@ class NodeRegisterRequest(BaseModel):
 class NodeResponse(BaseModel):
     id: int
     hostname: str
-    netdata_url: str
+    netdata_url: Optional[str] = None  # legacy field; holds the collector URL for new nodes
     collector_url: Optional[str] = None
     capabilities: Optional[dict] = None
     os_type: str
@@ -140,7 +139,7 @@ async def search_monitored_nodes(
         default=None,
         pattern="^(available|not_configured|unsupported|stale|collection_error|unknown)$",
     ),
-    source: Optional[str] = Query(default=None, pattern="^(netdata|palantir-agent)$"),
+    source: Optional[str] = Query(default=None, pattern="^(netdata|palantir-agent)$"),  # "netdata" kept only for legacy rows
     limit: int = Query(default=100, ge=1, le=500),
     cursor: Optional[str] = None,
     session: AsyncSession = Depends(get_session),
@@ -215,9 +214,9 @@ async def search_monitored_nodes(
                 CategoryCollectionStatus.source == source,
                 CategoryCollectionStatus.status == "unknown",
             ))
-            source_expected = (
-                source == "netdata" and category in {"system", "network", "processes", "containers"}
-            ) or (source == "palantir-agent" and MonitoredNode.collector_url.is_not(None))
+            source_expected = and_(
+                source == "palantir-agent", MonitoredNode.collector_url.is_not(None)
+            ) if source == "palantir-agent" else False
             missing_status = exists(select(1).where(
                 CategoryCollectionStatus.node_id == MonitoredNode.id,
                 CategoryCollectionStatus.category == category,
@@ -271,7 +270,6 @@ async def register_monitored_node(
         if existing:
             if (
                 existing.active
-                and existing.netdata_url == req.netdata_url
                 and existing.collector_url == req.collector_url
                 and existing.os_type == req.os_type
             ):
@@ -284,10 +282,10 @@ async def register_monitored_node(
     try:
         node = await NodeService.register_node(
             hostname=req.hostname,
-            netdata_url=req.netdata_url,
             os_type=req.os_type,
             session=session,
             collector_url=req.collector_url,
+            netdata_url=req.netdata_url,
         )
         return node
     except ValueError as e:
@@ -295,11 +293,11 @@ async def register_monitored_node(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(e),
         )
-    except NetdataUnavailable as e:
-        logger.warning(f"Netdata Agent unreachable during registration of {req.hostname}: {e}")
+    except CollectorUnavailable as e:
+        logger.warning(f"Host collector unreachable during registration of {req.hostname}: {e}")
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="Netdata Agent unreachable or returned an invalid response",
+            detail="Host collector unreachable or returned an invalid response",
         )
     except Exception as e:
         logger.exception(f"Unexpected failure registering node {req.hostname}")

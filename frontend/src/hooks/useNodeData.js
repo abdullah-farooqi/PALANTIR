@@ -1,5 +1,5 @@
 import { api } from '../api';
-import { AGENT, CATEGORIES, NETDATA, seriesParams } from '../lib/metrics';
+import { AGENT, CATEGORIES, seriesParams } from '../lib/metrics';
 import { usePolling } from './usePolling';
 
 const NET_MIN_MS = 30 * 60e3;
@@ -16,32 +16,26 @@ const SECTION_CATEGORY = { services: 'services', containers: 'containers', vms: 
  * snapshot (limit=1) of the categories on screen.
  */
 function plan(view, section) {
-  if (view === 'overview') return { agent: ['system', 'storage', 'processes'], netdata: ['system', 'processes'], cpu: true, net: true };
-  if (view === 'inventory') return { agent: SECTION_CATEGORY[section] ? [SECTION_CATEGORY[section]] : [], netdata: [], cpu: false, net: false };
-  return { agent: [], netdata: [], cpu: false, net: false };
+  if (view === 'overview') return { agent: ['system', 'storage', 'processes', 'network'], cpu: true, net: true };
+  if (view === 'inventory') return { agent: SECTION_CATEGORY[section] ? [SECTION_CATEGORY[section]] : [], cpu: false, net: false };
+  return { agent: [], cpu: false, net: false };
 }
 
 function newest(nodeId, category, source) {
   return api
-    .getSeries(nodeId, category, { source, limit: 1, since: new Date(Date.now() - LATEST_WINDOW_MS).toISOString() })
+    .getSeries(nodeId, category, { source, kind: 'full', limit: 1, since: new Date(Date.now() - LATEST_WINDOW_MS).toISOString() })
     .then((r) => (r.items && r.items[0]) || null);
 }
 
-// Rebuilds the { category: { ...typed, sources:{netdata:[row], 'palantir-agent':[payload]} } } shape lib/metrics.js reads.
-function assemble(agent, netdata) {
+// Rebuilds the { category: { ...typed, sources:{'palantir-agent':[payload]} } } shape lib/metrics.js reads.
+function assemble(agent) {
   const latest = {};
   CATEGORIES.forEach((cat) => {
     const entry = { sources: {} };
-    const n = netdata[cat];
     const a = agent[cat];
-    if (n) {
-      Object.assign(entry, n.metrics || {});
-      entry.collected_at = n.collected_at;
-      if (n.data && Array.isArray(n.data.top_processes)) entry.top_processes = n.data.top_processes;
-      entry.sources.netdata = [n.data];
-    }
     if (a) {
-      entry.collected_at = entry.collected_at || a.collected_at;
+      Object.assign(entry, a.metrics || {});
+      entry.collected_at = a.collected_at;
       entry.sources[AGENT] = [a.data];
     }
     latest[cat] = entry;
@@ -65,18 +59,12 @@ export function useNodeData(nodeId, range, refreshMs, view = 'overview', section
         { name: 'status', run: () => api.getCollectionStatus(nodeId) },
         { name: 'active', run: () => api.getActiveAlerts(nodeId) },
         ...p.agent.map((c) => ({ name: `agent:${c}`, run: () => newest(nodeId, c, AGENT) })),
-        ...p.netdata.map((c) => ({ name: `nd:${c}`, run: () => newest(nodeId, c, NETDATA) })),
       ];
       if (p.cpu) {
         tasks.push({
           name: 'cpu',
-          run: () =>
-            api.getSeries(nodeId, 'system', seriesParams(range, { source: NETDATA }))
-              .then((res) => {
-                if (res && res.items && res.items.length > 0) return res;
-                return api.getSeries(nodeId, 'system', seriesParams(range, { source: AGENT }));
-              })
-              .catch(() => api.getSeries(nodeId, 'system', seriesParams(range, { source: AGENT }))),
+          // per-second samples + the once-a-minute snapshots, raw for short ranges, bucketed for long ones
+          run: () => api.getSeries(nodeId, 'system', seriesParams(range, { source: AGENT })),
         });
       }
       if (p.net) {
@@ -98,7 +86,6 @@ export function useNodeData(nodeId, range, refreshMs, view = 'overview', section
 
       const out = { errors: {}, view, section };
       const agent = {};
-      const netdata = {};
       results.forEach((r, i) => {
         const name = tasks[i].name;
         if (r.status === 'rejected') {
@@ -106,10 +93,9 @@ export function useNodeData(nodeId, range, refreshMs, view = 'overview', section
           return;
         }
         if (name.startsWith('agent:')) agent[name.slice(6)] = r.value;
-        else if (name.startsWith('nd:')) netdata[name.slice(3)] = r.value;
         else out[name] = r.value;
       });
-      out.latest = assemble(agent, netdata);
+      out.latest = assemble(agent);
       return out;
     },
     [nodeId, range.key, view, view === 'inventory' ? section : ''],
@@ -123,19 +109,16 @@ export async function fetchNodeSummary(nodeId) {
   const categories = ['system', 'storage', 'processes', 'network'];
   const tasks = [
     ...categories.map((c) => newest(nodeId, c, AGENT)),
-    ...categories.map((c) => newest(nodeId, c, NETDATA)),
-    api.getSeries(nodeId, 'system', { source: NETDATA, limit: 30 })
+    // last ~5 minutes of CPU (per-second rows) for the card sparkline
+    api.getSeries(nodeId, 'system', { source: AGENT, since: new Date(Date.now() - 5 * 60e3).toISOString(), limit: 300 }),
   ];
   const results = await Promise.allSettled(tasks);
   const agent = {};
-  const netdata = {};
   categories.forEach((cat, idx) => {
-    const resAgent = results[idx];
-    const resNetdata = results[categories.length + idx];
-    if (resAgent.status === 'fulfilled' && resAgent.value) agent[cat] = resAgent.value;
-    if (resNetdata.status === 'fulfilled' && resNetdata.value) netdata[cat] = resNetdata.value;
+    const res = results[idx];
+    if (res.status === 'fulfilled' && res.value) agent[cat] = res.value;
   });
-  const cpuSeriesRes = results[categories.length * 2];
+  const cpuSeriesRes = results[categories.length];
   const cpuItems = (cpuSeriesRes && cpuSeriesRes.status === 'fulfilled' && cpuSeriesRes.value && cpuSeriesRes.value.items) ? cpuSeriesRes.value.items : [];
-  return { latest: assemble(agent, netdata), history: cpuItems };
+  return { latest: assemble(agent), history: cpuItems };
 }

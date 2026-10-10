@@ -7,7 +7,6 @@ CATEGORY_ORDER = (
     "system", "storage", "network", "services", "processes",
     "connections", "containers", "vms",
 )
-NETDATA_CATEGORIES = {"system", "network", "processes", "containers"}
 CATEGORY_LABELS = {
     "system": "System",
     "storage": "Storage",
@@ -41,15 +40,11 @@ def summarize_category_statuses(
 
     for category in CATEGORY_ORDER:
         source_summaries = []
-        for source in ("netdata", "palantir-agent"):
+        for source in ("palantir-agent",):
             row = by_key.get((category, source))
             if row is None:
-                if source == "netdata":
-                    base_status = "unknown" if category in NETDATA_CATEGORIES else "unsupported"
-                    message = None if base_status == "unknown" else "The current Netdata collection pipeline does not collect this category."
-                else:
-                    base_status = "unknown" if has_collector else "not_configured"
-                    message = None if has_collector else "No PALANTIR host collector is configured for this node."
+                base_status = "unknown" if has_collector else "not_configured"
+                message = None if has_collector else "No PALANTIR host collector is configured for this node."
                 last_attempt = last_success = error_code = None
             else:
                 base_status = row.status

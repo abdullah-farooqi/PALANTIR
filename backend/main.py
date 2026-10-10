@@ -28,36 +28,27 @@ logger = logging.getLogger("palantir")
 
 async def auto_register_local_node():
     """
-    Zero-touch auto-registration:
-    Polls local Netdata sensor on startup and registers/updates it in PostgreSQL.
-    Runs asynchronously in the background so FastAPI starts immediately.
+    Optional zero-touch registration of a host collector next to the central stack.
+    Only runs when LOCAL_COLLECTOR_URL is set (e.g. http://host.docker.internal:20000).
     """
-    netdata_url = "http://netdata:19999"
-    max_retries = 30
-    delay = 2
-
-    for attempt in range(1, max_retries + 1):
+    collector_url = settings.LOCAL_COLLECTOR_URL.strip()
+    if not collector_url:
+        return
+    for attempt in range(1, 31):
         try:
             async with AsyncSessionLocal() as session:
                 node = await NodeService.register_node(
-                    hostname="local-node",
-                    netdata_url=netdata_url,
+                    hostname=settings.LOCAL_NODE_HOSTNAME,
+                    collector_url=collector_url,
                     os_type="linux",
                     session=session,
                 )
-                logger.info(
-                    f"✓ [ZERO-TOUCH] Auto-registered local Netdata sensor '{node.hostname}' "
-                    f"(ID: {node.id}, Contexts: {node.context_count}, Alerts: {node.alert_count})"
-                )
+                logger.info(f"Auto-registered local host collector '{node.hostname}' (ID: {node.id})")
                 return
         except Exception as exc:
-            logger.debug(f"Waiting for Netdata sensor ({attempt}/{max_retries}): {exc}")
-            await asyncio.sleep(delay)
-
-    logger.warning(
-        "Could not auto-register local Netdata node within timeout. "
-        "It will be probed during periodic scheduled tasks."
-    )
+            logger.debug(f"Waiting for local host collector ({attempt}/30): {exc}")
+            await asyncio.sleep(2)
+    logger.warning("Could not auto-register the local host collector within the timeout.")
 
 
 @asynccontextmanager
@@ -69,7 +60,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
-    description="PALANTIR Backend API — Netdata Sensor & Autonomous Security Investigation Engine",
+    description="PALANTIR Backend API — Host Collector & Autonomous Security Investigation Engine",
     version="1.0.0",
     lifespan=lifespan,
 )
@@ -88,7 +79,7 @@ app.add_middleware(
 async def healthz():
     return {"status": "ok", "app": settings.PROJECT_NAME}
 
-# Internal router (Netdata webhook)
+# Internal router (alert webhook)
 app.include_router(internal_router, prefix="/internal", tags=["Internal Webhooks"])
 
 # Public API v1 routers
