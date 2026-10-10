@@ -21,7 +21,7 @@ def evaluate_all_nodes(self):
             nodes = session.execute(stmt).scalars().all()
             for node in nodes:
                 try:
-                    svc = AnomalyService(node_url=node.netdata_url)
+                    svc = AnomalyService()
                     asyncio.run(svc.evaluate_and_trigger(node.id, session))
                 except Exception as exc:
                     failures += 1

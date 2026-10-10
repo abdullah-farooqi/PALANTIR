@@ -121,7 +121,10 @@ class Settings(BaseSettings):
     MIN_CONTEXTS_ANOMALOUS: int = Field(default=2, ge=1)
     COOLDOWN_MINUTES: int = Field(default=10, ge=0)
 
-    # Netdata default client timeout
+    # Optional: register the host collector running next to the central stack at startup
+    LOCAL_COLLECTOR_URL: str = Field(default="", description="e.g. http://host.docker.internal:20000")
+    LOCAL_NODE_HOSTNAME: str = Field(default="local-node")
+    # Kept so existing .env files / older modules that still read it keep working
     NETDATA_TIMEOUT_SECONDS: float = Field(default=5.0, gt=0, le=120)
     AGENT_AUTH_TOKEN: str = Field(
         default="",

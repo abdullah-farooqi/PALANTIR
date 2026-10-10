@@ -51,7 +51,7 @@ export function ErrorLine({ children, warn }) {
 /** Row of tiny toggle buttons: [a] [b] [c]. */
 export function Chips({ options, value, onChange }) {
   return (
-    <span className="row" style={{ gap: 2 }}>
+    <span className="row" style={{ gap: 4 }}>
       {options.map((o) => (
         <button
           key={o.value}
@@ -59,9 +59,24 @@ export function Chips({ options, value, onChange }) {
           className={`chip-btn ${value === o.value ? 'on' : ''}`}
           onClick={() => onChange(o.value)}
           title={o.title}
+          style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}
         >
-          {o.hotkey && <span className="k">{o.hotkey}</span>}
-          {o.label}
+          {o.hotkey && (
+            <span
+              style={{
+                fontSize: 10,
+                color: value === o.value ? '#14301a' : '#728c78',
+                background: value === o.value ? '#39e569' : 'rgba(255,255,255,0.08)',
+                padding: '0 4px',
+                borderRadius: 3,
+                fontWeight: 800,
+                lineHeight: '13px',
+              }}
+            >
+              {o.hotkey}
+            </span>
+          )}
+          <span>{o.label}</span>
         </button>
       ))}
     </span>

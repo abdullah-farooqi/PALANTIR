@@ -1,19 +1,14 @@
 // Turns backend telemetry into the plain numbers the boxes display.
 //
-// Two collectors feed the same `metric_snapshots` table:
+// The PALANTIR host collector ("palantir-agent") is the only telemetry source. Every helper here
+// returns null / [] when the collector did not report a value - nothing is ever replaced by a
+// made-up default (0, "ext4", a flat line ...). Screens turn null into "no data available".
 //
-//  netdata         flat per-second rows:  { timestamp, 'system.cpu': 12.3, ..., source:'netdata' }
-//                  plus typed columns on the snapshot (cpu_pct, ram_used_mb, ram_total_mb,
-//                  load_avg, swap_used_mb, top_processes).
-//  palantir-agent  one JSON payload per minute: { observed_at, status, source:'palantir-agent',
-//                  data: { memory:{...}, filesystems:[...], interfaces:{...}, ... } }
-//
-// GET /nodes/{id}/metrics returns, per category, the newest snapshot plus
-// `sources: { netdata: [data, ...newest first], 'palantir-agent': [payload, ...] }`.
+// GET /nodes/{id}/metrics/{category}/series?source=palantir-agent returns snapshots shaped like
+//   { collected_at, data: { observed_at, status, source, data: { ...collector fields } }, metrics:{typed} }
 
 import { toMs } from './format';
 
-export const NETDATA = 'netdata';
 export const AGENT = 'palantir-agent';
 export const MIB = 1024 * 1024;
 
@@ -40,12 +35,6 @@ export function agentStatus(latest, category) {
   return p ? p.status || 'available' : null;
 }
 
-/** Newest Netdata flat row for a category, or null. */
-export function netdataRow(latest, category) {
-  const list = latest && latest[category] && latest[category].sources && latest[category].sources[NETDATA];
-  return list && list.length > 0 ? list[0] : null;
-}
-
 // ---- system ------------------------------------------------------------------
 
 export function systemSummary(latest) {
@@ -54,38 +43,37 @@ export function systemSummary(latest) {
   const mem = a.memory || {};
   const swap = a.swap || {};
 
-  // Prefer the collector's psutil numbers (exact bytes); fall back to Netdata typed columns.
-  const totalBytes = num(mem.total_bytes) ?? (num(sys.ram_total_mb) !== null ? sys.ram_total_mb * MIB : null);
-  const usedBytes = num(mem.used_bytes) ?? (num(sys.ram_used_mb) !== null ? sys.ram_used_mb * MIB : null);
+  const totalBytes = num(mem.total_bytes);
+  const usedBytes = num(mem.used_bytes);
   const availBytes = num(mem.available_bytes);
   let memPct = num(mem.percent);
   if (memPct === null && totalBytes && usedBytes !== null) memPct = Math.min(100, (usedBytes / totalBytes) * 100);
 
   const swapTotal = num(swap.total_bytes);
-  const swapUsed = num(swap.used_bytes) ?? (num(sys.swap_used_mb) !== null ? sys.swap_used_mb * MIB : null);
+  const swapUsed = num(swap.used_bytes);
   let swapPct = num(swap.percent);
   if (swapPct === null && swapTotal && swapUsed !== null) swapPct = (swapUsed / swapTotal) * 100;
 
   const load = Array.isArray(a.load_average) ? a.load_average.filter((x) => num(x) !== null) : [];
-  if (load.length === 0 && num(sys.load_avg) !== null) load.push(sys.load_avg);
+  const cores = num(a.cpu_logical_count) ?? num(a.cpu_count);
 
   return {
-    cpuPct: num(sys.cpu_pct) ?? num(a.cpu_pct),
-    cores: num(a.cpu_logical_count) ?? num(a.cpu_count),
-    cpuCoresPct: Array.isArray(a.cpu_cores_pct) ? a.cpu_cores_pct : [],
+    cpuPct: num(a.cpu_pct),
+    cores,
+    cpuCoresPct: Array.isArray(a.cpu_cores_pct) ? a.cpu_cores_pct.filter((x) => num(x) !== null) : [],
     cpuHistory: Array.isArray(a.cpu_history) ? a.cpu_history : [],
     cpuTimes: a.cpu_times || {},
-    cpuModel: (a.os_release && a.os_release.MODEL) || a.cpu_model || null,
+    cpuModel: a.cpu_model || (a.os_release && a.os_release.MODEL) || null,
     load,
     mem: {
       total: totalBytes,
       used: usedBytes,
       available: availBytes,
-      buffers: num(mem.buffers_bytes) || 0,
-      cached: num(mem.cached_bytes) || 0,
-      active: num(mem.active_bytes) || 0,
-      inactive: num(mem.inactive_bytes) || 0,
-      slab: num(mem.slab_bytes) || 0,
+      buffers: num(mem.buffers_bytes),
+      cached: num(mem.cached_bytes),
+      active: num(mem.active_bytes),
+      inactive: num(mem.inactive_bytes),
+      slab: num(mem.slab_bytes),
       pct: memPct,
     },
     swap: { total: swapTotal, used: swapUsed, pct: swapPct },
@@ -96,6 +84,31 @@ export function systemSummary(latest) {
 }
 
 // ---- storage --------------------------------------------------------------------
+
+/** Disk throughput measured by the collector itself (needs no second snapshot). null when not measured. */
+function ioNowFrom(devices) {
+  const sum = (key) => {
+    const values = devices.map((d) => num(d[key])).filter((v) => v !== null);
+    return values.length ? values.reduce((x, y) => x + y, 0) : null;
+  };
+  const max = (key) => {
+    const values = devices.map((d) => num(d[key])).filter((v) => v !== null);
+    return values.length ? Math.max(...values) : null;
+  };
+  const read = sum('read_bytes_per_sec');
+  const write = sum('write_bytes_per_sec');
+  const r = sum('read_iops');
+  const w = sum('write_iops');
+  const totalOps = (r || 0) + (w || 0);
+  const busy = max('busy_pct');
+  return {
+    readRate: read,
+    writeRate: write,
+    iops: r === null && w === null ? null : totalOps,
+    busyPct: busy,
+    totalOps: totalOps > 0 ? totalOps : null,
+  };
+}
 
 export function storageSummary(latest) {
   const a = agentData(latest, 'storage');
@@ -156,57 +169,11 @@ export function storageSummary(latest) {
 
     if (uniqueFs.length > 0) {
       const rootItem = uniqueFs.find((f) => (f.mount === '/' || f.mount === '/host') && f.totalBytes > 0) || uniqueFs[0];
-      return { filesystems: [rootItem, ...uniqueFs.filter((f) => f !== rootItem)], raid: a.raid || null, diskIo: primaryDiskIo, available: true };
+      return { filesystems: [rootItem, ...uniqueFs.filter((f) => f !== rootItem)], raid: a.raid || null, diskIo: primaryDiskIo, ioNow: ioNowFrom(primaryDiskIo), available: true };
     }
   }
 
-  // Netdata Disk Telemetry Fallback (when host collector on port 20000 is not enabled or empty)
-  const sys = (latest && latest.system) || {};
-  const sysStorage = (latest && latest.storage) || {};
-  const diskTotal = num(sysStorage.disk_total_mb) ?? num(sys.disk_total_mb) !== null ? (sysStorage.disk_total_mb || sys.disk_total_mb) * MIB : null;
-  const diskUsed = num(sysStorage.disk_used_mb) ?? num(sys.disk_used_mb) !== null ? (sysStorage.disk_used_mb || sys.disk_used_mb) * MIB : null;
-  const diskFree = diskTotal !== null && diskUsed !== null ? Math.max(0, diskTotal - diskUsed) : null;
-  let pct = num(sysStorage.disk_pct) ?? num(sys.disk_pct);
-  if (pct === null && diskTotal && diskUsed !== null) pct = (diskUsed / diskTotal) * 100;
-
-  // Fallback to checking rootFs metrics if present anywhere in latest
-  const sysFs = (sysStorage.filesystems || sys.filesystems || []).filter((f) => f && f.mountpoint && f.status === 'available');
-
-  if (sysFs.length > 0) {
-    const parsedFs = sysFs.map((f) => ({
-      mount: f.mountpoint,
-      device: f.device || 'rootfs',
-      fs: f.filesystem || 'ext4',
-      total: num(f.total_bytes),
-      used: num(f.used_bytes),
-      free: num(f.free_bytes),
-      totalBytes: num(f.total_bytes),
-      usedBytes: num(f.used_bytes),
-      freeBytes: num(f.free_bytes),
-      pct: num(f.percent),
-      status: 'available',
-    }));
-    return { filesystems: parsedFs, raid: null, diskIo: [], available: true };
-  }
-
-  if (diskTotal !== null || diskUsed !== null || pct !== null) {
-    const netdataFs = [{
-      mount: '/',
-      device: 'rootfs',
-      fs: 'ext4',
-      total: diskTotal,
-      used: diskUsed,
-      free: diskFree,
-      totalBytes: diskTotal,
-      usedBytes: diskUsed,
-      freeBytes: diskFree,
-      pct: pct !== null ? pct : 0,
-      status: 'available',
-    }];
-    return { filesystems: netdataFs, raid: null, diskIo: [], available: true };
-  }
-
-  return { filesystems: [], raid: null, diskIo: [], available: false };
+  return { filesystems: [], raid: null, diskIo: [], ioNow: null, available: false };
 }
 
 /**
@@ -225,14 +192,14 @@ export function storageFromSeries(items) {
     .sort((a, b) => a.t - b.t);
 
   if (rows.length < 2) {
-    return { readRate: 0, writeRate: 0, iops: 0 };
+    return { readRate: null, writeRate: null, iops: null };
   }
 
   const last = rows[rows.length - 1];
   const prev = rows[rows.length - 2];
   const dt = (last.t - prev.t) / 1000;
   if (dt <= 0) {
-    return { readRate: 0, writeRate: 0, iops: 0 };
+    return { readRate: null, writeRate: null, iops: null };
   }
 
   const filterPrimary = (ioList) => {
@@ -355,80 +322,40 @@ export function networkFromSeries(items, selected = 'all') {
   return { points, ifaces, names: [...names].filter((n) => !isLoopback(n)), totals };
 }
 
-/** Comprehensive network rates from PALANTIR host collector or Netdata fallback. */
-export function netdataNetNow(latest) {
-  const netCat = (latest && latest.network) || {};
-
-  // 1. Check PALANTIR agent interfaces first (exact bytes_recv, bytes_sent)
+/**
+ * Current network rates straight from the collector snapshot (counter deltas it measured itself).
+ * Returns null when there is no network payload; rx/tx are null when no rate was measured yet.
+ * Cumulative totals are returned as totalRx/totalTx and must never be shown as a speed.
+ */
+export function networkNow(latest) {
   const a = agentData(latest, 'network');
-  if (a && a.interfaces && typeof a.interfaces === 'object') {
-    let totalRx = 0;
-    let totalTx = 0;
-    Object.entries(a.interfaces).forEach(([ifaceName, iface]) => {
-      // Exclude loopback & virtual interfaces
-      if (ifaceName === 'lo' || /^lo\d*$/.test(ifaceName) || isVirtualIface(ifaceName)) return;
-      if (iface && typeof iface === 'object') {
-        if (typeof iface.bytes_recv === 'number') totalRx += iface.bytes_recv;
-        if (typeof iface.bytes_sent === 'number') totalTx += iface.bytes_sent;
-      }
-    });
-    // Return cumulative byte totals; rate must come from series delta, not raw cumulative total
-    return {
-      rx: null,
-      tx: null,
-      totalRx,
-      totalTx,
-    };
-  }
-
-  // 2. Fallback to Netdata flat row metrics
-  const row = netdataRow(latest, 'network');
-  if (row) {
-    let rx = 0;
-    let tx = 0;
-    Object.keys(row).forEach((k) => {
-      if (!/^net\./.test(k) || typeof row[k] !== 'number') return;
-      if (row[k] >= 0) rx += row[k];
-      else tx += -row[k];
-    });
-    const rxBytes = (rx * 1000) / 8;
-    const txBytes = (tx * 1000) / 8;
-    return {
-      rx: rxBytes,
-      tx: txBytes,
-      rxBits: rxBytes * 8,
-      txBits: txBytes * 8,
-    };
-  }
-
-  return null;
+  if (!a || !a.interfaces || typeof a.interfaces !== 'object') return null;
+  let rx = null;
+  let tx = null;
+  let totalRx = 0;
+  let totalTx = 0;
+  Object.entries(a.interfaces).forEach(([name, iface]) => {
+    if (isLoopback(name) || isVirtualIface(name) || !iface || typeof iface !== 'object') return;
+    if (num(iface.rx_bytes_per_sec) !== null) rx = (rx || 0) + iface.rx_bytes_per_sec;
+    if (num(iface.tx_bytes_per_sec) !== null) tx = (tx || 0) + iface.tx_bytes_per_sec;
+    totalRx += num(iface.bytes_recv) || 0;
+    totalTx += num(iface.bytes_sent) || 0;
+  });
+  return { rx, tx, totalRx, totalTx };
 }
 
 // ---- processes ----------------------------------------------------------------------
 
 export function processSummary(latest) {
-  const p = (latest && latest.processes) || {};
   const a = agentData(latest, 'processes');
-  const topList = Array.isArray(p.top_processes) ? p.top_processes : [];
-  const topCpuMap = new Map();
-  topList.forEach((x) => {
-    if (x && x.pid !== undefined && x.pid !== null) topCpuMap.set(x.pid, num(x.cpu_pct));
-    else if (x && x.name) topCpuMap.set(x.name, num(x.cpu_pct));
-  });
-  const apps = topList.map((x) => ({
-    name: x.name, cpu: num(x.cpu_pct), mem: num(x.mem_mb) !== null ? x.mem_mb * MIB : null,
-  }));
   const host = a
-    ? (a.top_by_rss || []).map((x) => {
-        const fallbackCpu = topCpuMap.get(x.pid) ?? topCpuMap.get(x.name);
-        return {
-          pid: x.pid, name: x.name, user: x.username, status: x.status,
-          threads: num(x.threads), rss: num(x.rss_bytes), cpuTime: num(x.cpu_time_seconds),
-          cpu: num(x.cpu_pct) ?? fallbackCpu ?? 0,
-        };
-      })
+    ? (a.top_by_rss || []).map((x) => ({
+        pid: x.pid, name: x.name, user: x.username, status: x.status,
+        threads: num(x.threads), rss: num(x.rss_bytes), cpuTime: num(x.cpu_time_seconds),
+        cpu: num(x.cpu_pct), // null = not measured yet (never shown as 0)
+      }))
     : [];
-  return { apps, host, count: a ? num(a.process_count) : null, oom: a ? a.oom_counters || {} : {} };
+  return { apps: [], host, count: a ? num(a.process_count) : null, oom: a ? a.oom_counters || {} : {} };
 }
 
 // ---- inventories -----------------------------------------------------------------------

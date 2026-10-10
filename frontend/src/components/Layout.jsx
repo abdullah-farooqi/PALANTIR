@@ -5,12 +5,12 @@ import { formatClock, formatRelative } from '../lib/format';
 import { statusTone } from '../lib/events';
 
 export const VIEWS = [
-  { key: 'fleet', label: 'hosts grid', hotkey: '1' },
-  { key: 'overview', label: 'overview', hotkey: '2' },
-  { key: 'inventory', label: 'inventory', hotkey: '3' },
-  { key: 'events', label: 'events', hotkey: '4' },
-  { key: 'logs', label: 'logs', hotkey: '5' },
-  { key: 'investigations', label: 'investigations', hotkey: '6' },
+  { key: 'fleet', label: 'hosts grid' },
+  { key: 'overview', label: 'overview' },
+  { key: 'inventory', label: 'inventory' },
+  { key: 'events', label: 'events' },
+  { key: 'logs', label: 'logs' },
+  { key: 'investigations', label: 'investigations' },
 ];
 
 export const REFRESH_OPTIONS = [
@@ -52,7 +52,7 @@ function pipelineTitle(ops, summary) {
   return lines.join('\n') || 'no health data';
 }
 
-export function TopBar({ view, setView, fleet, refreshMs, setRefreshMs, refreshing, onRefresh }) {
+export function TopBar({ view, setView, onToggleSettings, fleet, refreshMs, setRefreshMs, refreshing, onRefresh }) {
   return (
     <header className="topbar flex-col-topbar">
       <div className="topbar-main-row">
@@ -67,8 +67,11 @@ export function TopBar({ view, setView, fleet, refreshMs, setRefreshMs, refreshi
           
           <button
             className={`user-menu-btn ${view === 'settings' ? 'admin-active' : ''}`}
-            onClick={() => setView(view === 'settings' ? 'fleet' : 'settings')}
-            title="Open System Settings"
+            onClick={() => {
+              if (onToggleSettings) onToggleSettings();
+              else setView(view === 'settings' ? 'fleet' : 'settings');
+            }}
+            title={view === 'settings' ? 'Close Settings (Return to Previous Screen)' : 'Open System Settings'}
           >
             <svg className="menu-icon-svg" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
               <circle cx="12" cy="12" r="3"/>
@@ -92,7 +95,7 @@ export function NodeBar({ nodes, selectedId, onSelect, onAdd, onRemove, onViewGr
       <span className="tone-dim">active node:</span>
       {nodes.length === 0 && <span className="tone-dim">none registered yet</span>}
       {nodes.map((n) => (
-        <button key={n.id} className={`nodetab ${n.id === selectedId && currentView !== 'fleet' ? 'on' : ''}`} onClick={() => onSelect(n.id)} title={`${n.netdata_url}${n.collector_url ? `\ncollector ${n.collector_url}` : ''}\nlast contact ${formatRelative(n.last_seen_at)}`}>
+        <button key={n.id} className={`nodetab ${n.id === selectedId && currentView !== 'fleet' ? 'on' : ''}`} onClick={() => onSelect(n.id)} title={`${n.collector_url || ''}\nlast contact ${formatRelative(n.last_seen_at)}`}>
           <Dot tone={statusTone(n.reachability)} />
           {n.hostname}
         </button>

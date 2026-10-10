@@ -204,8 +204,6 @@ services:
 volumes:
   postgres_data:
   redis_data:
-  netdata_lib:
-  netdata_cache:
   authentik_postgres_data:
   authentik_media:
   authentik_templates:

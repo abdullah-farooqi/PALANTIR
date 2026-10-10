@@ -127,6 +127,9 @@ export const api = {
   getFleetSummary: () => request('/fleet/summary'),
   getOpsHealth: () => request('/health/operations'),
   getMetricSchema: () => request('/metrics/schema'),
+  // ---- system settings -------------------------------------------------------
+  getThresholds: () => request('/settings/thresholds'),
+  updateThreshold: (id, data) => request(`/settings/thresholds/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
   // Process liveness probe (not under /api/v1, not authenticated).
   healthz: () => request('/healthz', {}, { base: '' }),
 };

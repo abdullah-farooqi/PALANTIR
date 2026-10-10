@@ -10,7 +10,7 @@ class MonitoredNode(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     hostname = Column(String, nullable=False, unique=True)
-    netdata_url = Column(String, nullable=False)
+    netdata_url = Column(String, nullable=True)
     collector_url = Column(String, nullable=True)
     capabilities = Column(JSONB, nullable=True)
     os_type = Column(String, nullable=False, default="linux")

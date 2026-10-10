@@ -6,8 +6,8 @@
 CREATE TABLE IF NOT EXISTS monitored_nodes (
     id              SERIAL PRIMARY KEY,
     hostname        TEXT        NOT NULL UNIQUE,
-    netdata_url     TEXT        NOT NULL,       -- http://<ip>:19999
-    collector_url   TEXT,                       -- optional PALANTIR host collector endpoint
+    collector_url   TEXT        NOT NULL,
+    netdata_url     TEXT,
     capabilities    JSONB,
     os_type         TEXT        NOT NULL DEFAULT 'linux',
     active          BOOLEAN     NOT NULL DEFAULT TRUE,
@@ -351,6 +351,27 @@ CREATE INDEX IF NOT EXISTS idx_investigations_status
 -- ─────────────────────────────────────────────────────────────────────
 -- Default Seed: Local Netdata Sensor Node (Auto-Registered)
 -- ─────────────────────────────────────────────────────────────────────
-INSERT INTO monitored_nodes (hostname, netdata_url, os_type, active)
-VALUES ('local-node', 'http://netdata:19999', 'linux', TRUE)
+INSERT INTO monitored_nodes (hostname, collector_url, os_type, active)
+VALUES ('local-node', 'http://127.0.0.1:20000', 'linux', TRUE)
 ON CONFLICT (hostname) DO NOTHING;
+
+-- Dynamic threshold settings for collector native alert evaluation
+CREATE TABLE IF NOT EXISTS system_alert_thresholds (
+    id VARCHAR(64) PRIMARY KEY,
+    name VARCHAR(128) NOT NULL,
+    chart VARCHAR(64) NOT NULL,
+    metric_key VARCHAR(64) NOT NULL,
+    units VARCHAR(32) NOT NULL,
+    warning_val FLOAT NOT NULL,
+    critical_val FLOAT NOT NULL,
+    description TEXT,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+INSERT INTO system_alert_thresholds (id, name, chart, metric_key, units, warning_val, critical_val, description)
+VALUES 
+  ('cpu', 'high_cpu_utilization', 'system.cpu', 'cpu_pct', '%', 5.0, 80.0, 'Host CPU utilization threshold'),
+  ('ram', 'ram_in_use', 'system.ram', 'ram_pct', '%', 50.0, 85.0, 'Host memory utilization threshold'),
+  ('disk', 'root_disk_space', 'system.disk', 'root_used_pct', '%', 80.0, 90.0, 'Root disk partition used percentage')
+ON CONFLICT (id) DO NOTHING;
+

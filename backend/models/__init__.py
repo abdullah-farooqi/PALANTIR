@@ -7,6 +7,7 @@ from .investigation import AgentInvestigation
 from .log_event import LogEvent
 from .category_status import CategoryCollectionStatus
 from .service_heartbeat import ServiceHeartbeat
+from .threshold import SystemAlertThreshold
 
 __all__ = [
     "Base",
@@ -18,4 +19,5 @@ __all__ = [
     "LogEvent",
     "CategoryCollectionStatus",
     "ServiceHeartbeat",
+    "SystemAlertThreshold",
 ]

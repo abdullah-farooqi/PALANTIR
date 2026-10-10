@@ -49,7 +49,7 @@ def verify_webhook_secret(secret_header: Optional[str]) -> bool:
 
 def validate_netdata_url(url: str) -> str:
     """
-    Strict SSRF and URI validation for Netdata sensor endpoints.
+    Strict SSRF and URI validation for remote sensor and collector endpoints.
 
     Protections:
     - Enforces http or https scheme (blocks file://, gopher://, dict://, etc.).

@@ -48,10 +48,32 @@ function Dashboard() {
   const [showAdd, setShowAdd] = useState(false);
   const [toast, setToast] = useState(null);
   const toastTimer = useRef(null);
+  const [prevView, setPrevView] = useState('fleet');
 
   const setRange = useCallback((r) => { setRangeState(r); write('palantir.range', r.key); }, []);
   const setRefreshMs = useCallback((v) => { setRefreshMsState(v); write('palantir.refresh', v); }, []);
-  const changeView = useCallback((v) => { setView(v); write('palantir.view', v); }, []);
+  const changeView = useCallback((v) => {
+    setView((current) => {
+      if (current !== 'settings' && v === 'settings') {
+        setPrevView(current);
+      }
+      return v;
+    });
+    write('palantir.view', v);
+  }, []);
+  const goBack = useCallback(() => {
+    changeView('fleet');
+  }, [changeView]);
+  const goBackFromSettings = useCallback(() => {
+    changeView(prevView || 'fleet');
+  }, [changeView, prevView]);
+  const toggleSettings = useCallback(() => {
+    if (view === 'settings') {
+      changeView(prevView || 'fleet');
+    } else {
+      changeView('settings');
+    }
+  }, [view, changeView, prevView]);
   const notify = useCallback((text, error = false) => {
     setToast({ text, error });
     clearTimeout(toastTimer.current);
@@ -122,8 +144,7 @@ function Dashboard() {
       }
       if (showAdd) return;
       const idx = nodes.findIndex((n) => n.id === selectedId);
-      if (e.key >= '1' && e.key <= String(VIEWS.length)) changeView(VIEWS[Number(e.key) - 1].key);
-      else if (e.key === '[' && nodes.length) setSelectedId(nodes[(idx - 1 + nodes.length) % nodes.length].id);
+      if (e.key === '[' && nodes.length) setSelectedId(nodes[(idx - 1 + nodes.length) % nodes.length].id);
       else if (e.key === ']' && nodes.length) setSelectedId(nodes[(idx + 1) % nodes.length].id);
       else if (e.key === 'r') refreshAll();
       else if (e.key === 't') setRange(RANGES[(RANGES.findIndex((r) => r.key === range.key) + 1) % RANGES.length]);
@@ -176,19 +197,19 @@ function Dashboard() {
       />
     );
   } else if (view === 'settings') {
-    body = <SettingsTab node={node} data={nodeData.data} refreshMs={refreshMs} setRefreshMs={setRefreshMs} onRefresh={refreshAll} refreshing={fleet.refreshing || nodeData.refreshing} onBack={() => changeView('fleet')} />;
+    body = <SettingsTab node={node} data={nodeData.data} fleet={fleet} refreshMs={refreshMs} setRefreshMs={setRefreshMs} onRefresh={refreshAll} refreshing={fleet.refreshing || nodeData.refreshing} onBack={goBackFromSettings} onToast={notify} />;
   } else if (!node) {
     body = <Empty>Select a node.</Empty>;
   } else if (view === 'overview') {
-    body = <OverviewTab node={node} state={nodeData} range={range} setRange={setRange} onBack={() => changeView('fleet')} />;
+    body = <OverviewTab node={node} state={nodeData} range={range} setRange={setRange} onBack={goBack} onChangeView={changeView} />;
   } else if (view === 'inventory') {
-    body = <InventoryTab node={node} state={nodeData} section={section} setSection={setSection} />;
+    body = <InventoryTab node={node} state={nodeData} section={section} setSection={setSection} onBack={goBack} onChangeView={changeView} />;
   } else if (view === 'events') {
-    body = <AlertsTab node={node} state={nodeData} scope={scope} setScope={setScope} onInvestigate={onInvestigate} refreshMs={refreshMs} />;
+    body = <AlertsTab node={node} state={nodeData} scope={scope} setScope={setScope} onInvestigate={onInvestigate} refreshMs={refreshMs} onBack={goBack} onChangeView={changeView} />;
   } else if (view === 'logs') {
-    body = <LogsTab node={node} scope={scope} setScope={setScope} refreshMs={refreshMs} />;
+    body = <LogsTab node={node} scope={scope} setScope={setScope} refreshMs={refreshMs} onBack={goBack} onChangeView={changeView} />;
   } else {
-    body = <InvestigationsTab node={node} scope={scope} setScope={setScope} refreshMs={refreshMs} focusId={focusInv} onToast={notify} />;
+    body = <InvestigationsTab node={node} scope={scope} setScope={setScope} refreshMs={refreshMs} focusId={focusInv} onToast={notify} onBack={goBack} onChangeView={changeView} />;
   }
 
   return (
@@ -196,6 +217,7 @@ function Dashboard() {
       <TopBar
         view={view}
         setView={changeView}
+        onToggleSettings={toggleSettings}
         fleet={fleet}
         refreshMs={refreshMs}
         setRefreshMs={setRefreshMs}

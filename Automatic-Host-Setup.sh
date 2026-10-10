@@ -31,14 +31,13 @@ if ! command -v docker &> /dev/null; then
   exit 1
 fi
 
-# 3. Stop & Clean any existing telemetry/collector containers first
+# 3. Stop & Clean any existing collector containers first
 echo -e "${CYAN}Cleaning any existing PALANTIR host containers...${NC}"
-docker rm -f palantir-netdata palantir-collector netdata 2>/dev/null || true
-docker ps -q --filter "publish=19999" | xargs -r docker rm -f 2>/dev/null || true
+docker rm -f palantir-collector 2>/dev/null || true
 docker ps -q --filter "publish=20000" | xargs -r docker rm -f 2>/dev/null || true
 sleep 1
 
-# 4. Check and Handle Occupied Ports (19999 and 20000)
+# 4. Check and Handle Occupied Port (20000)
 check_port() {
   local port=$1
   local name=$2
@@ -68,31 +67,27 @@ check_port() {
   fi
 }
 
-check_port 19999 "Palantir Telemetry Sensor"
 check_port 20000 "Palantir Hardware Collector"
 
 # 5. Handle Firewall (UFW / iptables)
 if command -v ufw &> /dev/null; then
   if ufw status | grep -q "Status: active"; then
-    echo -e "${YELLOW}UFW Firewall detected. Opening ports 19999 & 20000...${NC}"
-    ufw allow 19999/tcp >/dev/null
+    echo -e "${YELLOW}UFW Firewall detected. Opening port 20000...${NC}"
     ufw allow 20000/tcp >/dev/null
-    echo -e "${GREEN}✓ Firewall ports 19999 & 20000 opened.${NC}"
+    echo -e "${GREEN}✓ Firewall port 20000 opened.${NC}"
   fi
 fi
 
-# 6. Deploy Palantir Telemetry Sensor (Port 19999)
-echo -e "${CYAN}Deploying Palantir Telemetry Sensor (Port 19999)...${NC}"
-docker run -d \
-  --name palantir-netdata \
-  -p 0.0.0.0:19999:19999 \
-  --pid=host \
-  -v /proc:/host/proc:ro \
-  -v /sys:/host/sys:ro \
-  -v /etc:/host/etc:ro \
-  -v /etc/os-release:/host/etc/os-release:ro \
-  --restart unless-stopped \
-  abdullahahmadfarooqi/palantir-netdata:latest >/dev/null
+# 6. Check and Pull Latest Palantir Host Collector Image
+COLLECTOR_IMAGE="abdullahahmadfarooqi/palantir-host-collector:latest"
+echo -e "${CYAN}Checking for collector image updates (${COLLECTOR_IMAGE})...${NC}"
+
+PULL_OUTPUT=$(docker pull "${COLLECTOR_IMAGE}" 2>&1)
+if echo "$PULL_OUTPUT" | grep -iq "Status: Image is up to date"; then
+  echo -e "${GREEN}✓ Image is already up to date. Using existing local image.${NC}"
+else
+  echo -e "${GREEN}✓ Downloaded updated image layers for ${COLLECTOR_IMAGE}.${NC}"
+fi
 
 # 7. Deploy Palantir Host Hardware Collector (Port 20000)
 echo -e "${CYAN}Deploying Palantir Hardware Collector (Port 20000)...${NC}"
@@ -106,7 +101,7 @@ docker run -d \
   -v /etc/os-release:/host/etc/os-release:ro \
   -v /var/run/docker.sock:/var/run/docker.sock:ro \
   --restart unless-stopped \
-  abdullahahmadfarooqi/palantir-host-collector:latest >/dev/null
+  "${COLLECTOR_IMAGE}" >/dev/null
 
 # 8. Determine Host IP (Detecting Ethernet / Wi-Fi)
 GET_IP() {
