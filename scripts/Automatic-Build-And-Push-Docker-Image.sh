@@ -65,17 +65,13 @@ echo ""
 echo ">>> Building palantir-backend..."
 docker build -t palantir-backend:"$TAG" -t palantir-backend:latest ./backend
 
-# 2. Build Netdata Sensor Image
-echo ""
-echo ">>> Building palantir-netdata..."
-docker build -t palantir-netdata:"$TAG" -t palantir-netdata:latest ./services/netdata
-
+# 2. Build Palantir Host Collector Image
 echo ""
 echo ">>> Building palantir-host-collector..."
 docker build -t palantir-host-collector:"$TAG" -t palantir-host-collector:latest ./agent
 
 echo ""
-echo "✓ Local build complete for palantir-backend, palantir-netdata and palantir-host-collector."
+echo "✓ Local build complete for palantir-backend and palantir-host-collector."
 
 if [ "$BUILD_ONLY" = true ]; then
   echo "Build-only flag specified. Skipping registry pushes."
@@ -88,8 +84,6 @@ if [ -n "$HUB_USER" ]; then
   echo ">>> Tagging and pushing to Docker Hub ($HUB_USER)..."
   docker tag palantir-backend:"$TAG" "$HUB_USER"/palantir-backend:"$TAG"
   docker tag palantir-backend:latest "$HUB_USER"/palantir-backend:latest
-  docker tag palantir-netdata:"$TAG" "$HUB_USER"/palantir-netdata:"$TAG"
-  docker tag palantir-netdata:latest "$HUB_USER"/palantir-netdata:latest
   docker tag palantir-host-collector:"$TAG" "$HUB_USER"/palantir-host-collector:"$TAG"
   docker tag palantir-host-collector:latest "$HUB_USER"/palantir-host-collector:latest
 
@@ -97,9 +91,6 @@ if [ -n "$HUB_USER" ]; then
   docker push "$HUB_USER"/palantir-backend:"$TAG"
   docker push "$HUB_USER"/palantir-backend:latest
 
-  echo "Pushing $HUB_USER/palantir-netdata:$TAG..."
-  docker push "$HUB_USER"/palantir-netdata:"$TAG"
-  docker push "$HUB_USER"/palantir-netdata:latest
   echo "Pushing $HUB_USER/palantir-host-collector:$TAG..."
   docker push "$HUB_USER"/palantir-host-collector:"$TAG"
   docker push "$HUB_USER"/palantir-host-collector:latest
@@ -114,8 +105,6 @@ if [ -n "$GHCR_USER" ]; then
 
   docker tag palantir-backend:"$TAG" "$GHCR_PREFIX"/palantir-backend:"$TAG"
   docker tag palantir-backend:latest "$GHCR_PREFIX"/palantir-backend:latest
-  docker tag palantir-netdata:"$TAG" "$GHCR_PREFIX"/palantir-netdata:"$TAG"
-  docker tag palantir-netdata:latest "$GHCR_PREFIX"/palantir-netdata:latest
   docker tag palantir-host-collector:"$TAG" "$GHCR_PREFIX"/palantir-host-collector:"$TAG"
   docker tag palantir-host-collector:latest "$GHCR_PREFIX"/palantir-host-collector:latest
 
@@ -123,9 +112,6 @@ if [ -n "$GHCR_USER" ]; then
   docker push "$GHCR_PREFIX"/palantir-backend:"$TAG"
   docker push "$GHCR_PREFIX"/palantir-backend:latest
 
-  echo "Pushing $GHCR_PREFIX/palantir-netdata:$TAG..."
-  docker push "$GHCR_PREFIX"/palantir-netdata:"$TAG"
-  docker push "$GHCR_PREFIX"/palantir-netdata:latest
   echo "Pushing $GHCR_PREFIX/palantir-host-collector:$TAG..."
   docker push "$GHCR_PREFIX"/palantir-host-collector:"$TAG"
   docker push "$GHCR_PREFIX"/palantir-host-collector:latest

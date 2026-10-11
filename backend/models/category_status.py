@@ -40,7 +40,7 @@ class CategoryCollectionStatus(Base):
             name="ck_node_category_status_category",
         ),
         CheckConstraint(
-            "source IN ('netdata','palantir-agent')",
+            "source IN ('palantir-agent')",
             name="ck_node_category_status_source",
         ),
         CheckConstraint(

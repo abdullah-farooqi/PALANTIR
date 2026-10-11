@@ -9,6 +9,7 @@ import os
 import platform
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import time
@@ -33,8 +34,34 @@ AGENT_TOKEN = os.getenv("PALANTIR_AGENT_TOKEN", "")
 LOG_MIN_PRIORITY = int(os.getenv("LOG_MIN_PRIORITY", "7"))
 LOG_LIMIT_MAX = int(os.getenv("LOG_LIMIT_MAX", "5000"))
 APP_LOG_GLOBS = [item for item in os.getenv("APP_LOG_GLOBS", "/host/var/log/**/*.log").split(",") if item]
-DOCKER_SOCKET = Path(os.getenv("DOCKER_SOCKET", "/host/run/docker.sock"))
-LXD_SOCKET = Path(os.getenv("LXD_SOCKET", "/host/var/lib/lxd/unix.socket"))
+def _first_socket(candidates: list[str], default: str) -> Path:
+    """First candidate that is a live unix socket (blank candidates are skipped), else `default`."""
+    for candidate in candidates:
+        if candidate:
+            path = Path(candidate)
+            try:
+                if path.exists() and path.is_socket():
+                    return path
+            except OSError:
+                continue
+    return Path(default)
+
+
+# Docker and Podman (Podman exposes a Docker-compatible API), LXD / Incus, libvirt: first live socket wins.
+DOCKER_SOCKET = _first_socket([
+    os.getenv("DOCKER_SOCKET", ""), "/host/run/docker.sock", "/host/var/run/docker.sock", "/var/run/docker.sock",
+    "/run/docker.sock", "/host/run/podman/podman.sock", "/run/podman/podman.sock",
+], "/host/run/docker.sock")
+LXD_SOCKET = _first_socket([
+    os.getenv("LXD_SOCKET", ""), "/host/var/lib/lxd/unix.socket", "/host/var/snap/lxd/common/lxd/unix.socket",
+    "/host/run/lxd/unix.socket", "/host/var/lib/incus/unix.socket", "/host/run/incus/unix.socket",
+], "/host/var/lib/lxd/unix.socket")
+LIBVIRT_SOCKET = _first_socket([
+    os.getenv("LIBVIRT_SOCKET", ""), "/host/run/libvirt/libvirt-sock", "/host/run/libvirt/virtqemud-sock",
+    "/run/libvirt/libvirt-sock", "/run/libvirt/virtqemud-sock",
+], "/host/run/libvirt/libvirt-sock")
+ALLOW_ANONYMOUS_KILL = os.getenv("PALANTIR_ALLOW_ANON_KILL", "") == "1"
+PROXMOX_INSECURE_TLS = os.getenv("PROXMOX_INSECURE_TLS", "") == "1"  # Proxmox ships a self-signed certificate
 KUBERNETES_API_URL = os.getenv("KUBERNETES_API_URL", "").rstrip("/")
 KUBERNETES_TOKEN = os.getenv("KUBERNETES_TOKEN", "")
 KUBERNETES_CA_CERT = os.getenv("KUBERNETES_CA_CERT", "")
@@ -524,6 +551,123 @@ def _read_os_release() -> dict[str, str]:
     return {}
 
 
+def _read_first_line(path: Path, limit: int = 512) -> str | None:
+    text = _read_text(path, limit).strip()
+    return text.splitlines()[0].strip() if text else None
+
+
+def _host_hostname() -> str:
+    """The HOST's name.  Inside a container socket.gethostname() is the container id, so prefer /etc/hostname."""
+    for path in (HOST_ROOT / "etc/hostname", Path("/etc/hostname")):
+        name = _read_first_line(path, 256)
+        if name:
+            return name
+    return socket.gethostname()
+
+
+def _host_machine_id() -> str:
+    """Unique persistent machine ID for this OS / VM / bare-metal host."""
+    for path in (
+        HOST_ROOT / "etc/machine-id",
+        Path("/etc/machine-id"),
+        HOST_ROOT / "var/lib/dbus/machine-id",
+        Path("/var/lib/dbus/machine-id"),
+    ):
+        val = _read_first_line(path, 128)
+        if val and len(val) >= 16:
+            return val.strip().lower()
+
+    dmi_uuid = _read_first_line(HOST_SYS / "class/dmi/id/product_uuid", 128)
+    if dmi_uuid and len(dmi_uuid) >= 16:
+        return dmi_uuid.strip().lower()
+
+    # Fallback to persistent primary interface MAC address
+    try:
+        import uuid
+        mac = uuid.getnode()
+        if (mac >> 40) % 2 == 0:  # Valid non-random MAC
+            return f"mac-{mac:012x}"
+    except Exception:
+        pass
+
+    return f"host-{_host_hostname()}"
+
+
+
+_VIRT_MARKERS = (
+    ("kvm", "KVM"), ("qemu", "QEMU/KVM"), ("vmware", "VMware"), ("virtualbox", "VirtualBox"), ("innotek", "VirtualBox"),
+    ("xen", "Xen"), ("hyper-v", "Hyper-V"), ("virtual machine", "Hyper-V"), ("amazon ec2", "AWS EC2 (Nitro/KVM)"),
+    ("google compute", "Google Compute Engine"), ("digitalocean", "DigitalOcean"), ("openstack", "OpenStack"),
+    ("parallels", "Parallels"), ("bochs", "Bochs"), ("bhyve", "bhyve"), ("proxmox", "Proxmox/KVM"),
+)
+
+
+def _virtualization() -> dict[str, Any]:
+    """Is this machine itself a virtual machine (and on what)?  is_virtual is None when it cannot be told."""
+    cpuinfo = _read_text(HOST_PROC / "cpuinfo", 1_000_000)
+    flags_line = next((line for line in cpuinfo.splitlines() if line.lower().startswith(("flags", "features"))), "")
+    dmi = HOST_SYS / "class/dmi/id"
+    vendor = _read_first_line(dmi / "sys_vendor")
+    product = _read_first_line(dmi / "product_name")
+    haystack = f"{vendor or ''} {product or ''}".lower()
+    hypervisor = next((label for marker, label in _VIRT_MARKERS if marker in haystack), None)
+    flagged = " hypervisor" in f" {flags_line}"
+    if flagged or hypervisor:
+        return {"is_virtual": True, "hypervisor": hypervisor, "vendor": vendor, "product": product}
+    if cpuinfo:
+        return {"is_virtual": False, "hypervisor": None, "vendor": vendor, "product": product}
+    return {"is_virtual": None, "hypervisor": None, "vendor": vendor, "product": product}
+
+
+def _temperatures() -> list[dict[str, Any]]:
+    readings: list[dict[str, Any]] = []
+    base = HOST_SYS / "class/hwmon"
+    try:
+        chips = sorted(base.iterdir())
+    except OSError:
+        return readings
+    for chip in chips:
+        chip_name = _read_first_line(chip / "name") or chip.name
+        try:
+            inputs = sorted(item for item in chip.iterdir() if re.fullmatch(r"temp\d+_input", item.name))
+        except OSError:
+            continue
+        for item in inputs:
+            raw = _read_first_line(item, 32)
+            try:
+                celsius = int(raw) / 1000.0 if raw is not None else None
+            except ValueError:
+                celsius = None
+            if celsius is None or not -60.0 <= celsius <= 200.0:
+                continue  # unplugged / broken sensor
+            readings.append({"sensor": chip_name, "label": _read_first_line(chip / item.name.replace("_input", "_label")) or item.name.replace("_input", ""), "celsius": round(celsius, 1)})
+        if len(readings) >= 60:
+            break
+    return readings[:60]
+
+
+def _batteries() -> list[dict[str, Any]]:
+    batteries: list[dict[str, Any]] = []
+    try:
+        supplies = sorted((HOST_SYS / "class/power_supply").iterdir())
+    except OSError:
+        return batteries
+    for supply in supplies:
+        if _read_first_line(supply / "type") != "Battery":
+            continue
+        capacity = _read_first_line(supply / "capacity", 16)
+        batteries.append({"name": supply.name, "percent": int(capacity) if capacity and capacity.isdigit() else None, "status": _read_first_line(supply / "status", 32)})
+    return batteries
+
+
+def _uptime_seconds() -> float | None:
+    first = _read_first_line(HOST_PROC / "uptime", 128)
+    try:
+        return round(float(first.split()[0]), 1) if first else None
+    except (ValueError, IndexError):
+        return None
+
+
 def collect_system() -> dict[str, Any]:
     mem = psutil.virtual_memory()
     swap = psutil.swap_memory()
@@ -578,6 +722,13 @@ def collect_system() -> dict[str, Any]:
             "percent": swap.percent if swap.total else None,  # no swap configured -> no percentage
         },
         "load_average": _read_loadavg(),
+        "hostname": _host_hostname(),
+        "kernel": _read_first_line(HOST_PROC / "sys/kernel/osrelease", 128),
+        "architecture": platform.machine(),
+        "uptime_seconds": _uptime_seconds(),
+        "virtualization": _virtualization(),
+        "temperatures": _temperatures(),
+        "batteries": _batteries(),
         "vmstat": vmstat,
         "os_release": _read_os_release(),
     }
@@ -622,6 +773,28 @@ def _host_mounts() -> list[dict[str, str]]:
         return []
 
 
+def _block_devices() -> list[dict[str, Any]]:
+    devices: list[dict[str, Any]] = []
+    try:
+        entries = sorted((HOST_SYS / "block").iterdir())
+    except OSError:
+        return devices
+    for entry in entries:
+        if re.match(r"^(loop|ram|zram|fd|sr)\d*", entry.name):
+            continue
+        sectors = _read_first_line(entry / "size", 32)
+        rotational = _read_first_line(entry / "queue/rotational", 4)
+        devices.append({
+            "name": entry.name,
+            "size_bytes": int(sectors) * 512 if sectors and sectors.isdigit() else None,
+            "rotational": (rotational == "1") if rotational in {"0", "1"} else None,
+            "removable": _read_first_line(entry / "removable", 4) == "1",
+            "model": _read_first_line(entry / "device/model", 128),
+            "kind": "nvme" if entry.name.startswith("nvme") else "virtual" if entry.name.startswith(("vd", "xvd")) else "disk",
+        })
+    return devices
+
+
 def collect_storage() -> dict[str, Any]:
     filesystems: list[dict[str, Any]] = []
     seen_devices: set[str] = set()
@@ -660,6 +833,7 @@ def collect_storage() -> dict[str, Any]:
     return _status_data({
         "filesystems": filesystems,
         "disk_io": _disk_io(),
+        "block_devices": _block_devices(),
         "raid": {"detected": bool(raid_arrays), "arrays": raid_arrays, "mdstat_raw": mdstat},
     }, "available" if filesystems else "partial")
 
@@ -704,6 +878,43 @@ def _parse_proc_net_dev() -> dict[str, dict[str, int]]:
     return interfaces
 
 
+def _interface_details() -> dict[str, dict[str, Any]]:
+    """Link state, speed, MTU, MAC, wired/wireless/virtual kind and IP addresses per interface."""
+    details: dict[str, dict[str, Any]] = {}
+    base = HOST_SYS / "class/net"
+    try:
+        names = sorted(item.name for item in base.iterdir())
+    except OSError:
+        return details
+    try:
+        addresses = psutil.net_if_addrs()
+    except (OSError, RuntimeError):
+        addresses = {}
+    for name in names:
+        link = base / name
+        speed = _read_first_line(link / "speed", 16)
+        mtu = _read_first_line(link / "mtu", 16)
+        real = os.path.realpath(link)
+        if name == "lo":
+            kind = "loopback"
+        elif (link / "wireless").exists() or (link / "phy80211").exists():
+            kind = "wireless"
+        elif "/devices/virtual/" in real:
+            kind = "virtual"
+        else:
+            kind = "ethernet"
+        details[name] = {
+            "state": _read_first_line(link / "operstate", 32),
+            "speed_mbps": int(speed) if speed and speed.lstrip("-").isdigit() and int(speed) > 0 else None,
+            "mtu": int(mtu) if mtu and mtu.isdigit() else None,
+            "mac": _read_first_line(link / "address", 32),
+            "kind": kind,
+            "addresses": [{"family": "ipv6" if item.family == socket.AF_INET6 else "ipv4", "address": item.address.split("%")[0], "netmask": item.netmask}
+                          for item in addresses.get(name, []) if item.family in (socket.AF_INET, socket.AF_INET6)],
+        }
+    return details
+
+
 def collect_network() -> dict[str, Any]:
     interfaces = _parse_proc_net_dev()
     if not interfaces:
@@ -722,8 +933,10 @@ def collect_network() -> dict[str, Any]:
         except (OSError, RuntimeError):
             pass
     rates = _RATE_SAMPLER.network_rates()
+    details = _interface_details()
     for name, counters in interfaces.items():
         counters.update(rates.get(name, {}))  # rx/tx_bytes_per_sec, rx/tx_packets_per_sec when measured
+        counters.update(details.get(name, {}))
     protocols = {}
     pending_headers: dict[str, list[str]] = {}
     for line in _host_net_file("snmp").splitlines():
@@ -854,23 +1067,29 @@ def _decode_socket_address(value: str, ipv6: bool) -> tuple[str, int] | None:
 def _socket_inode_owners(wanted: set[str]) -> dict[str, int]:
     """Map socket inode -> pid with ONE pass over /proc/<pid>/fd."""
     owners: dict[str, int] = {}
-    try:
-        entries = [entry for entry in os.scandir(HOST_PROC) if entry.name.isdigit()]
-    except OSError:
+    if not wanted:
         return owners
-    for entry in entries:
-        if len(owners) >= len(wanted):
-            break
+    proc_dirs = [HOST_PROC]
+    if HOST_PROC != Path("/proc") and Path("/proc").exists():
+        proc_dirs.append(Path("/proc"))
+    for proc_dir in proc_dirs:
         try:
-            for fd in os.scandir(f"{entry.path}/fd"):
-                try:
-                    target = os.readlink(fd.path)
-                except OSError:
-                    continue
-                if target.startswith("socket:[") and target[8:-1] in wanted:
-                    owners.setdefault(target[8:-1], int(entry.name))
-        except (OSError, PermissionError):
+            entries = [entry for entry in os.scandir(proc_dir) if entry.name.isdigit()]
+        except OSError:
             continue
+        for entry in entries:
+            if len(owners) >= len(wanted):
+                return owners
+            try:
+                for fd in os.scandir(f"{entry.path}/fd"):
+                    try:
+                        target = os.readlink(fd.path)
+                    except OSError:
+                        continue
+                    if target.startswith("socket:[") and target[8:-1] in wanted:
+                        owners.setdefault(target[8:-1], int(entry.name))
+            except (OSError, PermissionError):
+                continue
     return owners
 
 
@@ -906,6 +1125,10 @@ def collect_connections() -> dict[str, Any]:
             return None
         if pid not in names:
             text = _read_text(HOST_PROC / str(pid) / "comm", 256).strip()
+            if not text:
+                cmd = _read_text(HOST_PROC / str(pid) / "cmdline", 512).replace("\x00", " ").strip()
+                if cmd:
+                    text = Path(cmd.split()[0]).name
             names[pid] = text or None
         return names[pid]
 
@@ -995,51 +1218,85 @@ def collect_services() -> dict[str, Any]:
     return _status_data({"manager": "systemd", "services": services}, status)
 
 
-def _docker_request(path: str) -> Any:
-    if not DOCKER_SOCKET.exists() or not DOCKER_SOCKET.is_socket():
-        raise FileNotFoundError("Docker socket not mounted")
+_MAX_API_BYTES = 50_000_000
+
+
+def _unix_request(socket_path: Path, request_path: str, timeout: float = 5.0, method: str = "GET") -> tuple[int, bytes]:
     import http.client
 
     class UnixConnection(http.client.HTTPConnection):
         def connect(self) -> None:
             self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            self.sock.settimeout(3)
-            self.sock.connect(str(DOCKER_SOCKET))
+            self.sock.settimeout(timeout)
+            self.sock.connect(str(socket_path))
 
-    conn = UnixConnection("localhost", timeout=3)
-    conn.request("GET", path, headers={"Host": "localhost"})
-    response = conn.getresponse()
-    body = response.read(2_000_000)
-    conn.close()
-    if response.status != 200:
-        raise OSError(f"Docker API returned HTTP {response.status}")
+    connection = UnixConnection("localhost", timeout=timeout)
+    try:
+        connection.request(method, request_path, headers={"Host": "localhost"})
+        response = connection.getresponse()
+        return response.status, response.read(_MAX_API_BYTES)
+    finally:
+        connection.close()
+
+
+def _docker_request(path: str, timeout: float = 5.0) -> Any:
+    if not DOCKER_SOCKET.exists() or not DOCKER_SOCKET.is_socket():
+        raise FileNotFoundError("Docker/Podman socket not mounted")
+    status, body = _unix_request(DOCKER_SOCKET, path, timeout)
+    if status != 200:
+        raise OSError(f"Docker API returned HTTP {status}")
     return json.loads(body)
 
 
 def _container_stats(container_id: str) -> dict[str, Any]:
     try:
-        stats = _docker_request(f"/containers/{container_id}/stats?stream=false")
-        memory = stats.get("memory_stats", {})
-        cpu = stats.get("cpu_stats", {})
-        previous = stats.get("precpu_stats", {})
-        cpu_delta = cpu.get("cpu_usage", {}).get("total_usage", 0) - previous.get("cpu_usage", {}).get("total_usage", 0)
+        stats = _docker_request(f"/containers/{container_id}/stats?stream=false", timeout=15.0)
+        memory = stats.get("memory_stats") or {}
+        cpu = stats.get("cpu_stats") or {}
+        previous = stats.get("precpu_stats") or {}
+        cpu_delta = (cpu.get("cpu_usage") or {}).get("total_usage", 0) - (previous.get("cpu_usage") or {}).get("total_usage", 0)
         system_delta = cpu.get("system_cpu_usage", 0) - previous.get("system_cpu_usage", 0)
-        online = cpu.get("online_cpus") or len(cpu.get("cpu_usage", {}).get("percpu_usage", [])) or 1
-        cpu_pct = (cpu_delta / system_delta * online * 100) if system_delta > 0 else None
-        return {"memory_usage_bytes": memory.get("usage"), "memory_limit_bytes": memory.get("limit"), "cpu_percent": cpu_pct}
-    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        online = cpu.get("online_cpus") or len((cpu.get("cpu_usage") or {}).get("percpu_usage") or []) or 1
+        cpu_pct = (cpu_delta / system_delta * online * 100) if system_delta > 0 and cpu_delta >= 0 else None
+
+        usage = memory.get("usage")
+        mem_stats = memory.get("stats") or {}
+        # `docker stats` shows the working set: usage minus reclaimable page cache
+        cache = mem_stats.get("inactive_file", mem_stats.get("total_inactive_file", mem_stats.get("cache")))
+        working = usage - cache if isinstance(usage, (int, float)) and isinstance(cache, (int, float)) and usage >= cache else usage
+
+        networks = stats.get("networks") or {}
+        block = (stats.get("blkio_stats") or {}).get("io_service_bytes_recursive") or []
+        block_read = sum(item.get("value", 0) for item in block if str(item.get("op", "")).lower() == "read")
+        block_write = sum(item.get("value", 0) for item in block if str(item.get("op", "")).lower() == "write")
+        return {
+            "memory_usage_bytes": working,
+            "memory_raw_usage_bytes": usage,
+            "memory_limit_bytes": memory.get("limit"),
+            "cpu_percent": cpu_pct,
+            "net_rx_bytes": sum(item.get("rx_bytes", 0) for item in networks.values()) if networks else None,
+            "net_tx_bytes": sum(item.get("tx_bytes", 0) for item in networks.values()) if networks else None,
+            "block_read_bytes": block_read if block else None,
+            "block_write_bytes": block_write if block else None,
+            "pids": (stats.get("pids_stats") or {}).get("current"),
+        }
+    except (OSError, json.JSONDecodeError, TypeError, ValueError, AttributeError):
         return {}
 
 
 def collect_containers() -> dict[str, Any]:
     sources: dict[str, Any] = {}
     rows: list[dict[str, Any]] = []
-    docker_status = "unavailable"
+    docker_status = "not_configured"
+    docker_reason = "Docker/Podman socket not present"
     try:
-        containers = _docker_request("/containers/json?all=1")
-        docker_status = "available"
-    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        containers = _docker_request("/containers/json?all=1", timeout=10.0)
+        docker_status, docker_reason = "available", None
+    except FileNotFoundError:
         containers = []
+    except (OSError, json.JSONDecodeError) as exc:
+        containers = []
+        docker_status, docker_reason = "unavailable", str(exc)[:300]
     containers = containers[:500]
     active = [item for item in containers if item.get("State") == "running"][:100]
     with ThreadPoolExecutor(max_workers=16) as pool:
@@ -1052,15 +1309,17 @@ def collect_containers() -> dict[str, Any]:
         metrics = stats_by_id.get(cid, {})
         labels = container.get("Labels") or {}
         safe_labels = {key: "[REDACTED]" if SENSITIVE_KEY.search(key) else value for key, value in labels.items()}
-        rows.append({"runtime": "docker", "id": cid[:12], "name": (container.get("Names") or [""])[0].lstrip("/"), "image": container.get("Image"), "state": container.get("State"), "status": container.get("Status"), "labels": safe_labels, "metrics": metrics})
+        ports = [{"private": port.get("PrivatePort"), "public": port.get("PublicPort"), "type": port.get("Type"), "ip": port.get("IP")} for port in (container.get("Ports") or []) if isinstance(port, dict)]
+        rows.append({"runtime": "docker", "id": cid[:12], "name": (container.get("Names") or [""])[0].lstrip("/"), "image": container.get("Image"), "state": container.get("State"), "status": container.get("Status"), "created": container.get("Created"), "command": _redact_text(str(container.get("Command") or ""))[:300], "ports": ports, "labels": safe_labels, "metrics": metrics})
     sources["docker"] = {
         "status": docker_status,
+        "reason": docker_reason,
         "count": len(containers),
         "stats_count": len(active),
         "stats_truncated": len([item for item in containers if item.get("State") == "running"]) > len(active),
     }
 
-    lxd_path = LXD_SOCKET if LXD_SOCKET.exists() else Path("/host/run/lxd/unix.socket")
+    lxd_path = LXD_SOCKET
     if not lxd_path.exists():
         sources["lxd"] = {"status": "not_configured", "count": 0, "reason": "LXD socket not present"}
     else:
@@ -1073,13 +1332,50 @@ def collect_containers() -> dict[str, Any]:
         except (FileNotFoundError, OSError, json.JSONDecodeError) as exc:
             sources["lxd"] = {"status": "unavailable", "count": 0, "reason": str(exc)[:300]}
 
+    lxc_rows = _collect_legacy_lxc()
+    if lxc_rows is not None:
+        rows.extend(lxc_rows)
+        sources["lxc"] = {"status": "available", "count": len(lxc_rows)}
+
     kube = _collect_kubernetes()
     if kube["status"] == "available":
         rows.extend(kube["pods"])
     sources["kubernetes"] = {"status": kube["status"], "reason": kube.get("reason"), "count": len(kube.get("pods", []))}
     source_statuses = [item.get("status") for item in sources.values()]
-    status = "available" if "available" in source_statuses else "unavailable"
+    # "available" = at least one runtime answered (even with 0 containers); a runtime that is present
+    # but failing is "unavailable"; nothing present at all is "not_configured".
+    if "available" in source_statuses:
+        status = "available"
+    elif "unavailable" in source_statuses:
+        status = "unavailable"
+    else:
+        status = "not_configured"
     return _status_data({"containers": rows, "sources": sources}, status)
+
+
+def _running_lxc_names() -> set[str]:
+    names: set[str] = set()
+    try:
+        entries = [entry for entry in os.scandir(HOST_PROC) if entry.name.isdigit()]
+    except OSError:
+        return names
+    for entry in entries:
+        cmdline = _read_text(Path(entry.path) / "cmdline", 1024).replace("\x00", " ")
+        match = re.search(r"\[lxc monitor\]\s+\S+\s+(\S+)", cmdline)
+        if match:
+            names.add(match.group(1))
+    return names
+
+
+def _collect_legacy_lxc() -> list[dict[str, Any]] | None:
+    """Classic LXC / Proxmox-style containers defined under /var/lib/lxc (None when LXC is not used)."""
+    base = HOST_ROOT / "var/lib/lxc"
+    try:
+        names = sorted(item.name for item in base.iterdir() if (item / "config").is_file())
+    except OSError:
+        return None
+    running = _running_lxc_names()
+    return [{"runtime": "lxc", "id": name, "name": name, "image": None, "state": "running" if name in running else "stopped", "status": "running" if name in running else "stopped"} for name in names]
 
 
 def _collect_kubernetes() -> dict[str, Any]:
@@ -1116,21 +1412,9 @@ def _collect_kubernetes() -> dict[str, Any]:
 def _unix_http_get(path: Path, request_path: str) -> Any:
     if not path.exists() or not path.is_socket():
         raise FileNotFoundError(str(path))
-    import http.client
-
-    class UnixConnection(http.client.HTTPConnection):
-        def connect(self) -> None:
-            self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            self.sock.settimeout(3)
-            self.sock.connect(str(path))
-
-    connection = UnixConnection("localhost", timeout=3)
-    connection.request("GET", request_path)
-    response = connection.getresponse()
-    content = response.read(2_000_000)
-    connection.close()
-    if response.status != 200:
-        raise OSError(f"runtime API returned HTTP {response.status}")
+    status, content = _unix_request(path, request_path, 5.0)
+    if status != 200:
+        raise OSError(f"runtime API returned HTTP {status}")
     payload = json.loads(content)
     if isinstance(payload, dict) and payload.get("type") == "async":
         operation = payload.get("operation", "").rstrip("/")
@@ -1139,107 +1423,211 @@ def _unix_http_get(path: Path, request_path: str) -> Any:
     return payload
 
 
-def collect_vms() -> dict[str, Any]:
-    proxmox = _collect_proxmox()
-    virsh = shutil.which("virsh")
-    libvirt_socket = Path("/host/run/libvirt/libvirt-sock")
-    if not virsh or not libvirt_socket.exists():
-        if proxmox["status"] == "available":
-            return _status_data({"sources": {"proxmox": proxmox}, "vms": proxmox.get("vms", [])})
-        return _status_data({"runtime": "libvirt", "vms": [], "proxmox": proxmox, "reason": "libvirt client or host namespace unavailable"}, "unavailable")
+def _parse_kib_to_bytes(value: str | None) -> int | None:
+    """'8192000 KiB' -> bytes (virsh dominfo style)."""
+    if not value:
+        return None
+    parts = value.split()
     try:
-        uri = "qemu+unix:///system?socket=/host/run/libvirt/libvirt-sock"
-        result = subprocess.run([virsh, "--connect", uri, "list", "--all", "--name"], capture_output=True, text=True, timeout=5, check=False)
+        number = int(parts[0])
+    except (ValueError, IndexError):
+        return None
+    unit = parts[1].lower() if len(parts) > 1 else "kib"
+    if "gib" in unit or unit == "gb":
+        return number * 1024 ** 3
+    if "mib" in unit or unit == "mb":
+        return number * 1024 ** 2
+    if "kib" in unit or unit == "kb":
+        return number * 1024
+    return number
+
+
+def _qemu_size_to_bytes(value: str) -> int | None:
+    match = re.match(r"^(?:size=)?(\d+)([kKmMgGtT]?)", value.strip())
+    if not match:
+        return None
+    factor = {"": 1024 ** 2, "k": 1024, "m": 1024 ** 2, "g": 1024 ** 3, "t": 1024 ** 4}[match.group(2).lower()]
+    return int(match.group(1)) * factor  # a bare number is MiB for QEMU's -m
+
+
+def _qemu_processes() -> list[dict[str, Any]]:
+    """Running QEMU/KVM guests, read from the HOST process table.
+
+    Needs no socket or credentials, so it also finds Proxmox guests, hand-started QEMU and libvirt
+    guests when the management API is not reachable.
+    """
+    rates = _RATE_SAMPLER.process_rates()
+    cores = (len(_CPU_SAMPLER.current()["cores"]) if _CPU_SAMPLER.current() else 0) or psutil.cpu_count(logical=True) or 1
+    guests: list[dict[str, Any]] = []
+    for proc in psutil.process_iter(attrs=["pid", "name", "cmdline", "memory_info", "create_time"]):
+        info = proc.info
+        name = str(info.get("name") or "")
+        if not (name.startswith("qemu-system") or name in {"kvm", "qemu-kvm", "qemu"}):
+            continue
+        args = info.get("cmdline") or []
+        guest: dict[str, Any] = {"pid": info["pid"]}
+        for index, arg in enumerate(args[:-1]):
+            value = args[index + 1]
+            if arg == "-name":
+                first = value.split(",")[0]
+                guest["name"] = first[6:] if first.startswith("guest=") else first
+            elif arg == "-id" and value.isdigit():
+                guest["vmid"] = int(value)
+            elif arg == "-uuid":
+                guest["uuid"] = value
+            elif arg == "-smp":
+                count = re.match(r"^(?:cpus=)?(\d+)", value)
+                if count:
+                    guest["cpu_count"] = int(count.group(1))
+            elif arg == "-m":
+                guest["max_memory"] = _qemu_size_to_bytes(value.split(",")[0])
+        memory = info.get("memory_info")
+        measured = rates.get(info["pid"])
+        core_pct = measured[1] if measured and info.get("create_time") is not None and abs(float(info["create_time"]) - measured[0]) <= PID_REUSE_TOLERANCE_SECONDS else None
+        guest.update({
+            "rss_bytes": memory.rss if memory else None,
+            "cpu_core_pct": round(core_pct, 2) if core_pct is not None else None,
+            "cpu_pct": round(min(100.0, core_pct / cores), 2) if core_pct is not None else None,
+        })
+        guest.setdefault("name", f"qemu-{info['pid']}")
+        guests.append(guest)
+    return guests
+
+
+def _libvirt_domain(virsh: str, uri: str, name: str, qemu_by_name: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    info = subprocess.run([virsh, "--connect", uri, "dominfo", name], capture_output=True, text=True, timeout=5, check=False)
+    parsed: dict[str, str] = {}
+    for line in info.stdout.splitlines():
+        key, separator, value = line.partition(":")
+        if separator:
+            parsed[key.strip().lower().replace(" ", "_")] = value.strip()
+
+    raw_state = parsed.get("state", "unknown")
+    max_mem_bytes = _parse_kib_to_bytes(parsed.get("max_memory"))
+    used_mem_bytes = None
+    if "running" in raw_state.lower():
+        stat_res = subprocess.run([virsh, "--connect", uri, "dommemstat", name], capture_output=True, text=True, timeout=3, check=False)
+        if stat_res.returncode == 0:
+            stats: dict[str, int] = {}
+            for sline in stat_res.stdout.splitlines():
+                sparts = sline.split()
+                if len(sparts) >= 2:
+                    try:
+                        stats[sparts[0].lower()] = int(sparts[1])
+                    except ValueError:
+                        pass
+            if "available" in stats and "usable" in stats:
+                used_mem_bytes = (stats["available"] - stats["usable"]) * 1024
+            elif "actual" in stats and "unused" in stats:
+                used_mem_bytes = (stats["actual"] - stats["unused"]) * 1024
+            elif "rss" in stats:
+                used_mem_bytes = stats["rss"] * 1024
+            elif "actual" in stats:
+                used_mem_bytes = stats["actual"] * 1024
+        if used_mem_bytes is None:
+            used_mem_bytes = _parse_kib_to_bytes(parsed.get("used_memory"))
+
+    process = qemu_by_name.get(name) or qemu_by_name.get(parsed.get("uuid", ""))
+    return {
+        "runtime": "libvirt",
+        "name": name,
+        "state": raw_state,
+        "cpu_count": parsed.get("cpu(s)"),
+        "max_memory": max_mem_bytes,
+        "used_memory": used_mem_bytes,
+        "uuid": parsed.get("uuid"),
+        "autostart": parsed.get("autostart"),
+        "persistent": parsed.get("persistent"),
+        # live host-side usage of the guest (from its QEMU process); None when not measured
+        "cpu_pct": process.get("cpu_pct") if process else None,
+        "rss_bytes": process.get("rss_bytes") if process else None,
+        "pid": process.get("pid") if process else None,
+    }
+
+
+def _collect_libvirt(qemu: list[dict[str, Any]]) -> dict[str, Any]:
+    virsh = shutil.which("virsh")
+    if not LIBVIRT_SOCKET.exists():
+        return {"status": "not_configured", "vms": [], "reason": "libvirt socket not present"}
+    if not virsh:
+        return {"status": "unavailable", "vms": [], "reason": "virsh client is not installed in the collector image"}
+    uri = f"qemu+unix:///system?socket={LIBVIRT_SOCKET}"
+    try:
+        result = subprocess.run([virsh, "--connect", uri, "list", "--all", "--name"], capture_output=True, text=True, timeout=8, check=False)
         if result.returncode:
-            if proxmox["status"] == "available":
-                return _status_data({"sources": {"proxmox": proxmox}, "vms": proxmox.get("vms", [])})
-            return _status_data({"runtime": "libvirt", "vms": [], "reason": result.stderr.strip()[:300]}, "unavailable")
-        names = [name for name in result.stdout.splitlines() if name.strip()]
-        vms = []
-        for name in names[:500]:
-            info = subprocess.run([virsh, "--connect", uri, "dominfo", name], capture_output=True, text=True, timeout=5, check=False)
-            parsed = {}
-            for line in info.stdout.splitlines():
-                key, separator, value = line.partition(":")
-                if separator:
-                    parsed[key.strip().lower().replace(" ", "_")] = value.strip()
-
-            raw_state = parsed.get("state", "unknown")
-            # Parse memory from dominfo (e.g., "8192000 KiB") into integer bytes
-            def _parse_kib_to_bytes(val: str | None) -> int | None:
-                if not val:
-                    return None
-                parts = val.split()
-                try:
-                    num = int(parts[0])
-                    unit = parts[1].lower() if len(parts) > 1 else "kib"
-                    if "kib" in unit or "kb" in unit:
-                        return num * 1024
-                    elif "mib" in unit or "mb" in unit:
-                        return num * 1024 * 1024
-                    elif "gib" in unit or "gb" in unit:
-                        return num * 1024 * 1024 * 1024
-                    return num
-                except (ValueError, IndexError):
-                    return None
-
-            max_mem_bytes = _parse_kib_to_bytes(parsed.get("max_memory"))
-            used_mem_bytes = None
-
-            # For running VMs, attempt to query live memory stats (dommemstat)
-            if "running" in raw_state.lower():
-                stat_res = subprocess.run([virsh, "--connect", uri, "dommemstat", name], capture_output=True, text=True, timeout=3, check=False)
-                if stat_res.returncode == 0:
-                    stats = {}
-                    for sline in stat_res.stdout.splitlines():
-                        sparts = sline.split()
-                        if len(sparts) >= 2:
-                            try:
-                                stats[sparts[0].lower()] = int(sparts[1])
-                            except ValueError:
-                                pass
-                    # actual/usable or rss
-                    if "available" in stats and "usable" in stats:
-                        used_mem_bytes = (stats["available"] - stats["usable"]) * 1024
-                    elif "actual" in stats and "unused" in stats:
-                        used_mem_bytes = (stats["actual"] - stats["unused"]) * 1024
-                    elif "rss" in stats:
-                        used_mem_bytes = stats["rss"] * 1024
-                    elif "actual" in stats:
-                        used_mem_bytes = stats["actual"] * 1024
-
-                # Fallback if balloon/stat query gave nothing
-                if used_mem_bytes is None:
-                    used_mem_bytes = _parse_kib_to_bytes(parsed.get("used_memory"))
-
-            vms.append({
-                "name": name,
-                "state": raw_state,
-                "cpu_count": parsed.get("cpu(s)"),
-                "max_memory": max_mem_bytes,
-                "used_memory": used_mem_bytes,
-            })
-        return _status_data({"sources": {"libvirt": {"status": "available", "count": len(vms)}, "proxmox": proxmox}, "vms": vms + proxmox.get("vms", [])})
+            return {"status": "unavailable", "vms": [], "reason": result.stderr.strip()[:300]}
+        names = [name.strip() for name in result.stdout.splitlines() if name.strip()][:500]
+        by_name = {guest["name"]: guest for guest in qemu}
+        by_name.update({guest["uuid"]: guest for guest in qemu if guest.get("uuid")})
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            vms = list(pool.map(lambda item: _libvirt_domain(virsh, uri, item, by_name), names))
+        return {"status": "available", "vms": vms}
     except (OSError, subprocess.TimeoutExpired) as exc:
-        return _status_data({"runtime": "libvirt", "vms": [], "reason": str(exc)[:300]}, "unavailable")
+        return {"status": "unavailable", "vms": [], "reason": str(exc)[:300]}
+
+
+def collect_vms() -> dict[str, Any]:
+    qemu = _qemu_processes()
+    libvirt = _collect_libvirt(qemu)
+    proxmox = _collect_proxmox()
+
+    vms: list[dict[str, Any]] = list(libvirt["vms"]) + list(proxmox.get("vms", []))
+    known_names = {str(vm.get("name")) for vm in vms}
+    known_vmids = {vm.get("vmid") for vm in proxmox.get("vms", []) if vm.get("vmid") is not None}
+    # Guests visible only as QEMU processes (Proxmox without API token, plain QEMU, libvirt without a socket)
+    process_only = [guest for guest in qemu if guest["name"] not in known_names and guest.get("vmid") not in known_vmids]
+    for guest in process_only:
+        vms.append({
+            "runtime": "proxmox-qemu" if guest.get("vmid") is not None else "qemu-process",
+            "name": guest["name"], "vmid": guest.get("vmid"), "state": "running", "cpu_count": guest.get("cpu_count"),
+            "max_memory": guest.get("max_memory"), "used_memory": guest.get("rss_bytes"),
+            "cpu_pct": guest.get("cpu_pct"), "rss_bytes": guest.get("rss_bytes"), "pid": guest.get("pid"), "uuid": guest.get("uuid"),
+        })
+
+    sources = {
+        "libvirt": {"status": libvirt["status"], "count": len(libvirt["vms"]), "reason": libvirt.get("reason")},
+        "proxmox": {"status": proxmox["status"], "count": len(proxmox.get("vms", [])), "reason": proxmox.get("reason")},
+        "qemu_processes": {"status": "available" if qemu else "not_configured", "count": len(process_only),
+                           "reason": None if qemu else "No QEMU/KVM guest process is running on this host"},
+    }
+    statuses = [item["status"] for item in sources.values()]
+    if "available" in statuses:
+        status = "available"
+    elif "unavailable" in statuses:
+        status = "unavailable"
+    else:
+        status = "not_configured"
+    data: dict[str, Any] = {"sources": sources, "vms": vms}
+    if status == "not_configured":
+        data["reason"] = "No hypervisor (libvirt / Proxmox / QEMU) is running on this host"
+    return _status_data(data, status)
 
 
 def _collect_proxmox() -> dict[str, Any]:
     if not PROXMOX_API_URL or not PROXMOX_API_TOKEN:
         return {"status": "not_configured", "vms": [], "reason": "Proxmox API URL/token not configured"}
     headers = {"Authorization": f"PVEAPIToken={PROXMOX_API_TOKEN}"}
-    verify: str | bool = PROXMOX_CA_CERT or True
+    verify: str | bool = False if PROXMOX_INSECURE_TLS else (PROXMOX_CA_CERT or True)
     try:
         nodes = httpx.get(f"{PROXMOX_API_URL}/api2/json/nodes", headers=headers, verify=verify, timeout=5.0)
         nodes.raise_for_status()
         vms = []
         for node in nodes.json().get("data", []):
             node_name = node.get("node")
-            for runtime, endpoint in (("qemu", "qemu"), ("lxc", "lxc")):
-                response = httpx.get(f"{PROXMOX_API_URL}/api2/json/nodes/{node_name}/{endpoint}", headers=headers, verify=verify, timeout=5.0)
+            for runtime in ("qemu", "lxc"):
+                response = httpx.get(f"{PROXMOX_API_URL}/api2/json/nodes/{node_name}/{runtime}", headers=headers, verify=verify, timeout=5.0)
                 response.raise_for_status()
                 for item in response.json().get("data", []):
-                    vms.append({"runtime": "proxmox-" + runtime, "node": node_name, "vmid": item.get("vmid"), "name": item.get("name"), "status": item.get("status"), "cpu": item.get("cpu"), "memory_bytes": item.get("mem"), "max_memory_bytes": item.get("maxmem")})
+                    cpu = item.get("cpu")
+                    vms.append({
+                        "runtime": "proxmox-" + runtime, "node": node_name, "vmid": item.get("vmid"), "name": item.get("name"),
+                        "status": item.get("status"), "state": item.get("status"),
+                        "cpu": cpu, "cpu_pct": round(cpu * 100, 2) if isinstance(cpu, (int, float)) else None,  # cpu is a 0-1 share of the VM's vCPUs
+                        "cpu_count": item.get("cpus"),
+                        "memory_bytes": item.get("mem"), "max_memory_bytes": item.get("maxmem"),
+                        "used_memory": item.get("mem"), "max_memory": item.get("maxmem"),
+                        "uptime_seconds": item.get("uptime"),
+                    })
         return {"status": "available", "vms": vms}
     except (httpx.HTTPError, ValueError) as exc:
         return {"status": "unavailable", "vms": [], "reason": str(exc)[:300]}
@@ -1266,26 +1654,36 @@ def discover_capabilities() -> dict[str, Any]:
         "sources": ["systemd journal", "configured application log files"],
         "reason": None if journal_available or app_logs_available else "journal and configured application log files are unavailable",
     }
-    lxd_path = LXD_SOCKET if LXD_SOCKET.exists() else Path("/host/run/lxd/unix.socket")
+    def is_socket(path: Path) -> bool:
+        try:
+            return path.exists() and path.is_socket()
+        except OSError:
+            return False
+
+    docker_ok, lxd_ok = is_socket(DOCKER_SOCKET), is_socket(LXD_SOCKET)
+    kube_ok = bool(KUBERNETES_API_URL and KUBERNETES_TOKEN)
+    legacy_lxc = (HOST_ROOT / "var/lib/lxc").is_dir()
     capabilities["containers"] = {
-        "status": "available" if ((DOCKER_SOCKET.exists() and DOCKER_SOCKET.is_socket()) or (lxd_path.exists() and lxd_path.is_socket()) or (KUBERNETES_API_URL and KUBERNETES_TOKEN)) else "unavailable",
-        "sources": {"docker": DOCKER_SOCKET.exists() and DOCKER_SOCKET.is_socket(), "lxd": lxd_path.exists() and lxd_path.is_socket(), "kubernetes": bool(KUBERNETES_API_URL and KUBERNETES_TOKEN)},
-        "reason": None if ((DOCKER_SOCKET.exists() and DOCKER_SOCKET.is_socket()) or (lxd_path.exists() and lxd_path.is_socket()) or (KUBERNETES_API_URL and KUBERNETES_TOKEN)) else "No Docker/LXD socket or Kubernetes API credentials are configured",
+        "status": "available" if (docker_ok or lxd_ok or kube_ok or legacy_lxc) else "not_configured",
+        "sources": {"docker": docker_ok, "lxd": lxd_ok, "kubernetes": kube_ok, "lxc": legacy_lxc},
+        "reason": None if (docker_ok or lxd_ok or kube_ok or legacy_lxc) else "No Docker/Podman/LXD socket, LXC directory or Kubernetes credentials found on this host",
     }
     containerd_socket = Path("/host/run/containerd/containerd.sock")
     capabilities["containerd"] = {
         "status": "not_configured" if containerd_socket.exists() else "unavailable",
         "reason": "containerd CRI collection is not configured" if containerd_socket.exists() else "containerd socket not present",
     }
-    legacy_lxc = Path("/host/var/lib/lxc")
     capabilities["lxc"] = {
-        "status": "available" if legacy_lxc.is_dir() else "not_configured",
-        "reason": "legacy LXC adapter is present" if legacy_lxc.is_dir() else "legacy LXC is not present",
+        "status": "available" if legacy_lxc else "not_configured",
+        "reason": "legacy LXC definitions found" if legacy_lxc else "legacy LXC is not present",
     }
+    libvirt_ok = bool(shutil.which("virsh") and is_socket(LIBVIRT_SOCKET))
+    proxmox_ok = bool(PROXMOX_API_URL and PROXMOX_API_TOKEN)
+    qemu_ok = bool(_qemu_processes())
     capabilities["vms"] = {
-        "status": "available" if ((shutil.which("virsh") and Path("/host/run/libvirt/libvirt-sock").exists()) or (PROXMOX_API_URL and PROXMOX_API_TOKEN)) else "unavailable",
-        "sources": {"libvirt": bool(shutil.which("virsh") and Path("/host/run/libvirt/libvirt-sock").exists()), "proxmox": bool(PROXMOX_API_URL and PROXMOX_API_TOKEN)},
-        "reason": None if ((shutil.which("virsh") and Path("/host/run/libvirt/libvirt-sock").exists()) or (PROXMOX_API_URL and PROXMOX_API_TOKEN)) else "libvirt socket or Proxmox API credentials are unavailable",
+        "status": "available" if (libvirt_ok or proxmox_ok or qemu_ok) else "not_configured",
+        "sources": {"libvirt": libvirt_ok, "proxmox": proxmox_ok, "qemu_processes": qemu_ok},
+        "reason": None if (libvirt_ok or proxmox_ok or qemu_ok) else "No hypervisor (libvirt / Proxmox / QEMU) found on this host",
     }
     capabilities["firewall"] = _firewall_state()
     cpu_now = _CPU_SAMPLER.current()
@@ -1347,6 +1745,10 @@ def _parse_file_log(raw: str, path: str, inode: int, offset: int) -> dict[str, A
         event_at = float(timestamp_raw) / (1_000_000 if timestamp_raw > 10_000_000_000 else 1)
     service = data.get("service") or data.get("logger") or Path(path).name
     pid = data.get("pid")
+    if not pid:
+        pid_match = re.search(r"\bpid=(\d+)\b", message, re.IGNORECASE) or re.search(r"\[(\d+)\]", message)
+        if pid_match:
+            pid = pid_match.group(1)
     fields = {key: value for key, value in data.items() if key not in {"message", "msg", "timestamp", "time", "@timestamp", "severity", "level", "priority", "service", "logger", "pid"}}
     event_hash = hashlib.sha256(f"{path}:{inode}:{offset}:{raw}".encode("utf-8", errors="replace")).hexdigest()
     return {
@@ -1438,9 +1840,16 @@ def collect_logs(since: float, limit: int) -> dict[str, Any]:
                         cursor = str(record.get("__CURSOR") or "")
                         message = str(record.get("MESSAGE", ""))
                         source = str(record.get("SYSLOG_IDENTIFIER") or record.get("_COMM") or "systemd")
+                        raw_pid = record.get("_PID") or record.get("SYSLOG_PID")
+                        if not raw_pid:
+                            # Extract pid=... or [pid] from message if present (e.g. kernel audit / syslog)
+                            pid_match = re.search(r"\bpid=(\d+)\b", message, re.IGNORECASE) or re.search(r"\[(\d+)\]", message)
+                            if pid_match:
+                                raw_pid = pid_match.group(1)
+                        pid_val = int(raw_pid) if str(raw_pid or "").isdigit() else None
                         safe_fields = _safe_fields({key: value for key, value in record.items() if not key.startswith("_") and key not in {"MESSAGE", "__CURSOR", "__REALTIME_TIMESTAMP", "__MONOTONIC_TIMESTAMP"}})
                         event_id = hashlib.sha256((cursor or f"{event_at}:{source}:{message}").encode()).hexdigest()
-                        events.append({"event_id": event_id, "timestamp": datetime.fromtimestamp(event_at, timezone.utc).isoformat(), "timestamp_epoch": event_at, "source": source, "severity": {0: "emergency", 1: "alert", 2: "critical", 3: "error", 4: "warning", 5: "notice", 6: "info", 7: "debug"}.get(priority, "unknown"), "service": record.get("_SYSTEMD_UNIT") or record.get("UNIT"), "pid": record.get("_PID"), "message": _redact_text(message)[:16_384], "fields": safe_fields, "parser": "systemd-journal"})
+                        events.append({"event_id": event_id, "timestamp": datetime.fromtimestamp(event_at, timezone.utc).isoformat(), "timestamp_epoch": event_at, "source": source, "severity": {0: "emergency", 1: "alert", 2: "critical", 3: "error", 4: "warning", 5: "notice", 6: "info", 7: "debug"}.get(priority, "unknown"), "service": record.get("_SYSTEMD_UNIT") or record.get("UNIT"), "pid": pid_val, "message": _redact_text(message)[:16_384], "fields": safe_fields, "parser": "systemd-journal"})
                     except (ValueError, TypeError, json.JSONDecodeError):
                         continue
             except (OSError, subprocess.TimeoutExpired) as exc:
@@ -1473,12 +1882,14 @@ def info(x_palantir_agent_token: str | None = Header(default=None)) -> dict[str,
     return {
         "name": "PALANTIR Linux Host Collector",
         "version": APP_VERSION,
-        "hostname": socket.gethostname(),
+        "hostname": _host_hostname(),
+        "machine_id": _host_machine_id(),
         "os": platform.platform(),
         "os_release": _read_os_release(),
         "cpu_model": _cpu_model(),
         "schema_version": 1,
     }
+
 
 
 @app.get("/api/v1/capabilities")
@@ -1525,6 +1936,16 @@ def diagnostics(x_palantir_agent_token: str | None = Header(default=None)) -> di
             "last_error": _RATE_SAMPLER.last_error,
         },
         "interfaces": sorted(_parse_proc_net_dev()),
+        "token_configured": bool(AGENT_TOKEN),
+        "sockets": {
+            "docker": str(DOCKER_SOCKET) if DOCKER_SOCKET.exists() else None,
+            "lxd": str(LXD_SOCKET) if LXD_SOCKET.exists() else None,
+            "libvirt": str(LIBVIRT_SOCKET) if LIBVIRT_SOCKET.exists() else None,
+            "dbus": next((str(path) for path in (Path("/host/run/dbus/system_bus_socket"), Path("/run/dbus/system_bus_socket")) if path.exists()), None),
+        },
+        "tools": {name: bool(shutil.which(name)) for name in ("busctl", "systemctl", "journalctl", "virsh", "nft")},
+        "journal_dirs": [str(path) for path in (HOST_LOG / "journal", Path("/host/run/log/journal")) if path.is_dir()],
+        "virtualization": _virtualization(),
     }
 
 
@@ -1554,6 +1975,361 @@ def logs(
 ) -> dict[str, Any]:
     _guard(x_palantir_agent_token)
     return collect_logs(since, limit)
+
+
+@app.post("/api/v1/processes/{pid}/kill")
+def kill_process(
+    pid: int,
+    signal_type: str = Query(default="SIGTERM", pattern="^(SIGTERM|SIGKILL|15|9)$"),
+    x_palantir_agent_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    _guard(x_palantir_agent_token)
+    if not AGENT_TOKEN and not ALLOW_ANONYMOUS_KILL:
+        # Without a token anybody who can reach port 20000 could kill any host process.
+        raise HTTPException(status_code=403, detail="Process control is disabled: start the collector with PALANTIR_AGENT_TOKEN set")
+    sig = signal.SIGKILL if signal_type in {"SIGKILL", "9"} else signal.SIGTERM
+    # Prevent accidental suicide or killing PID 1
+    if pid <= 1:
+        raise HTTPException(status_code=400, detail="Cannot terminate PID <= 1")
+    try:
+        os.kill(pid, sig)
+        return {"success": True, "pid": pid, "signal": "SIGKILL" if sig == signal.SIGKILL else "SIGTERM"}
+    except ProcessLookupError:
+        raise HTTPException(status_code=404, detail=f"Process {pid} not found")
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=f"Permission denied killing process {pid}: {exc}")
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to kill process {pid}: {exc}")
+
+
+@app.post("/api/v1/containers/{container_id}/stop")
+def stop_container(
+    container_id: str,
+    timeout_seconds: int = Query(default=10, ge=0, le=60),
+    x_palantir_agent_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    _guard(x_palantir_agent_token)
+    if not AGENT_TOKEN and not ALLOW_ANONYMOUS_KILL:
+        raise HTTPException(status_code=403, detail="Container control is disabled: start the collector with PALANTIR_AGENT_TOKEN set")
+    if not DOCKER_SOCKET.exists() or not DOCKER_SOCKET.is_socket():
+        raise HTTPException(status_code=400, detail="Docker/Podman socket is not mounted or available")
+
+    clean_id = container_id.strip()
+    if not clean_id or not re.match(r"^[a-zA-Z0-9_.-]+$", clean_id):
+        raise HTTPException(status_code=400, detail="Invalid container identifier")
+
+    # Collect active container host PIDs before stopping it
+    stopped_pids: list[int] = []
+    try:
+        top_status, top_body = _unix_request(DOCKER_SOCKET, f"/containers/{clean_id}/top", timeout=3.0)
+        if top_status == 200:
+            top_data = json.loads(top_body)
+            titles = [str(t).upper() for t in top_data.get("Titles", [])]
+            pid_idx = titles.index("PID") if "PID" in titles else 1
+            for proc in top_data.get("Processes", []):
+                if len(proc) > pid_idx:
+                    try:
+                        p_val = int(proc[pid_idx])
+                        if p_val > 1:
+                            stopped_pids.append(p_val)
+                    except (ValueError, TypeError):
+                        pass
+    except Exception:
+        pass
+
+    try:
+        status, body = _unix_request(
+            DOCKER_SOCKET,
+            f"/containers/{clean_id}/stop?t={timeout_seconds}",
+            timeout=float(timeout_seconds + 5),
+            method="POST",
+        )
+        if status in {204, 304}:
+            return {
+                "success": True,
+                "container_id": clean_id,
+                "status": "stopped" if status == 204 else "already_stopped",
+                "stopped_pids": stopped_pids,
+            }
+        if status == 404:
+            raise HTTPException(status_code=404, detail=f"Container {clean_id} not found")
+        raise HTTPException(status_code=500, detail=f"Docker API error ({status}): {body.decode(errors='replace')[:200]}")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to stop container {clean_id}: {exc}")
+
+
+@app.post("/api/v1/vms/{vm_id}/stop")
+def stop_vm(
+    vm_id: str,
+    force: bool = Query(default=False),
+    x_palantir_agent_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    _guard(x_palantir_agent_token)
+    if not AGENT_TOKEN and not ALLOW_ANONYMOUS_KILL:
+        raise HTTPException(status_code=403, detail="VM control is disabled: start the collector with PALANTIR_AGENT_TOKEN set")
+
+    target = vm_id.strip()
+    if not target or not re.match(r"^[a-zA-Z0-9_.-]+$", target):
+        raise HTTPException(status_code=400, detail="Invalid VM identifier")
+
+    virsh = shutil.which("virsh")
+    if virsh and LIBVIRT_SOCKET.exists():
+        uri = f"qemu+unix:///system?socket={LIBVIRT_SOCKET}"
+        action = "destroy" if force else "shutdown"
+        res = subprocess.run([virsh, "--connect", uri, action, target], capture_output=True, text=True, timeout=10, check=False)
+        if res.returncode == 0:
+            return {"success": True, "vm_id": target, "action": action, "runtime": "libvirt"}
+
+    if PROXMOX_API_URL and PROXMOX_API_TOKEN:
+        headers = {"Authorization": f"PVEAPIToken={PROXMOX_API_TOKEN}"}
+        verify: str | bool = False if PROXMOX_INSECURE_TLS else (PROXMOX_CA_CERT or True)
+        subpath = "stop" if force else "shutdown"
+        try:
+            nodes = httpx.get(f"{PROXMOX_API_URL}/api2/json/nodes", headers=headers, verify=verify, timeout=5.0)
+            if nodes.status_code == 200:
+                for node_obj in nodes.json().get("data", []):
+                    n_name = node_obj.get("node")
+                    for r_type in ("qemu", "lxc"):
+                        r_post = httpx.post(
+                            f"{PROXMOX_API_URL}/api2/json/nodes/{n_name}/{r_type}/{target}/status/{subpath}",
+                            headers=headers,
+                            verify=verify,
+                            timeout=10.0,
+                        )
+                        if r_post.status_code in {200, 204}:
+                            return {"success": True, "vm_id": target, "action": subpath, "runtime": f"proxmox-{r_type}"}
+        except Exception:
+            pass
+
+    raise HTTPException(status_code=404, detail=f"VM '{target}' could not be stopped (not found or hypervisor unreachable)")
+
+
+def _demux_docker_logs(raw: bytes) -> str:
+    lines: list[str] = []
+    i = 0
+    n = len(raw)
+    while i + 8 <= n:
+        stream_type = raw[i]
+        if stream_type in (1, 2) and raw[i + 1 : i + 4] == b"\x00\x00\x00":
+            size = int.from_bytes(raw[i + 4 : i + 8], byteorder="big")
+            i += 8
+            if i + size <= n:
+                chunk = raw[i : i + size].decode(errors="replace")
+                lines.append(chunk)
+                i += size
+                continue
+            else:
+                chunk = raw[i:].decode(errors="replace")
+                lines.append(chunk)
+                break
+        else:
+            return raw.decode(errors="replace")
+    return "".join(lines) if lines else raw.decode(errors="replace")
+
+
+@app.post("/api/v1/containers/{container_id}/start")
+def start_container(
+    container_id: str,
+    x_palantir_agent_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    _guard(x_palantir_agent_token)
+    if not AGENT_TOKEN and not ALLOW_ANONYMOUS_KILL:
+        raise HTTPException(status_code=403, detail="Container control is disabled: start the collector with PALANTIR_AGENT_TOKEN set")
+    if not DOCKER_SOCKET.exists() or not DOCKER_SOCKET.is_socket():
+        raise HTTPException(status_code=400, detail="Docker/Podman socket is not mounted or available")
+
+    clean_id = container_id.strip()
+    if not clean_id or not re.match(r"^[a-zA-Z0-9_.-]+$", clean_id):
+        raise HTTPException(status_code=400, detail="Invalid container identifier")
+
+    try:
+        status, body = _unix_request(
+            DOCKER_SOCKET,
+            f"/containers/{clean_id}/start",
+            timeout=15.0,
+            method="POST",
+        )
+        if status in {204, 304}:
+            return {
+                "success": True,
+                "container_id": clean_id,
+                "status": "started" if status == 204 else "already_started",
+            }
+        if status == 404:
+            raise HTTPException(status_code=404, detail=f"Container {clean_id} not found")
+        raise HTTPException(status_code=500, detail=f"Docker API error ({status}): {body.decode(errors='replace')[:200]}")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to start container {clean_id}: {exc}")
+
+
+@app.post("/api/v1/containers/{container_id}/restart")
+def restart_container(
+    container_id: str,
+    timeout_seconds: int = Query(default=10, ge=0, le=60),
+    x_palantir_agent_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    _guard(x_palantir_agent_token)
+    if not AGENT_TOKEN and not ALLOW_ANONYMOUS_KILL:
+        raise HTTPException(status_code=403, detail="Container control is disabled: start the collector with PALANTIR_AGENT_TOKEN set")
+    if not DOCKER_SOCKET.exists() or not DOCKER_SOCKET.is_socket():
+        raise HTTPException(status_code=400, detail="Docker/Podman socket is not mounted or available")
+
+    clean_id = container_id.strip()
+    if not clean_id or not re.match(r"^[a-zA-Z0-9_.-]+$", clean_id):
+        raise HTTPException(status_code=400, detail="Invalid container identifier")
+
+    try:
+        status, body = _unix_request(
+            DOCKER_SOCKET,
+            f"/containers/{clean_id}/restart?t={timeout_seconds}",
+            timeout=float(timeout_seconds + 10),
+            method="POST",
+        )
+        if status in {204, 304}:
+            return {
+                "success": True,
+                "container_id": clean_id,
+                "status": "restarted",
+            }
+        if status == 404:
+            raise HTTPException(status_code=404, detail=f"Container {clean_id} not found")
+        raise HTTPException(status_code=500, detail=f"Docker API error ({status}): {body.decode(errors='replace')[:200]}")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to restart container {clean_id}: {exc}")
+
+
+@app.get("/api/v1/containers/{container_id}/logs")
+def get_container_logs(
+    container_id: str,
+    tail: int = Query(default=200, ge=1, le=5000),
+    x_palantir_agent_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    _guard(x_palantir_agent_token)
+    if not AGENT_TOKEN and not ALLOW_ANONYMOUS_KILL:
+        raise HTTPException(status_code=403, detail="Container inspection is disabled: start the collector with PALANTIR_AGENT_TOKEN set")
+    if not DOCKER_SOCKET.exists() or not DOCKER_SOCKET.is_socket():
+        raise HTTPException(status_code=400, detail="Docker/Podman socket is not mounted or available")
+
+    clean_id = container_id.strip()
+    if not clean_id or not re.match(r"^[a-zA-Z0-9_.-]+$", clean_id):
+        raise HTTPException(status_code=400, detail="Invalid container identifier")
+
+    try:
+        status, body = _unix_request(
+            DOCKER_SOCKET,
+            f"/containers/{clean_id}/logs?stdout=1&stderr=1&tail={tail}&timestamps=0",
+            timeout=10.0,
+            method="GET",
+        )
+        if status == 200:
+            clean_text = _demux_docker_logs(body)
+            return {
+                "success": True,
+                "container_id": clean_id,
+                "tail": tail,
+                "logs": clean_text,
+            }
+        if status == 404:
+            raise HTTPException(status_code=404, detail=f"Container {clean_id} not found")
+        raise HTTPException(status_code=500, detail=f"Docker API error ({status}): {body.decode(errors='replace')[:200]}")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch logs for container {clean_id}: {exc}")
+
+
+@app.post("/api/v1/vms/{vm_id}/start")
+def start_vm(
+    vm_id: str,
+    x_palantir_agent_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    _guard(x_palantir_agent_token)
+    if not AGENT_TOKEN and not ALLOW_ANONYMOUS_KILL:
+        raise HTTPException(status_code=403, detail="VM control is disabled: start the collector with PALANTIR_AGENT_TOKEN set")
+
+    target = vm_id.strip()
+    if not target or not re.match(r"^[a-zA-Z0-9_.-]+$", target):
+        raise HTTPException(status_code=400, detail="Invalid VM identifier")
+
+    virsh = shutil.which("virsh")
+    if virsh and LIBVIRT_SOCKET.exists():
+        uri = f"qemu+unix:///system?socket={LIBVIRT_SOCKET}"
+        res = subprocess.run([virsh, "--connect", uri, "start", target], capture_output=True, text=True, timeout=10, check=False)
+        if res.returncode == 0:
+            return {"success": True, "vm_id": target, "action": "start", "runtime": "libvirt"}
+
+    if PROXMOX_API_URL and PROXMOX_API_TOKEN:
+        headers = {"Authorization": f"PVEAPIToken={PROXMOX_API_TOKEN}"}
+        verify: str | bool = False if PROXMOX_INSECURE_TLS else (PROXMOX_CA_CERT or True)
+        try:
+            nodes = httpx.get(f"{PROXMOX_API_URL}/api2/json/nodes", headers=headers, verify=verify, timeout=5.0)
+            if nodes.status_code == 200:
+                for node_obj in nodes.json().get("data", []):
+                    n_name = node_obj.get("node")
+                    for r_type in ("qemu", "lxc"):
+                        r_post = httpx.post(
+                            f"{PROXMOX_API_URL}/api2/json/nodes/{n_name}/{r_type}/{target}/status/start",
+                            headers=headers,
+                            verify=verify,
+                            timeout=10.0,
+                        )
+                        if r_post.status_code in {200, 204}:
+                            return {"success": True, "vm_id": target, "action": "start", "runtime": f"proxmox-{r_type}"}
+        except Exception:
+            pass
+
+    raise HTTPException(status_code=404, detail=f"VM '{target}' could not be started (not found or hypervisor unreachable)")
+
+
+@app.post("/api/v1/vms/{vm_id}/restart")
+def restart_vm(
+    vm_id: str,
+    force: bool = Query(default=False),
+    x_palantir_agent_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    _guard(x_palantir_agent_token)
+    if not AGENT_TOKEN and not ALLOW_ANONYMOUS_KILL:
+        raise HTTPException(status_code=403, detail="VM control is disabled: start the collector with PALANTIR_AGENT_TOKEN set")
+
+    target = vm_id.strip()
+    if not target or not re.match(r"^[a-zA-Z0-9_.-]+$", target):
+        raise HTTPException(status_code=400, detail="Invalid VM identifier")
+
+    virsh = shutil.which("virsh")
+    if virsh and LIBVIRT_SOCKET.exists():
+        uri = f"qemu+unix:///system?socket={LIBVIRT_SOCKET}"
+        action = "reset" if force else "reboot"
+        res = subprocess.run([virsh, "--connect", uri, action, target], capture_output=True, text=True, timeout=10, check=False)
+        if res.returncode == 0:
+            return {"success": True, "vm_id": target, "action": action, "runtime": "libvirt"}
+
+    if PROXMOX_API_URL and PROXMOX_API_TOKEN:
+        headers = {"Authorization": f"PVEAPIToken={PROXMOX_API_TOKEN}"}
+        verify: str | bool = False if PROXMOX_INSECURE_TLS else (PROXMOX_CA_CERT or True)
+        try:
+            nodes = httpx.get(f"{PROXMOX_API_URL}/api2/json/nodes", headers=headers, verify=verify, timeout=5.0)
+            if nodes.status_code == 200:
+                for node_obj in nodes.json().get("data", []):
+                    n_name = node_obj.get("node")
+                    for r_type in ("qemu", "lxc"):
+                        r_post = httpx.post(
+                            f"{PROXMOX_API_URL}/api2/json/nodes/{n_name}/{r_type}/{target}/status/reboot",
+                            headers=headers,
+                            verify=verify,
+                            timeout=10.0,
+                        )
+                        if r_post.status_code in {200, 204}:
+                            return {"success": True, "vm_id": target, "action": "reboot", "runtime": f"proxmox-{r_type}"}
+        except Exception:
+            pass
+
+    raise HTTPException(status_code=404, detail=f"VM '{target}' could not be restarted (not found or hypervisor unreachable)")
 
 
 _start_samplers()

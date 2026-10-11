@@ -122,6 +122,7 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ node_id: nodeId, trigger_type: triggerType, trigger_id: triggerId }),
     }),
+  deleteInvestigation: (id) => request(`/investigations/${id}`, { method: 'DELETE' }),
 
   // ---- fleet / health --------------------------------------------------------
   getFleetSummary: () => request('/fleet/summary'),
@@ -130,6 +131,24 @@ export const api = {
   // ---- system settings -------------------------------------------------------
   getThresholds: () => request('/settings/thresholds'),
   updateThreshold: (id, data) => request(`/settings/thresholds/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+  // ---- process / container / vm management ----------------------------------
+  killProcess: (nodeId, pid, signalType = 'SIGTERM') =>
+    request(`/nodes/${nodeId}/processes/${pid}/kill${qs({ signal_type: signalType })}`, { method: 'POST' }),
+  stopContainer: (nodeId, containerId, timeoutSeconds = 10) =>
+    request(`/nodes/${nodeId}/containers/${encodeURIComponent(containerId)}/stop${qs({ timeout_seconds: timeoutSeconds })}`, { method: 'POST' }),
+  startContainer: (nodeId, containerId) =>
+    request(`/nodes/${nodeId}/containers/${encodeURIComponent(containerId)}/start`, { method: 'POST' }),
+  restartContainer: (nodeId, containerId, timeoutSeconds = 10) =>
+    request(`/nodes/${nodeId}/containers/${encodeURIComponent(containerId)}/restart${qs({ timeout_seconds: timeoutSeconds })}`, { method: 'POST' }),
+  getContainerLogs: (nodeId, containerId, tail = 200) =>
+    request(`/nodes/${nodeId}/containers/${encodeURIComponent(containerId)}/logs${qs({ tail })}`),
+  stopVm: (nodeId, vmId, force = false) =>
+    request(`/nodes/${nodeId}/vms/${encodeURIComponent(vmId)}/stop${qs({ force })}`, { method: 'POST' }),
+  startVm: (nodeId, vmId) =>
+    request(`/nodes/${nodeId}/vms/${encodeURIComponent(vmId)}/start`, { method: 'POST' }),
+  restartVm: (nodeId, vmId, force = false) =>
+    request(`/nodes/${nodeId}/vms/${encodeURIComponent(vmId)}/restart${qs({ force })}`, { method: 'POST' }),
   // Process liveness probe (not under /api/v1, not authenticated).
   healthz: () => request('/healthz', {}, { base: '' }),
 };
+

@@ -1,8 +1,10 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Badge, Box, Chips, DataTable, Empty, ErrorLine, Meter } from './ui';
 import NodeHeaderNav from './NodeHeaderNav';
 import { agentStatus, containerSources, listOf, storageSummary, vmSources } from '../lib/metrics';
 import { formatBytes, formatNumber, formatPercent, formatCount } from '../lib/format';
+import { api } from '../api';
+
 
 const SECTIONS = [
   { value: 'services', label: 'SERVICES', hotkey: 's' },
@@ -197,13 +199,28 @@ function Services({ latest, filter }) {
   );
 }
 
-function Containers({ latest, filter }) {
-  const rows = listOf(latest, 'containers', 'containers').map((c) => ({
-    ...c,
-    cpu: c.metrics && typeof c.metrics.cpu_percent === 'number' ? c.metrics.cpu_percent : null,
-    mem: c.metrics && typeof c.metrics.memory_usage_bytes === 'number' ? c.metrics.memory_usage_bytes : null,
-    memLimit: c.metrics && typeof c.metrics.memory_limit_bytes === 'number' ? c.metrics.memory_limit_bytes : null,
-  }));
+function Containers({ latest, filter, containerOverrides = {}, onActionContainer, onViewLogs }) {
+  const rows = listOf(latest, 'containers', 'containers').map((c) => {
+    const id = c.id || c.name;
+    const name = c.name || id;
+    let state = c.state;
+    let status = c.status;
+    if (containerOverrides[id]) {
+      state = containerOverrides[id].state;
+      status = containerOverrides[id].status;
+    } else if (containerOverrides[name]) {
+      state = containerOverrides[name].state;
+      status = containerOverrides[name].status;
+    }
+    return {
+      ...c,
+      state,
+      status,
+      cpu: c.metrics && typeof c.metrics.cpu_percent === 'number' ? c.metrics.cpu_percent : null,
+      mem: c.metrics && typeof c.metrics.memory_usage_bytes === 'number' ? c.metrics.memory_usage_bytes : null,
+      memLimit: c.metrics && typeof c.metrics.memory_limit_bytes === 'number' ? c.metrics.memory_limit_bytes : null,
+    };
+  });
 
   const cols = [
     {
@@ -263,6 +280,107 @@ function Containers({ latest, filter }) {
       label: 'STATUS',
       render: (r) => <span style={{ color: '#7a9680', fontSize: 11 }}>{r.status || '—'}</span>,
     },
+    {
+      key: 'actions',
+      label: 'ACTIONS',
+      render: (r) => {
+        const stateStr = String(r.state || r.status || '').toLowerCase();
+        const isRunning = stateStr.includes('running') || stateStr === 'active' || stateStr === 'up';
+        return (
+          <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+            {isRunning ? (
+              <>
+                <button
+                  type="button"
+                  className="btn btn-sm"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onActionContainer && onActionContainer({ action: 'stop', container: r });
+                  }}
+                  style={{
+                    background: 'rgba(239, 68, 68, 0.12)',
+                    border: '1px solid #7f1d1d',
+                    color: '#f87171',
+                    padding: '2px 7px',
+                    fontSize: 10.5,
+                    fontWeight: 700,
+                    letterSpacing: '0.04em',
+                    borderRadius: 4,
+                  }}
+                  title="Stop this running container"
+                >
+                  STOP
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-sm"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onActionContainer && onActionContainer({ action: 'restart', container: r });
+                  }}
+                  style={{
+                    background: 'rgba(245, 158, 11, 0.12)',
+                    border: '1px solid #78350f',
+                    color: '#fbbf24',
+                    padding: '2px 7px',
+                    fontSize: 10.5,
+                    fontWeight: 700,
+                    letterSpacing: '0.04em',
+                    borderRadius: 4,
+                  }}
+                  title="Restart container"
+                >
+                  RESTART
+                </button>
+              </>
+            ) : (
+              <button
+                type="button"
+                className="btn btn-sm"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onActionContainer && onActionContainer({ action: 'start', container: r });
+                }}
+                style={{
+                  background: 'rgba(34, 197, 94, 0.12)',
+                  border: '1px solid #14532d',
+                  color: '#4ade80',
+                  padding: '2px 7px',
+                  fontSize: 10.5,
+                  fontWeight: 700,
+                  letterSpacing: '0.04em',
+                  borderRadius: 4,
+                }}
+                title="Start container"
+              >
+                START
+              </button>
+            )}
+            <button
+              type="button"
+              className="btn btn-sm"
+              onClick={(e) => {
+                e.stopPropagation();
+                onViewLogs && onViewLogs(r);
+              }}
+              style={{
+                background: 'rgba(6, 182, 212, 0.12)',
+                border: '1px solid #164e63',
+                color: '#22d3ee',
+                padding: '2px 7px',
+                fontSize: 10.5,
+                fontWeight: 700,
+                letterSpacing: '0.04em',
+                borderRadius: 4,
+              }}
+              title="View container logs"
+            >
+              LOGS
+            </button>
+          </div>
+        );
+      },
+    },
   ];
 
   return (
@@ -280,8 +398,24 @@ function Containers({ latest, filter }) {
   );
 }
 
-function Vms({ latest, filter }) {
-  const rows = listOf(latest, 'vms', 'vms');
+function Vms({ latest, filter, vmOverrides = {}, onActionVm }) {
+  const rows = listOf(latest, 'vms', 'vms').map((v) => {
+    const targetId = v.name || (v.vmid ? String(v.vmid) : '');
+    let state = v.state;
+    let status = v.status;
+    if (vmOverrides[targetId]) {
+      state = vmOverrides[targetId].state;
+      status = vmOverrides[targetId].status;
+    } else if (v.name && vmOverrides[v.name]) {
+      state = vmOverrides[v.name].state;
+      status = vmOverrides[v.name].status;
+    }
+    return {
+      ...v,
+      state,
+      status,
+    };
+  });
   const cols = [
     {
       key: 'name',
@@ -312,6 +446,86 @@ function Vms({ latest, filter }) {
       key: 'used_memory',
       label: 'USED MEMORY',
       render: (r) => <span style={{ color: '#06b6d4', fontWeight: 700 }}>{r.used_memory ? formatBytes(r.used_memory) : '—'}</span>,
+    },
+    {
+      key: 'actions',
+      label: 'ACTIONS',
+      render: (r) => {
+        const stateStr = String(r.state || r.status || '').toLowerCase();
+        const isRunning = stateStr.includes('running') || stateStr === 'active' || stateStr === 'up';
+        return (
+          <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+            {isRunning ? (
+              <>
+                <button
+                  type="button"
+                  className="btn btn-sm"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onActionVm && onActionVm({ action: 'stop', vm: r });
+                  }}
+                  style={{
+                    background: 'rgba(239, 68, 68, 0.12)',
+                    border: '1px solid #7f1d1d',
+                    color: '#f87171',
+                    padding: '2px 7px',
+                    fontSize: 10.5,
+                    fontWeight: 700,
+                    letterSpacing: '0.04em',
+                    borderRadius: 4,
+                  }}
+                  title="Stop virtual machine"
+                >
+                  STOP
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-sm"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onActionVm && onActionVm({ action: 'restart', vm: r });
+                  }}
+                  style={{
+                    background: 'rgba(245, 158, 11, 0.12)',
+                    border: '1px solid #78350f',
+                    color: '#fbbf24',
+                    padding: '2px 7px',
+                    fontSize: 10.5,
+                    fontWeight: 700,
+                    letterSpacing: '0.04em',
+                    borderRadius: 4,
+                  }}
+                  title="Restart virtual machine"
+                >
+                  RESTART
+                </button>
+              </>
+            ) : (
+              <button
+                type="button"
+                className="btn btn-sm"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onActionVm && onActionVm({ action: 'start', vm: r });
+                }}
+                style={{
+                  background: 'rgba(34, 197, 94, 0.12)',
+                  border: '1px solid #14532d',
+                  color: '#4ade80',
+                  padding: '2px 7px',
+                  fontSize: 10.5,
+                  fontWeight: 700,
+                  letterSpacing: '0.04em',
+                  borderRadius: 4,
+                }}
+                title="Start virtual machine"
+              >
+                START
+              </button>
+            )}
+          </div>
+        );
+      },
     },
   ];
 
@@ -656,14 +870,160 @@ function Capabilities({ caps }) {
 
 function emptyMsg(latest, cat, what) {
   const status = agentStatus(latest, cat);
-  if (status === null) return `No ${what} yet. The host collector has not reported this category.`;
+  if (status === 'not_configured') return `No ${what} configured or detected on this host.`;
   if (status === 'unavailable' || status === 'permission_denied') return `The collector reports ${what} as ${status.replace('_', ' ')} on this host.`;
+  if (status === 'available') return `No active ${what} found on this host.`;
+  if (status === null) return `No ${what} detected on this host.`;
   return `No ${what} reported.`;
 }
 
-export default function InventoryTab({ node, state, section, setSection, onBack, onChangeView }) {
+export default function InventoryTab({ node, state, section, setSection, onBack, onChangeView, onToast, onRefresh, onKilledPids }) {
   const [filter, setFilter] = useState('');
+  const [containerOverrides, setContainerOverrides] = useState(() => ({}));
+  const [vmOverrides, setVmOverrides] = useState(() => ({}));
+
+  // Workload Lifecycle Action Modals
+  const [pendingContainerAction, setPendingContainerAction] = useState(null);
+  const [executingContainerAction, setExecutingContainerAction] = useState(false);
+
+  const [pendingVmAction, setPendingVmAction] = useState(null);
+  const [executingVmAction, setExecutingVmAction] = useState(false);
+  const [forceVm, setForceVm] = useState(false);
+
+  // Instant Container Log Stream Modal
+  const [logContainer, setLogContainer] = useState(null);
+  const [logData, setLogData] = useState('');
+  const [logLoading, setLogLoading] = useState(false);
+  const [logError, setLogError] = useState(null);
+  const [logTail, setLogTail] = useState(200);
+  const [logWrap, setLogWrap] = useState(true);
+  const [copied, setCopied] = useState(false);
+  const logsContainerRef = useRef(null);
+
   const latest = state.data && state.data.latest;
+
+  useEffect(() => {
+    if (logsContainerRef.current) {
+      logsContainerRef.current.scrollTop = logsContainerRef.current.scrollHeight;
+    }
+  }, [logData]);
+
+  async function handleConfirmContainerAction() {
+    if (!pendingContainerAction || !node) return;
+    setExecutingContainerAction(true);
+    const { action, container } = pendingContainerAction;
+    const targetId = container.id || container.name;
+    const targetName = container.name || targetId;
+
+    try {
+      if (action === 'stop') {
+        const res = await api.stopContainer(node.id, targetId, 10);
+        setContainerOverrides((prev) => ({
+          ...prev,
+          [targetId]: { state: 'exited', status: 'Exited (manual stop)' },
+          [targetName]: { state: 'exited', status: 'Exited (manual stop)' },
+        }));
+        if (res && Array.isArray(res.stopped_pids) && res.stopped_pids.length > 0 && onKilledPids) {
+          onKilledPids(res.stopped_pids);
+        }
+        onToast && onToast(`Container ${targetName} stopped`);
+      } else if (action === 'start') {
+        await api.startContainer(node.id, targetId);
+        setContainerOverrides((prev) => ({
+          ...prev,
+          [targetId]: { state: 'running', status: 'Up (just started)' },
+          [targetName]: { state: 'running', status: 'Up (just started)' },
+        }));
+        onToast && onToast(`Container ${targetName} started`);
+      } else if (action === 'restart') {
+        await api.restartContainer(node.id, targetId, 10);
+        setContainerOverrides((prev) => ({
+          ...prev,
+          [targetId]: { state: 'running', status: 'Up (just restarted)' },
+          [targetName]: { state: 'running', status: 'Up (just restarted)' },
+        }));
+        onToast && onToast(`Container ${targetName} restarted`);
+      }
+      setPendingContainerAction(null);
+      if (onRefresh) onRefresh();
+    } catch (err) {
+      onToast && onToast(`Failed to ${action} container: ${err.message}`, true);
+    } finally {
+      setExecutingContainerAction(false);
+    }
+  }
+
+  async function handleConfirmVmAction() {
+    if (!pendingVmAction || !node) return;
+    setExecutingVmAction(true);
+    const { action, vm } = pendingVmAction;
+    const targetId = vm.name || (vm.vmid ? String(vm.vmid) : '');
+    const targetName = vm.name || targetId;
+
+    try {
+      if (action === 'stop') {
+        await api.stopVm(node.id, targetId, forceVm);
+        setVmOverrides((prev) => ({
+          ...prev,
+          [targetId]: { state: 'shut off', status: 'shut off' },
+          [targetName]: { state: 'shut off', status: 'shut off' },
+        }));
+        onToast && onToast(`Virtual machine ${targetName} stopped`);
+      } else if (action === 'start') {
+        await api.startVm(node.id, targetId);
+        setVmOverrides((prev) => ({
+          ...prev,
+          [targetId]: { state: 'running', status: 'running' },
+          [targetName]: { state: 'running', status: 'running' },
+        }));
+        onToast && onToast(`Virtual machine ${targetName} started`);
+      } else if (action === 'restart') {
+        await api.restartVm(node.id, targetId, forceVm);
+        setVmOverrides((prev) => ({
+          ...prev,
+          [targetId]: { state: 'running', status: 'running' },
+          [targetName]: { state: 'running', status: 'running' },
+        }));
+        onToast && onToast(`Virtual machine ${targetName} restarted`);
+      }
+      setPendingVmAction(null);
+      if (onRefresh) onRefresh();
+    } catch (err) {
+      onToast && onToast(`Failed to ${action} VM: ${err.message}`, true);
+    } finally {
+      setExecutingVmAction(false);
+    }
+  }
+
+  async function fetchContainerLogs(c, tail = logTail) {
+    if (!c || !node) return;
+    setLogLoading(true);
+    setLogError(null);
+    const targetId = c.id || c.name;
+    try {
+      const res = await api.getContainerLogs(node.id, targetId, tail);
+      setLogData(res.logs || '(no logs produced by container)');
+    } catch (err) {
+      setLogError(err.message || 'Failed to fetch logs');
+    } finally {
+      setLogLoading(false);
+    }
+  }
+
+  function handleOpenLogs(c) {
+    setLogContainer(c);
+    setLogData('');
+    setLogError(null);
+    fetchContainerLogs(c, logTail);
+  }
+
+  function handleCopyLogs() {
+    if (!logData) return;
+    navigator.clipboard.writeText(logData).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    });
+  }
 
   if (state.loading && !state.data) return <Empty><span className="spinner" /> loading telemetry…</Empty>;
   if (!state.data) return <ErrorLine>{state.error || 'No data'}</ErrorLine>;
@@ -723,13 +1083,542 @@ export default function InventoryTab({ node, state, section, setSection, onBack,
           }}
         >
           {section === 'services' && <Services latest={latest} filter={filter} />}
-          {section === 'containers' && <Containers latest={latest} filter={filter} />}
-          {section === 'vms' && <Vms latest={latest} filter={filter} />}
+          {section === 'containers' && (
+            <Containers
+              latest={latest}
+              filter={filter}
+              containerOverrides={containerOverrides}
+              onActionContainer={(act) => setPendingContainerAction(act)}
+              onViewLogs={handleOpenLogs}
+            />
+          )}
+          {section === 'vms' && (
+            <Vms
+              latest={latest}
+              filter={filter}
+              vmOverrides={vmOverrides}
+              onActionVm={(act) => {
+                setPendingVmAction(act);
+                setForceVm(false);
+              }}
+            />
+          )}
           {section === 'sockets' && <Sockets latest={latest} filter={filter} />}
           {section === 'storage' && <Storage latest={latest} filter={filter} />}
           {section === 'caps' && <Capabilities caps={caps} />}
         </div>
       </Box>
+
+      {/* Container Action Confirmation Modal */}
+      {pendingContainerAction && (
+        <div
+          className="modal-back"
+          style={{
+            position: 'fixed',
+            inset: 0,
+            background: 'rgba(0, 0, 0, 0.75)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            zIndex: 1000,
+          }}
+          onMouseDown={(e) => {
+            if (e.target === e.currentTarget && !executingContainerAction) setPendingContainerAction(null);
+          }}
+        >
+          <div
+            className="box modal hot"
+            role="dialog"
+            aria-modal="true"
+            style={{
+              maxWidth: 480,
+              width: '90%',
+              padding: '22px 20px',
+              background: '#070c08',
+              border: `1px solid ${
+                pendingContainerAction.action === 'stop'
+                  ? '#7f1d1d'
+                  : pendingContainerAction.action === 'restart'
+                  ? '#78350f'
+                  : '#14532d'
+              }`,
+              borderRadius: 8,
+              boxShadow: '0 10px 25px rgba(0,0,0,0.8)',
+            }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 12 }}>
+              {pendingContainerAction.action === 'stop' && (
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#ef4444" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <rect x="3" y="3" width="18" height="18" rx="2" ry="2" />
+                  <line x1="9" y1="9" x2="15" y2="15" />
+                  <line x1="15" y1="9" x2="9" y2="15" />
+                </svg>
+              )}
+              {pendingContainerAction.action === 'restart' && (
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#fbbf24" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <polyline points="23 4 23 10 17 10" />
+                  <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10" />
+                </svg>
+              )}
+              {pendingContainerAction.action === 'start' && (
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#4ade80" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <polygon points="5 3 19 12 5 21 5 3" />
+                </svg>
+              )}
+              <h3
+                style={{
+                  margin: 0,
+                  fontSize: 16,
+                  fontWeight: 800,
+                  color:
+                    pendingContainerAction.action === 'stop'
+                      ? '#f87171'
+                      : pendingContainerAction.action === 'restart'
+                      ? '#fbbf24'
+                      : '#4ade80',
+                  letterSpacing: '0.04em',
+                }}
+              >
+                {pendingContainerAction.action.toUpperCase()} CONTAINER
+              </h3>
+            </div>
+
+            <p style={{ margin: '0 0 16px', fontSize: 13, color: '#d8dee9', lineHeight: 1.5 }}>
+              Are you sure you want to {pendingContainerAction.action} container{' '}
+              <b>{pendingContainerAction.container.name || pendingContainerAction.container.id}</b>
+              {pendingContainerAction.container.image ? ` (${pendingContainerAction.container.image})` : ''}?
+            </p>
+
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10 }}>
+              <button
+                type="button"
+                className="btn"
+                onClick={() => setPendingContainerAction(null)}
+                disabled={executingContainerAction}
+                style={{ background: '#122416', border: '1px solid #244b2c', color: '#a3c4aa' }}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="btn btn-hot"
+                onClick={handleConfirmContainerAction}
+                disabled={executingContainerAction}
+                style={{
+                  background:
+                    pendingContainerAction.action === 'stop'
+                      ? '#7f1d1d'
+                      : pendingContainerAction.action === 'restart'
+                      ? '#78350f'
+                      : '#14532d',
+                  border: `1px solid ${
+                    pendingContainerAction.action === 'stop'
+                      ? '#dc2626'
+                      : pendingContainerAction.action === 'restart'
+                      ? '#d97706'
+                      : '#16a34a'
+                  }`,
+                  color: '#fff',
+                  fontWeight: 800,
+                  minWidth: 120,
+                }}
+              >
+                {executingContainerAction
+                  ? `${pendingContainerAction.action === 'stop' ? 'Stopping' : pendingContainerAction.action === 'restart' ? 'Restarting' : 'Starting'}…`
+                  : `${pendingContainerAction.action === 'stop' ? 'Stop Container' : pendingContainerAction.action === 'restart' ? 'Restart Container' : 'Start Container'}`}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* VM Action Confirmation Modal */}
+      {pendingVmAction && (
+        <div
+          className="modal-back"
+          style={{
+            position: 'fixed',
+            inset: 0,
+            background: 'rgba(0, 0, 0, 0.75)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            zIndex: 1000,
+          }}
+          onMouseDown={(e) => {
+            if (e.target === e.currentTarget && !executingVmAction) setPendingVmAction(null);
+          }}
+        >
+          <div
+            className="box modal hot"
+            role="dialog"
+            aria-modal="true"
+            style={{
+              maxWidth: 480,
+              width: '90%',
+              padding: '22px 20px',
+              background: '#070c08',
+              border: `1px solid ${
+                pendingVmAction.action === 'stop'
+                  ? '#7f1d1d'
+                  : pendingVmAction.action === 'restart'
+                  ? '#78350f'
+                  : '#14532d'
+              }`,
+              borderRadius: 8,
+              boxShadow: '0 10px 25px rgba(0,0,0,0.8)',
+            }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 12 }}>
+              {pendingVmAction.action === 'stop' && (
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#ef4444" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <rect x="2" y="3" width="20" height="14" rx="2" ry="2"/>
+                  <line x1="8" y1="21" x2="16" y2="21"/>
+                  <line x1="12" y1="17" x2="12" y2="21"/>
+                </svg>
+              )}
+              {pendingVmAction.action === 'restart' && (
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#fbbf24" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <polyline points="23 4 23 10 17 10" />
+                  <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10" />
+                </svg>
+              )}
+              {pendingVmAction.action === 'start' && (
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#4ade80" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <polygon points="5 3 19 12 5 21 5 3" />
+                </svg>
+              )}
+              <h3
+                style={{
+                  margin: 0,
+                  fontSize: 16,
+                  fontWeight: 800,
+                  color:
+                    pendingVmAction.action === 'stop'
+                      ? '#f87171'
+                      : pendingVmAction.action === 'restart'
+                      ? '#fbbf24'
+                      : '#4ade80',
+                  letterSpacing: '0.04em',
+                }}
+              >
+                {pendingVmAction.action.toUpperCase()} VIRTUAL MACHINE
+              </h3>
+            </div>
+
+            <p style={{ margin: '0 0 16px', fontSize: 13, color: '#d8dee9', lineHeight: 1.5 }}>
+              Are you sure you want to {pendingVmAction.action} virtual machine <b>{pendingVmAction.vm.name}</b>
+              {pendingVmAction.vm.runtime ? ` (${pendingVmAction.vm.runtime})` : ''}?
+            </p>
+
+            {pendingVmAction.action === 'stop' && (
+              <div style={{ marginBottom: 16 }}>
+                <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, color: '#cbd5e1', cursor: 'pointer' }}>
+                  <input
+                    type="checkbox"
+                    checked={forceVm}
+                    onChange={(e) => setForceVm(e.target.checked)}
+                    style={{ accentColor: '#ef4444' }}
+                  />
+                  Force immediate power off (destroy / hard stop)
+                </label>
+              </div>
+            )}
+
+            {pendingVmAction.action === 'restart' && (
+              <div style={{ marginBottom: 16 }}>
+                <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, color: '#cbd5e1', cursor: 'pointer' }}>
+                  <input
+                    type="checkbox"
+                    checked={forceVm}
+                    onChange={(e) => setForceVm(e.target.checked)}
+                    style={{ accentColor: '#fbbf24' }}
+                  />
+                  Hard reset instead of graceful reboot
+                </label>
+              </div>
+            )}
+
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10 }}>
+              <button
+                type="button"
+                className="btn"
+                onClick={() => setPendingVmAction(null)}
+                disabled={executingVmAction}
+                style={{ background: '#122416', border: '1px solid #244b2c', color: '#a3c4aa' }}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="btn btn-hot"
+                onClick={handleConfirmVmAction}
+                disabled={executingVmAction}
+                style={{
+                  background:
+                    pendingVmAction.action === 'stop'
+                      ? '#7f1d1d'
+                      : pendingVmAction.action === 'restart'
+                      ? '#78350f'
+                      : '#14532d',
+                  border: `1px solid ${
+                    pendingVmAction.action === 'stop'
+                      ? '#dc2626'
+                      : pendingVmAction.action === 'restart'
+                      ? '#d97706'
+                      : '#16a34a'
+                  }`,
+                  color: '#fff',
+                  fontWeight: 800,
+                  minWidth: 120,
+                }}
+              >
+                {executingVmAction
+                  ? `${pendingVmAction.action === 'stop' ? 'Stopping' : pendingVmAction.action === 'restart' ? 'Restarting' : 'Starting'}…`
+                  : `${pendingVmAction.action === 'stop' ? (forceVm ? 'Force Stop' : 'Graceful Stop') : pendingVmAction.action === 'restart' ? (forceVm ? 'Hard Reset' : 'Reboot VM') : 'Start VM'}`}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Instant Container Log Stream Modal */}
+      {logContainer && (
+        <div
+          className="modal-back"
+          style={{
+            position: 'fixed',
+            inset: 0,
+            background: 'rgba(0, 0, 0, 0.8)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            zIndex: 1000,
+          }}
+          onMouseDown={(e) => {
+            if (e.target === e.currentTarget) setLogContainer(null);
+          }}
+        >
+          <div
+            className="box modal hot"
+            role="dialog"
+            aria-modal="true"
+            style={{
+              maxWidth: 820,
+              width: '94%',
+              maxHeight: '90vh',
+              display: 'flex',
+              flexDirection: 'column',
+              padding: '18px 20px',
+              background: '#040805',
+              border: '1px solid #1a3d24',
+              borderRadius: 8,
+              boxShadow: '0 12px 30px rgba(0,0,0,0.9)',
+            }}
+          >
+            {/* Modal Header */}
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#22d3ee" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <polyline points="4 17 10 11 4 5" />
+                  <line x1="12" y1="19" x2="20" y2="19" />
+                </svg>
+                <div>
+                  <h3 style={{ margin: 0, fontSize: 15, fontWeight: 800, color: '#fff', letterSpacing: '0.03em', fontFamily: 'JetBrains Mono, monospace' }}>
+                    CONTAINER LOGS: {logContainer.name || logContainer.id}
+                  </h3>
+                  <div style={{ fontSize: 11, color: '#7a9680', marginTop: 2 }}>
+                    Image: <span style={{ color: '#a3c4aa' }}>{logContainer.image || '—'}</span> &bull; Runtime: <span style={{ color: '#06b6d4' }}>{logContainer.runtime || 'docker'}</span>
+                  </div>
+                </div>
+              </div>
+
+              {/* Close Button */}
+              <button
+                type="button"
+                className="btn btn-sm"
+                onClick={() => setLogContainer(null)}
+                style={{
+                  background: 'transparent',
+                  border: '1px solid #244b2c',
+                  color: '#94a3b8',
+                  padding: '4px 8px',
+                  borderRadius: 4,
+                  cursor: 'pointer',
+                }}
+                title="Close logs"
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <line x1="18" y1="6" x2="6" y2="18" />
+                  <line x1="6" y1="6" x2="18" y2="18" />
+                </svg>
+              </button>
+            </div>
+
+            {/* Modal Control Toolbar */}
+            <div
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                flexWrap: 'wrap',
+                gap: 8,
+                padding: '8px 10px',
+                background: '#071009',
+                border: '1px solid #142e1a',
+                borderRadius: 6,
+                marginBottom: 10,
+              }}
+            >
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <span style={{ fontSize: 11, color: '#728c78', fontWeight: 600 }}>TAIL:</span>
+                {[50, 100, 200, 500].map((t) => (
+                  <button
+                    key={t}
+                    type="button"
+                    onClick={() => {
+                      setLogTail(t);
+                      fetchContainerLogs(logContainer, t);
+                    }}
+                    style={{
+                      background: logTail === t ? 'rgba(6, 182, 212, 0.2)' : 'transparent',
+                      border: `1px solid ${logTail === t ? '#06b6d4' : '#1a3821'}`,
+                      color: logTail === t ? '#22d3ee' : '#728c78',
+                      fontSize: 10.5,
+                      fontWeight: 700,
+                      padding: '2px 7px',
+                      borderRadius: 4,
+                      cursor: 'pointer',
+                    }}
+                  >
+                    {t}
+                  </button>
+                ))}
+              </div>
+
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <button
+                  type="button"
+                  onClick={() => setLogWrap(!logWrap)}
+                  style={{
+                    background: logWrap ? 'rgba(57, 229, 105, 0.12)' : 'transparent',
+                    border: `1px solid ${logWrap ? '#2d6b3c' : '#1a3821'}`,
+                    color: logWrap ? '#39e569' : '#728c78',
+                    fontSize: 11,
+                    fontWeight: 600,
+                    padding: '3px 8px',
+                    borderRadius: 4,
+                    cursor: 'pointer',
+                  }}
+                  title="Toggle text wrapping"
+                >
+                  {logWrap ? 'Wrap: On' : 'Wrap: Off'}
+                </button>
+
+                <button
+                  type="button"
+                  onClick={handleCopyLogs}
+                  disabled={!logData || logLoading}
+                  style={{
+                    background: copied ? 'rgba(57, 229, 105, 0.15)' : 'transparent',
+                    border: `1px solid ${copied ? '#39e569' : '#1a3821'}`,
+                    color: copied ? '#39e569' : '#a3c4aa',
+                    fontSize: 11,
+                    fontWeight: 600,
+                    padding: '3px 8px',
+                    borderRadius: 4,
+                    cursor: 'pointer',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 5,
+                  }}
+                  title="Copy log text"
+                >
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
+                    <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+                  </svg>
+                  {copied ? 'Copied' : 'Copy'}
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => fetchContainerLogs(logContainer, logTail)}
+                  disabled={logLoading}
+                  style={{
+                    background: 'rgba(6, 182, 212, 0.12)',
+                    border: '1px solid #164e63',
+                    color: '#22d3ee',
+                    fontSize: 11,
+                    fontWeight: 700,
+                    padding: '3px 9px',
+                    borderRadius: 4,
+                    cursor: 'pointer',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 5,
+                  }}
+                  title="Refresh logs"
+                >
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <polyline points="23 4 23 10 17 10" />
+                    <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10" />
+                  </svg>
+                  {logLoading ? 'Refreshing…' : 'Refresh'}
+                </button>
+              </div>
+            </div>
+
+            {/* Log Terminal Window */}
+            <div
+              ref={logsContainerRef}
+              style={{
+                flex: 1,
+                minHeight: 280,
+                maxHeight: 520,
+                background: '#020503',
+                border: '1px solid #142e1a',
+                borderRadius: 6,
+                padding: '12px 14px',
+                overflowY: 'auto',
+                overflowX: logWrap ? 'hidden' : 'auto',
+                fontFamily: 'JetBrains Mono, monospace',
+                fontSize: 11.5,
+                lineHeight: 1.5,
+                color: '#d8dee9',
+              }}
+            >
+              {logLoading && !logData && (
+                <div style={{ color: '#728c78', padding: '16px 0', display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <span className="spinner" /> Streaming container logs…
+                </div>
+              )}
+              {logError && (
+                <div style={{ color: '#f87171', background: 'rgba(239,68,68,0.1)', padding: '8px 12px', borderRadius: 4, border: '1px solid #7f1d1d' }}>
+                  Failed to fetch logs: {logError}
+                </div>
+              )}
+              {!logLoading && !logError && !logData && (
+                <div style={{ color: '#566e5d' }}>(no output produced by container)</div>
+              )}
+              {logData && (
+                <pre
+                  style={{
+                    margin: 0,
+                    fontFamily: 'inherit',
+                    fontSize: 'inherit',
+                    whiteSpace: logWrap ? 'pre-wrap' : 'pre',
+                    wordBreak: logWrap ? 'break-word' : 'normal',
+                    color: '#c0caf5',
+                  }}
+                >
+                  {logData}
+                </pre>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </>
   );
 }

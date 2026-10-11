@@ -11,7 +11,6 @@ from api.v1.nodes import router as nodes_router
 from api.v1.metrics import router as metrics_router
 from api.v1.alerts import router as alerts_router
 from api.v1.investigations import router as investigations_router
-from api.v1.internal import router as internal_router
 from api.v1.logs import router as logs_router
 from api.v1.fleet import router as fleet_router
 from api.v1.events import router as events_router
@@ -19,6 +18,7 @@ from api.v1.catalog import router as metric_catalog_router
 from api.v1.fleet_logs import router as fleet_logs_router
 from api.v1.health import router as operational_health_router
 from api.v1.settings import router as settings_router
+from api.v1.internal import router as internal_router
 
 logging.basicConfig(
     level=logging.INFO,
@@ -80,9 +80,6 @@ app.add_middleware(
 async def healthz():
     return {"status": "ok", "app": settings.PROJECT_NAME}
 
-# Internal router (alert webhook)
-app.include_router(internal_router, prefix="/internal", tags=["Internal Webhooks"])
-
 # Public API v1 routers
 app.include_router(nodes_router, prefix=settings.API_V1_STR)
 app.include_router(metrics_router, prefix=settings.API_V1_STR, dependencies=[Depends(require_read)])
@@ -99,3 +96,4 @@ app.include_router(
     prefix=settings.API_V1_STR,
     dependencies=[Depends(require_read)],
 )
+app.include_router(internal_router, prefix="/internal")

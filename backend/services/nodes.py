@@ -3,7 +3,7 @@ from typing import List, Optional
 from datetime import datetime, timezone
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
-from core.security import validate_netdata_url
+from core.security import validate_collector_url
 from integrations.agent.client import AgentCollectorClient
 from models.node import MonitoredNode
 from models.alert import AlertEvent
@@ -26,7 +26,7 @@ class NodeService:
         """Register (or update) a node using PALANTIR host collector."""
         if not collector_url:
             raise ValueError("collector_url is required")
-        collector_url = validate_netdata_url(collector_url)
+        collector_url = validate_collector_url(collector_url)
         os_type = os_type.strip().lower() if os_type else "linux"
 
         try:
@@ -49,10 +49,23 @@ class NodeService:
         elif os_type not in {"linux", "windows"}:
             os_type = "linux"
 
-        stmt = select(MonitoredNode).where(MonitoredNode.hostname == hostname)
-        existing = (await session.execute(stmt)).scalar_one_or_none()
+        machine_id = str(info.get("machine_id", "")).strip().lower() or None
+
+        # 1. First look up by persistent machine_id if available
+        existing = None
+        if machine_id:
+            stmt = select(MonitoredNode).where(MonitoredNode.machine_id == machine_id)
+            existing = (await session.execute(stmt)).scalar_one_or_none()
+
+        # 2. Fall back to hostname match (for legacy records before machine_id was tracked)
+        if not existing:
+            stmt = select(MonitoredNode).where(MonitoredNode.hostname == hostname)
+            existing = (await session.execute(stmt)).scalar_one_or_none()
 
         if existing:
+            if machine_id and not existing.machine_id:
+                existing.machine_id = machine_id
+            existing.hostname = hostname  # Update to new hostname if machine was renamed
             existing.collector_url = collector_url
             if capabilities is not None:
                 existing.capabilities = capabilities
@@ -65,6 +78,7 @@ class NodeService:
 
         node = MonitoredNode(
             hostname=hostname,
+            machine_id=machine_id,
             collector_url=collector_url,
             capabilities=capabilities,
             os_type=os_type,

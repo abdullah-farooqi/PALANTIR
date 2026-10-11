@@ -49,6 +49,15 @@ function Dashboard() {
   const [toast, setToast] = useState(null);
   const toastTimer = useRef(null);
   const [prevView, setPrevView] = useState('fleet');
+  const [killedPids, setKilledPids] = useState(() => new Set());
+  const handleKilledPids = useCallback((pids) => {
+    if (!pids) return;
+    const list = Array.isArray(pids) ? pids : [pids];
+    const nums = list.map(Number).filter((n) => n > 1);
+    if (nums.length > 0) {
+      setKilledPids((prev) => new Set([...prev, ...nums]));
+    }
+  }, []);
 
   const setRange = useCallback((r) => { setRangeState(r); write('palantir.range', r.key); }, []);
   const setRefreshMs = useCallback((v) => { setRefreshMsState(v); write('palantir.refresh', v); }, []);
@@ -201,15 +210,15 @@ function Dashboard() {
   } else if (!node) {
     body = <Empty>Select a node.</Empty>;
   } else if (view === 'overview') {
-    body = <OverviewTab node={node} state={nodeData} range={range} setRange={setRange} onBack={goBack} onChangeView={changeView} />;
+    body = <OverviewTab node={node} state={nodeData} range={range} setRange={setRange} onBack={goBack} onChangeView={changeView} onToast={notify} onRefresh={nodeData.refresh} killedPids={killedPids} onKilledPids={handleKilledPids} />;
   } else if (view === 'inventory') {
-    body = <InventoryTab node={node} state={nodeData} section={section} setSection={setSection} onBack={goBack} onChangeView={changeView} />;
+    body = <InventoryTab node={node} state={nodeData} section={section} setSection={setSection} onBack={goBack} onChangeView={changeView} onToast={notify} onRefresh={nodeData.refresh} onKilledPids={handleKilledPids} />;
   } else if (view === 'events') {
     body = <AlertsTab node={node} state={nodeData} scope={scope} setScope={setScope} onInvestigate={onInvestigate} refreshMs={refreshMs} onBack={goBack} onChangeView={changeView} />;
   } else if (view === 'logs') {
     body = <LogsTab node={node} scope={scope} setScope={setScope} refreshMs={refreshMs} onBack={goBack} onChangeView={changeView} />;
   } else {
-    body = <InvestigationsTab node={node} scope={scope} setScope={setScope} refreshMs={refreshMs} focusId={focusInv} onToast={notify} onBack={goBack} onChangeView={changeView} />;
+    body = <InvestigationsTab node={node} scope={scope} setScope={setScope} refreshMs={refreshMs} focusId={focusInv} onToast={notify} onBack={goBack} onChangeView={changeView} fleet={fleet} />;
   }
 
   return (

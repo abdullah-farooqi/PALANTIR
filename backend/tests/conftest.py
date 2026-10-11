@@ -39,24 +39,3 @@ def initialize_test_database():
             # If DB is not available (e.g. unit tests without DB), allow tests to proceed or fail gracefully
             pass
 
-
-@pytest.fixture(autouse=True)
-async def ensure_local_node():
-    """Ensure baseline 'local-node' exists for all tests."""
-    try:
-        async with AsyncSessionLocal() as session:
-            stmt = select(MonitoredNode).where(MonitoredNode.hostname == "local-node")
-            node = (await session.execute(stmt)).scalar_one_or_none()
-            if not node:
-                node = MonitoredNode(
-                    hostname="local-node",
-                    netdata_url="http://netdata:19999",
-                    os_type="linux",
-                    active=True,
-                    context_count=200,
-                    alert_count=50,
-                )
-                session.add(node)
-                await session.commit()
-    except Exception:
-        pass

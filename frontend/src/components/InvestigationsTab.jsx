@@ -219,7 +219,7 @@ function Evidence({ inv }) {
   );
 }
 
-export default function InvestigationsTab({ node, scope, setScope, refreshMs, focusId, onToast, onBack, onChangeView }) {
+export default function InvestigationsTab({ node, scope, setScope, refreshMs, focusId, onToast, onBack, onChangeView, fleet }) {
   const [status, setStatus] = useState('');
   const [selected, setSelected] = useState(null);
   const [creating, setCreating] = useState(false);
@@ -251,6 +251,13 @@ export default function InvestigationsTab({ node, scope, setScope, refreshMs, fo
     }
   }
 
+  const nodesList = (fleet && fleet.nodes) || [];
+  const getNodeName = (r) => {
+    if (r.node_hostname) return r.node_hostname;
+    const found = nodesList.find((n) => n.id === r.node_id);
+    return found ? found.hostname : (r.node_id ? `#${r.node_id}` : '—');
+  };
+
   const cols = [
     {
       key: 'id',
@@ -258,6 +265,15 @@ export default function InvestigationsTab({ node, scope, setScope, refreshMs, fo
       num: true,
       render: (r) => <span style={{ color: '#22d3ee', fontWeight: 700, fontFamily: 'JetBrains Mono, monospace' }}>#{r.id}</span>,
     },
+    ...(scope === 'fleet' ? [{
+      key: 'host',
+      label: 'HOST',
+      render: (r) => (
+        <span style={{ color: '#39e569', fontWeight: 700, fontFamily: 'JetBrains Mono, monospace', fontSize: 11.5 }}>
+          {getNodeName(r)}
+        </span>
+      ),
+    }] : []),
     { key: 'status', label: 'STATUS', render: (r) => <Badge tone={statusTone(r.status)}>{r.status}</Badge> },
     {
       key: 'trigger',
@@ -289,6 +305,26 @@ export default function InvestigationsTab({ node, scope, setScope, refreshMs, fo
       ),
     },
   ];
+
+  const [pendingDelete, setPendingDelete] = useState(null);
+  const [deleting, setDeleting] = useState(false);
+
+  async function handleConfirmDelete() {
+    if (!pendingDelete) return;
+    setDeleting(true);
+    const targetId = pendingDelete.id;
+    try {
+      await api.deleteInvestigation(targetId);
+      onToast(`Investigation #${targetId} deleted`);
+      setPendingDelete(null);
+      if (selected === targetId) setSelected(null);
+      state.refresh();
+    } catch (err) {
+      onToast(`Failed to delete investigation #${targetId}: ${err.message}`, true);
+    } finally {
+      setDeleting(false);
+    }
+  }
 
   return (
     <>
@@ -405,6 +441,18 @@ export default function InvestigationsTab({ node, scope, setScope, refreshMs, fo
                 }}
               >
                 <div>
+                  <div style={{ fontSize: 11, color: '#728c78', textTransform: 'uppercase' }}>TARGET HOST</div>
+                  <div style={{ color: '#22d3ee', fontWeight: 700, fontSize: 13, marginTop: 2, fontFamily: 'JetBrains Mono, monospace' }}>
+                    {current.node_hostname || (node ? node.hostname : `Node #${current.node_id}`)}
+                  </div>
+                </div>
+                <div>
+                  <div style={{ fontSize: 11, color: '#728c78', textTransform: 'uppercase' }}>HOST IP / ENDPOINT</div>
+                  <div style={{ color: '#fbbf24', fontSize: 12, fontWeight: 600, fontFamily: 'JetBrains Mono, monospace', marginTop: 2 }}>
+                    {current.node_ip || (node && node.collector_url ? node.collector_url.replace(/^https?:\/\//, '').replace(/:\d+.*$/, '') : '—')}
+                  </div>
+                </div>
+                <div>
                   <div style={{ fontSize: 11, color: '#728c78', textTransform: 'uppercase' }}>TRIGGER</div>
                   <div style={{ color: '#fff', fontWeight: 700, fontSize: 13, marginTop: 2 }}>{describeTrigger(current)}</div>
                 </div>
@@ -457,10 +505,135 @@ export default function InvestigationsTab({ node, scope, setScope, refreshMs, fo
                   </pre>
                 </details>
               )}
+
+              {/* Bottom Right Actions */}
+              {CAN_WRITE && (
+                <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 24, paddingTop: 14, borderTop: '1px solid #142e1a' }}>
+                  <button
+                    type="button"
+                    onClick={() => setPendingDelete(current)}
+                    style={{
+                      background: 'rgba(239, 68, 68, 0.1)',
+                      border: '1px solid #7f1d1d',
+                      borderRadius: 6,
+                      color: '#f87171',
+                      padding: '7px 16px',
+                      fontSize: 12,
+                      fontWeight: 700,
+                      cursor: 'pointer',
+                      fontFamily: 'JetBrains Mono, monospace',
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: 6,
+                      transition: 'all 0.15s ease',
+                    }}
+                    title="Permanently delete this investigation"
+                  >
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#ef4444" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <polyline points="3 6 5 6 21 6"/>
+                      <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+                      <line x1="10" y1="11" x2="10" y2="17"/>
+                      <line x1="14" y1="11" x2="14" y2="17"/>
+                    </svg>
+                    <span>Delete Investigation</span>
+                  </button>
+                </div>
+              )}
             </div>
           )}
         </Box>
       </div>
+
+      {pendingDelete && (
+        <div
+          className="modal-back"
+          style={{
+            position: 'fixed',
+            inset: 0,
+            background: 'rgba(0, 0, 0, 0.75)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            zIndex: 1000,
+          }}
+          onMouseDown={(e) => {
+            if (e.target === e.currentTarget && !deleting) setPendingDelete(null);
+          }}
+        >
+          <div
+            className="box modal hot"
+            role="dialog"
+            aria-modal="true"
+            style={{
+              maxWidth: 440,
+              width: '90%',
+              padding: '22px 20px',
+              background: '#070c08',
+              border: '1px solid #7f1d1d',
+              borderRadius: 8,
+              boxShadow: '0 10px 25px rgba(0,0,0,0.8)',
+            }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 12 }}>
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#ef4444" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <polyline points="3 6 5 6 21 6"/>
+                <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+                <line x1="10" y1="11" x2="10" y2="17"/>
+                <line x1="14" y1="11" x2="14" y2="17"/>
+              </svg>
+              <h3 style={{ margin: 0, fontSize: 16, fontWeight: 800, color: '#f87171', letterSpacing: '0.04em' }}>
+                DELETE INVESTIGATION
+              </h3>
+            </div>
+
+            <p style={{ margin: '0 0 18px', fontSize: 13, color: '#d8dee9', lineHeight: 1.5 }}>
+              Are you sure you want to permanently delete investigation <b>#{pendingDelete.id}</b> ({describeTrigger(pendingDelete)})?
+            </p>
+
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10 }}>
+              <button
+                type="button"
+                className="btn"
+                disabled={deleting}
+                onClick={() => setPendingDelete(null)}
+                style={{
+                  background: 'transparent',
+                  border: '1px solid #1a3821',
+                  color: '#94a3b8',
+                  padding: '6px 14px',
+                  borderRadius: 6,
+                  cursor: 'pointer',
+                  fontWeight: 600,
+                  fontSize: 12,
+                }}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="btn"
+                disabled={deleting}
+                onClick={handleConfirmDelete}
+                style={{
+                  background: '#dc2626',
+                  border: 'none',
+                  color: '#fff',
+                  padding: '6px 16px',
+                  borderRadius: 6,
+                  cursor: 'pointer',
+                  fontWeight: 700,
+                  fontSize: 12,
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 6,
+                }}
+              >
+                {deleting ? 'Deleting…' : 'Delete Investigation'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </>
   );
 }

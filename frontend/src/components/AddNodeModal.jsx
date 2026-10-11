@@ -2,10 +2,13 @@ import { useEffect, useRef, useState } from 'react';
 import { api } from '../api';
 import { Spinner } from './ui';
 
-const formatUrl = (ip, port) => {
+const formatUrl = (ip, defaultPort = 20000) => {
   if (!ip) return '';
   const clean = ip.trim().replace(/^https?:\/\//i, '').replace(/\/.*$/, '');
-  return `http://${clean}:${port}`;
+  if (clean.includes(':')) {
+    return `http://${clean}`;
+  }
+  return `http://${clean}:${defaultPort}`;
 };
 
 export default function AddNodeModal({ onClose, onCreated }) {

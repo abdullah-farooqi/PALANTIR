@@ -47,7 +47,7 @@ def verify_webhook_secret(secret_header: Optional[str]) -> bool:
     )
 
 
-def validate_netdata_url(url: str) -> str:
+def validate_collector_url(url: str) -> str:
     """
     Strict SSRF and URI validation for remote sensor and collector endpoints.
 

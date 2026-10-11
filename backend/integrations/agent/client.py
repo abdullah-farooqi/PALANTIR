@@ -42,6 +42,25 @@ class AgentCollectorClient:
             raise RuntimeError("Host collector returned a non-object response")
         return payload
 
+    async def _post(
+        self,
+        path: str,
+        params: dict[str, Any] | None = None,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        try:
+            async with httpx.AsyncClient(timeout=timeout or self.timeout) as client:
+                response = await client.post(
+                    f"{self.base_url}{path}", params=params, headers=self._headers()
+                )
+                response.raise_for_status()
+                payload = response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            raise RuntimeError(f"Host collector request failed: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise RuntimeError("Host collector returned a non-object response")
+        return payload
+
     async def info(self) -> dict[str, Any]:
         return await self._get("/api/v1/info", timeout=min(self.timeout, 8.0))
 
@@ -57,3 +76,29 @@ class AgentCollectorClient:
 
     async def get_logs(self, since: float, limit: int = 5000) -> dict[str, Any]:
         return await self._get("/api/v1/logs", {"since": since, "limit": limit})
+
+    async def kill_process(self, pid: int, signal_type: str = "SIGTERM") -> dict[str, Any]:
+        return await self._post(f"/api/v1/processes/{pid}/kill", params={"signal_type": signal_type})
+
+    async def stop_container(self, container_id: str, timeout_seconds: int = 10) -> dict[str, Any]:
+        return await self._post(f"/api/v1/containers/{container_id}/stop", params={"timeout_seconds": timeout_seconds})
+
+    async def start_container(self, container_id: str) -> dict[str, Any]:
+        return await self._post(f"/api/v1/containers/{container_id}/start")
+
+    async def restart_container(self, container_id: str, timeout_seconds: int = 10) -> dict[str, Any]:
+        return await self._post(f"/api/v1/containers/{container_id}/restart", params={"timeout_seconds": timeout_seconds})
+
+    async def get_container_logs(self, container_id: str, tail: int = 200) -> dict[str, Any]:
+        return await self._get(f"/api/v1/containers/{container_id}/logs", {"tail": tail})
+
+    async def stop_vm(self, vm_id: str, force: bool = False) -> dict[str, Any]:
+        return await self._post(f"/api/v1/vms/{vm_id}/stop", params={"force": force})
+
+    async def start_vm(self, vm_id: str) -> dict[str, Any]:
+        return await self._post(f"/api/v1/vms/{vm_id}/start")
+
+    async def restart_vm(self, vm_id: str, force: bool = False) -> dict[str, Any]:
+        return await self._post(f"/api/v1/vms/{vm_id}/restart", params={"force": force})
+
+

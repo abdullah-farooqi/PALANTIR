@@ -8,14 +8,17 @@ import {
   formatBits, formatBytes, formatCount, formatDuration, formatPercent, formatRate, formatRelative, formatNumber,
 } from '../lib/format';
 import { statusTone } from '../lib/events';
+import { api } from '../api';
+import { CAN_WRITE } from '../lib/role';
 
 // ------------------------------------------------------------------ [1] cpu
-function StackedCpuGraph({ points = [], height = 215 }) {
+function StackedCpuGraph({ points = [], range, height = 215 }) {
   const wrap = useRef(null);
   const canvas = useRef(null);
   const [width, setWidth] = useState(300);
   const GUTTER_W = 42; // Dedicated left-side Y-axis gutter
-  const TOP_OFFSET = 18; // Top padding offset to clear box boundary & title badge
+  const TOP_OFFSET = 16; // Top padding
+  const BOTTOM_OFFSET = 18; // Bottom padding for X-axis time labels
 
   useEffect(() => {
     if (!wrap.current) return undefined;
@@ -40,6 +43,8 @@ function StackedCpuGraph({ points = [], height = 215 }) {
     return { scaleMax: 100, ticks: [0, 25, 50, 75, 100] };
   }, [points]);
 
+  const rangeMs = range && range.ms ? range.ms : 10 * 60e3;
+
   useEffect(() => {
     const el = canvas.current;
     if (!el) return;
@@ -52,16 +57,14 @@ function StackedCpuGraph({ points = [], height = 215 }) {
     ctx.clearRect(0, 0, width, height);
 
     const chartW = Math.max(10, width - GUTTER_W);
-    const chartH = height - TOP_OFFSET;
+    const chartH = height - TOP_OFFSET - BOTTOM_OFFSET;
     const CELL = 4;
-    const n = points.length;
-    const cw = n > 0 ? Math.max(CELL, Math.min(10, Math.floor(chartW / n))) : CELL;
-    const cols = Math.floor(chartW / cw);
+    const cols = Math.floor(chartW / CELL);
     const totalRows = Math.floor(chartH / CELL);
-    const dotW = cw - 1;
+    const dotW = CELL - 1;
     const dotH = CELL - 1;
 
-    // Subtle grid lines rendered dynamically based on ticks (excluding min 0 and max scaleMax)
+    // Subtle grid lines rendered dynamically based on ticks
     ctx.strokeStyle = 'rgba(25, 56, 34, 0.35)';
     ctx.lineWidth = 1;
     ticks.slice(1, -1).forEach((tickVal) => {
@@ -75,10 +78,73 @@ function StackedCpuGraph({ points = [], height = 215 }) {
     });
     ctx.setLineDash([]);
 
-    // Draw stacked cells strictly right of GUTTER_W below TOP_OFFSET
+    // Time window alignment: [now - rangeMs, now]
+    const now = Date.now();
+    const tStart = now - rangeMs;
+    const tEnd = now;
+    const span = tEnd - tStart;
+
+    // Expected sampling gap between data points for this range:
+    const expectedGapMs = range && range.bucket ? range.bucket * 1000 * 2.2 : 8000;
+
+    // Ensure sorted ascending by timestamp
+    const sorted = [...points].sort((a, b) => a.t - b.t);
+
     for (let c = 0; c < cols; c += 1) {
-      const idx = points.length - cols + c;
-      const pt = idx >= 0 ? points[idx] : null;
+      const colStart = tStart + (c / cols) * span;
+      const colEnd = tStart + ((c + 1) / cols) * span;
+      const colMid = (colStart + colEnd) / 2;
+
+      let sumV = 0;
+      let sumSys = 0;
+      let sumIowait = 0;
+      let count = 0;
+
+      for (let i = 0; i < sorted.length; i += 1) {
+        const p = sorted[i];
+        if (p.t >= colStart && p.t < colEnd) {
+          sumV += (p.v || 0);
+          sumSys += (typeof p.sys === 'number' ? p.sys : (p.v || 0) * 0.25);
+          sumIowait += (typeof p.iowait === 'number' ? p.iowait : 0);
+          count += 1;
+        } else if (p.t >= colEnd) {
+          break;
+        }
+      }
+
+      let pt = null;
+      if (count > 0) {
+        pt = {
+          v: sumV / count,
+          sys: sumSys / count,
+          iowait: sumIowait / count,
+        };
+      } else if (sorted.length > 0) {
+        let low = 0;
+        let high = sorted.length - 1;
+        while (low <= high) {
+          const mid = Math.floor((low + high) / 2);
+          if (sorted[mid].t < colMid) low = mid + 1;
+          else high = mid - 1;
+        }
+        const candidates = [];
+        if (high >= 0) candidates.push(sorted[high]);
+        if (low < sorted.length) candidates.push(sorted[low]);
+
+        if (candidates.length > 0) {
+          const nearest = candidates.reduce((best, curr) =>
+            Math.abs(curr.t - colMid) < Math.abs(best.t - colMid) ? curr : best
+          );
+          if (Math.abs(nearest.t - colMid) <= expectedGapMs) {
+            pt = {
+              v: nearest.v || 0,
+              sys: typeof nearest.sys === 'number' ? nearest.sys : (nearest.v || 0) * 0.25,
+              iowait: typeof nearest.iowait === 'number' ? nearest.iowait : 0,
+            };
+          }
+        }
+      }
+
       const totalV = pt ? Math.min(scaleMax, Math.max(0, pt.v || 0)) : 0;
       const sysV = pt && typeof pt.sys === 'number' ? pt.sys : totalV * 0.25;
       const iowaitV = pt && typeof pt.iowait === 'number' ? pt.iowait : 0;
@@ -101,13 +167,22 @@ function StackedCpuGraph({ points = [], height = 215 }) {
         } else {
           ctx.fillStyle = '#0a120c'; // Unfilled dot cell
         }
-        ctx.fillRect(GUTTER_W + c * cw, y, dotW, dotH);
+        ctx.fillRect(GUTTER_W + c * CELL, y, dotW, dotH);
       }
     }
-  }, [points, width, height, scaleMax, ticks]);
+  }, [points, width, height, scaleMax, ticks, rangeMs]);
 
   const formatTick = (val) => (val % 1 === 0 ? `${val}%` : `${Number(val.toFixed(2))}%`);
-  const chartH = height - TOP_OFFSET;
+  const chartH = height - TOP_OFFSET - BOTTOM_OFFSET;
+
+  const midLabel = useMemo(() => {
+    if (!range || !range.key) return '-5m';
+    if (range.key === '10m') return '-5m';
+    if (range.key === '1h') return '-30m';
+    if (range.key === '6h') return '-3h';
+    if (range.key === '24h') return '-12h';
+    return '-50%';
+  }, [range]);
 
   return (
     <div className="graph-wrap" ref={wrap} style={{ height, position: 'relative' }}>
@@ -125,7 +200,7 @@ function StackedCpuGraph({ points = [], height = 215 }) {
                 position: 'absolute',
                 bottom: `${pct}%`,
                 right: 4,
-                transform: isMax ? 'translateY(50%)' : isMin ? 'translateY(50%)' : 'translateY(50%)',
+                transform: 'translateY(50%)',
                 color: isMax || isMin ? '#39e569' : '#527a5a',
                 fontSize: isMax || isMin ? 10 : 9.5,
                 fontWeight: isMax || isMin ? 800 : 600,
@@ -135,6 +210,26 @@ function StackedCpuGraph({ points = [], height = 215 }) {
             </span>
           );
         })}
+      </div>
+      {/* Dedicated X-Axis Time Labels Row */}
+      <div
+        style={{
+          position: 'absolute',
+          bottom: 2,
+          left: GUTTER_W,
+          right: 0,
+          display: 'flex',
+          justifyContent: 'space-between',
+          fontSize: 9.5,
+          color: '#527a5a',
+          fontFamily: 'JetBrains Mono, monospace',
+          pointerEvents: 'none',
+          paddingRight: 6,
+        }}
+      >
+        <span>-{range?.label || '10m'}</span>
+        <span>{midLabel}</span>
+        <span>now</span>
       </div>
     </div>
   );
@@ -217,7 +312,7 @@ function CpuBox({ data, range, setRange }) {
           {points.length === 0 ? (
             <Empty>No data available</Empty>
           ) : (
-            <StackedCpuGraph points={points} height={215} />
+            <StackedCpuGraph points={points} range={range} height={215} />
           )}
         </div>
 
@@ -458,7 +553,7 @@ function MemBox({ data }) {
   );
 }
 
-function DisksBox({ data }) {
+function DisksBox({ data, nodeId }) {
   const st = useMemo(() => storageSummary(data.latest), [data.latest]);
   const diskIo = st.diskIo || [];
 
@@ -474,21 +569,52 @@ function DisksBox({ data }) {
   const iops = ioRates.iops;
   const busyPct = ioRates.busyPct;
 
-  // Track real peak read and write rates observed
-  const [peakRead, setPeakRead] = useState(null);
-  const [peakWrite, setPeakWrite] = useState(null);
+  // Track real peak read and write rates observed (persisted per node in localStorage)
+  const storageKey = nodeId ? `palantir.peakIo.${nodeId}` : 'palantir.peakIo.default';
+
+  const [peakRead, setPeakRead] = useState(() => {
+    try {
+      const saved = JSON.parse(window.localStorage.getItem(storageKey) || '{}');
+      return typeof saved.read === 'number' && saved.read > 0 ? saved.read : null;
+    } catch {
+      return null;
+    }
+  });
+
+  const [peakWrite, setPeakWrite] = useState(() => {
+    try {
+      const saved = JSON.parse(window.localStorage.getItem(storageKey) || '{}');
+      return typeof saved.write === 'number' && saved.write > 0 ? saved.write : null;
+    } catch {
+      return null;
+    }
+  });
 
   useEffect(() => {
     if (typeof readRate === 'number' && readRate > 0) {
-      setPeakRead((prev) => (prev === null ? readRate : Math.max(prev, readRate)));
+      setPeakRead((prev) => {
+        const next = prev === null ? readRate : Math.max(prev, readRate);
+        try {
+          const saved = JSON.parse(window.localStorage.getItem(storageKey) || '{}');
+          window.localStorage.setItem(storageKey, JSON.stringify({ ...saved, read: next }));
+        } catch {}
+        return next;
+      });
     }
-  }, [readRate]);
+  }, [readRate, storageKey]);
 
   useEffect(() => {
     if (typeof writeRate === 'number' && writeRate > 0) {
-      setPeakWrite((prev) => (prev === null ? writeRate : Math.max(prev, writeRate)));
+      setPeakWrite((prev) => {
+        const next = prev === null ? writeRate : Math.max(prev, writeRate);
+        try {
+          const saved = JSON.parse(window.localStorage.getItem(storageKey) || '{}');
+          window.localStorage.setItem(storageKey, JSON.stringify({ ...saved, write: next }));
+        } catch {}
+        return next;
+      });
     }
-  }, [writeRate]);
+  }, [writeRate, storageKey]);
 
   const fsList = st.filesystems || [];
 
@@ -579,7 +705,7 @@ function DisksBox({ data }) {
                   {typeof readRate === 'number' ? formatRate(readRate) : '—'}
                 </span>
                 <span style={{ fontSize: 10, color: '#4a6350', fontWeight: 500 }}>
-                  {peakRead !== null ? `peak: ${formatRate(peakRead)}` : 'peak: —'}
+                  {peakRead && peakRead > 0 ? `peak: ${formatRate(peakRead)}` : 'peak: —'}
                 </span>
               </div>
 
@@ -590,7 +716,7 @@ function DisksBox({ data }) {
                   {typeof writeRate === 'number' ? formatRate(writeRate) : '—'}
                 </span>
                 <span style={{ fontSize: 10, color: '#4a6350', fontWeight: 500 }}>
-                  {peakWrite !== null ? `peak: ${formatRate(peakWrite)}` : 'peak: —'}
+                  {peakWrite && peakWrite > 0 ? `peak: ${formatRate(peakWrite)}` : 'peak: —'}
                 </span>
               </div>
 
@@ -813,12 +939,23 @@ const renderStateBadge = (stateStr) => {
   return <span className="badge tone-dim">{first}</span>;
 };
 
-// ------------------------------------------------------------------ [5] proc
-function ProcBox({ data }) {
+function ProcBox({ data, nodeId, onToast, onRefresh, killedPids: parentKilledPids, onKilledPids }) {
   const proc = useMemo(() => processSummary(data.latest), [data.latest]);
   const [mode, setMode] = useState(proc.host.length > 0 ? 'host' : 'apps');
   const [filter, setFilter] = useState('');
   const [expandedGroups, setExpandedGroups] = useState(new Set());
+  const [pendingKill, setPendingKill] = useState(null);
+  const [killSignal, setKillSignal] = useState('SIGTERM');
+  const [killing, setKilling] = useState(false);
+  const [localKilledPids, setLocalKilledPids] = useState(new Set());
+
+  const killedPids = useMemo(() => {
+    const combined = new Set(localKilledPids);
+    if (parentKilledPids) {
+      parentKilledPids.forEach((p) => combined.add(Number(p)));
+    }
+    return combined;
+  }, [localKilledPids, parentKilledPids]);
 
   const toggleGroup = (groupName) => {
     setExpandedGroups((prev) => {
@@ -829,9 +966,21 @@ function ProcBox({ data }) {
     });
   };
 
+  // Filter out any successfully terminated processes immediately
+  const hostProcList = useMemo(() => {
+    if (killedPids.size === 0) return proc.host;
+    return proc.host.filter((p) => !killedPids.has(Number(p.pid)));
+  }, [proc.host, killedPids]);
+
+  const appProcList = useMemo(() => {
+    const list = proc.host.length > 0 ? proc.host : proc.apps;
+    if (killedPids.size === 0) return list;
+    return list.filter((p) => !killedPids.has(Number(p.pid)));
+  }, [proc.host, proc.apps, killedPids]);
+
   // Group processes by program name for [apps] tab
   const { groupedApps, sortedGroupList } = useMemo(() => {
-    const rawList = proc.host.length > 0 ? proc.host : proc.apps;
+    const rawList = appProcList;
     const map = new Map();
 
     rawList.forEach((item) => {
@@ -1025,9 +1174,59 @@ function ProcBox({ data }) {
       value: (r) => r.status,
       render: (r) => renderStateBadge(r.status),
     },
+    {
+      key: 'action',
+      label: 'Action',
+      sortable: false,
+      render: (r) => (
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            setPendingKill({ pid: r.pid, name: r.name });
+          }}
+          style={{
+            background: 'rgba(239, 68, 68, 0.1)',
+            border: '1px solid #7f1d1d',
+            borderRadius: 4,
+            color: '#f87171',
+            padding: '2px 8px',
+            fontSize: 11,
+            fontWeight: 700,
+            cursor: 'pointer',
+            fontFamily: 'JetBrains Mono, monospace',
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: 4,
+          }}
+          title={`Terminate process ${r.name} (PID ${r.pid})`}
+        >
+          Terminate
+        </button>
+      ),
+    },
   ];
 
-  const displayRows = mode === 'host' ? proc.host : groupedApps;
+  const handleConfirmKill = async () => {
+    if (!pendingKill || !nodeId) return;
+    setKilling(true);
+    const target = pendingKill;
+    try {
+      await api.killProcess(nodeId, target.pid, killSignal);
+      // Remove process from list immediately on success
+      setLocalKilledPids((prev) => new Set([...prev, Number(target.pid)]));
+      if (onKilledPids) onKilledPids(target.pid);
+      if (onToast) onToast(`Successfully sent ${killSignal} to ${target.name} (PID ${target.pid})`);
+      setPendingKill(null);
+      if (onRefresh) onRefresh();
+    } catch (err) {
+      if (onToast) onToast(`Failed to kill ${target.name}: ${err.message}`, true);
+    } finally {
+      setKilling(false);
+    }
+  };
+
+  const displayRows = mode === 'host' ? hostProcList : groupedApps;
 
   return (
     <Box
@@ -1125,6 +1324,124 @@ function ProcBox({ data }) {
           empty="No data available"
         />
       </div>
+
+      {pendingKill && (
+        <div
+          className="modal-back"
+          style={{
+            position: 'fixed',
+            inset: 0,
+            background: 'rgba(0, 0, 0, 0.75)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            zIndex: 1000,
+          }}
+          onMouseDown={(e) => {
+            if (e.target === e.currentTarget && !killing) setPendingKill(null);
+          }}
+        >
+          <div
+            className="box modal hot"
+            role="dialog"
+            aria-modal="true"
+            style={{
+              maxWidth: 460,
+              width: '90%',
+              padding: '22px 20px',
+              background: '#070c08',
+              border: '1px solid #7f1d1d',
+              borderRadius: 8,
+              boxShadow: '0 10px 25px rgba(0,0,0,0.8)',
+            }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 12 }}>
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#ef4444" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
+                <line x1="12" y1="9" x2="12" y2="13"/>
+                <line x1="12" y1="17" x2="12.01" y2="17"/>
+              </svg>
+              <h3 style={{ margin: 0, fontSize: 16, fontWeight: 800, color: '#f87171', letterSpacing: '0.04em' }}>
+                TERMINATE PROCESS
+              </h3>
+            </div>
+
+            <p style={{ margin: '0 0 16px', fontSize: 13, color: '#d8dee9', lineHeight: 1.5 }}>
+              Are you sure you want to terminate <b>{pendingKill.name}</b> (PID <code style={{ color: '#22d3ee' }}>{pendingKill.pid}</code>)?
+            </p>
+
+            <div style={{ marginBottom: 18 }}>
+              <label style={{ display: 'block', fontSize: 11, fontWeight: 700, color: '#728c78', marginBottom: 6 }}>
+                TERMINATION SIGNAL
+              </label>
+              <div style={{ display: 'flex', gap: 12 }}>
+                <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: '#cbd5e1', cursor: 'pointer' }}>
+                  <input
+                    type="radio"
+                    name="signal"
+                    value="SIGTERM"
+                    checked={killSignal === 'SIGTERM'}
+                    onChange={(e) => setKillSignal(e.target.value)}
+                  />
+                  <span>SIGTERM (Graceful - 15)</span>
+                </label>
+                <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: '#f87171', cursor: 'pointer' }}>
+                  <input
+                    type="radio"
+                    name="signal"
+                    value="SIGKILL"
+                    checked={killSignal === 'SIGKILL'}
+                    onChange={(e) => setKillSignal(e.target.value)}
+                  />
+                  <span>SIGKILL (Force Kill - 9)</span>
+                </label>
+              </div>
+            </div>
+
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10 }}>
+              <button
+                type="button"
+                className="btn"
+                disabled={killing}
+                onClick={() => setPendingKill(null)}
+                style={{
+                  background: 'transparent',
+                  border: '1px solid #1a3821',
+                  color: '#94a3b8',
+                  padding: '6px 14px',
+                  borderRadius: 6,
+                  cursor: 'pointer',
+                  fontWeight: 600,
+                  fontSize: 12,
+                }}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="btn"
+                disabled={killing}
+                onClick={handleConfirmKill}
+                style={{
+                  background: killSignal === 'SIGKILL' ? '#b91c1c' : '#dc2626',
+                  border: 'none',
+                  color: '#fff',
+                  padding: '6px 16px',
+                  borderRadius: 6,
+                  cursor: 'pointer',
+                  fontWeight: 700,
+                  fontSize: 12,
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 6,
+                }}
+              >
+                {killing ? 'Terminating…' : killSignal === 'SIGKILL' ? 'Force Kill Process' : 'Terminate Process'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </Box>
   );
 }
@@ -1174,7 +1491,7 @@ function SourcesBox({ node, data }) {
   );
 }
 
-export default function OverviewTab({ node, state, range, setRange, onBack, onChangeView }) {
+export default function OverviewTab({ node, state, range, setRange, onBack, onChangeView, onToast, onRefresh, killedPids, onKilledPids }) {
   const data = state.data;
   if (state.loading && !data) return <Empty><span className="spinner" /> loading telemetry…</Empty>;
   if (!data) return <ErrorLine>{state.error || 'No data'}</ErrorLine>;
@@ -1192,11 +1509,11 @@ export default function OverviewTab({ node, state, range, setRange, onBack, onCh
         <div className="a-mem">
           <div className="two-col" style={{ gap: 14 }}>
             <MemBox data={data} />
-            <DisksBox data={data} />
+            <DisksBox data={data} nodeId={node?.id} />
           </div>
         </div>
         <div className="a-net"><NetBox data={data} /></div>
-        <ProcBox data={data} />
+        <ProcBox data={data} nodeId={node?.id} onToast={onToast} onRefresh={onRefresh} killedPids={killedPids} onKilledPids={onKilledPids} />
       </div>
     </>
   );

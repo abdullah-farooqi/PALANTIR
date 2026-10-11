@@ -167,9 +167,9 @@ async def get_metric_series(
     if since >= until:
         raise HTTPException(status_code=400, detail="since must be earlier than until")
     if since < earliest:
-        raise HTTPException(status_code=400, detail="Requested window begins before metric retention")
+        since = earliest
     if until - since > timedelta(hours=retention_hours):
-        raise HTTPException(status_code=400, detail="Requested window exceeds metric retention")
+        since = until - timedelta(hours=retention_hours)
     source_expr = func.coalesce(MetricSnapshot.data["source"].as_string(), "palantir-agent")
     filters = [
         MetricSnapshot.node_id == node_id,

@@ -3,13 +3,16 @@ from typing import List, Dict, Any, Optional
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, status
 from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import and_, func, or_, select
+from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 from core.database import get_session
 from core.api_auth import require_admin
 from core.cursors import decode_cursor, encode_cursor
+from urllib.parse import urlparse
 from models.alert import AlertEvent
 from models.anomaly import AnomalyEvent
 from models.investigation import AgentInvestigation
+from models.node import MonitoredNode
 from services.nodes import NodeService
 from services.investigations import enqueue_investigation_async
 
@@ -35,6 +38,8 @@ class InvestigationCreateRequest(BaseModel):
 class InvestigationResponse(BaseModel):
     id: int
     node_id: int
+    node_hostname: Optional[str] = None
+    node_ip: Optional[str] = None
     job_id: Optional[str] = None
     queued_at: Optional[str] = None
     started_at: Optional[str] = None
@@ -55,10 +60,27 @@ def _serialize(row: AgentInvestigation) -> dict[str, Any]:
     summary = row.summary
     if status_value == "running" and not row.job_id:
         status_value = "failed"
-        summary = summary or "Legacy investigation was never dispatched to a worker."
+    node = None
+    try:
+        from sqlalchemy.orm import inspect as sa_inspect
+        insp = sa_inspect(row)
+        if "node" in insp.dict:
+            node = row.node
+    except Exception:
+        node = None
+    hostname = node.hostname if node else None
+    node_ip = None
+    if node and node.collector_url:
+        try:
+            parsed = urlparse(node.collector_url)
+            node_ip = parsed.hostname
+        except Exception:
+            node_ip = None
     return {
         "id": row.id,
         "node_id": row.node_id,
+        "node_hostname": hostname,
+        "node_ip": node_ip,
         "job_id": row.job_id,
         "queued_at": row.queued_at.isoformat() if row.queued_at else None,
         "started_at": row.started_at.isoformat() if row.started_at else None,
@@ -82,6 +104,7 @@ async def list_investigations(
 ) -> List[Dict[str, Any]]:
     stmt = (
         select(AgentInvestigation)
+        .options(selectinload(AgentInvestigation.node))
         .order_by(func.coalesce(AgentInvestigation.started_at, AgentInvestigation.queued_at).desc(), AgentInvestigation.id.desc())
         .limit(limit)
     )
@@ -118,7 +141,7 @@ async def search_investigations(
     except (ValueError, TypeError, KeyError) as exc:
         raise HTTPException(status_code=400, detail=str(exc) or "Cursor is invalid") from exc
 
-    statement = select(AgentInvestigation)
+    statement = select(AgentInvestigation).options(selectinload(AgentInvestigation.node))
     if node_id is not None:
         statement = statement.where(AgentInvestigation.node_id == node_id)
     if status_filter is not None:
@@ -161,7 +184,7 @@ async def get_investigation(
     investigation_id: int = Path(..., ge=1, description="Investigation ID"),
     session: AsyncSession = Depends(get_session),
 ) -> Dict[str, Any]:
-    stmt = select(AgentInvestigation).where(AgentInvestigation.id == investigation_id)
+    stmt = select(AgentInvestigation).options(selectinload(AgentInvestigation.node)).where(AgentInvestigation.id == investigation_id)
     inv = (await session.execute(stmt)).scalar_one_or_none()
     if not inv:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Investigation not found")
@@ -212,3 +235,17 @@ async def trigger_investigation(
             detail={"message": "Investigation dispatch failed", "investigation_id": investigation.id},
         )
     return _serialize(investigation)
+
+
+@router.delete("/{investigation_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_investigation(
+    investigation_id: int = Path(..., ge=1, description="Investigation ID to delete"),
+    session: AsyncSession = Depends(get_session),
+    _role: None = Depends(require_admin),
+) -> None:
+    stmt = select(AgentInvestigation).where(AgentInvestigation.id == investigation_id)
+    row = (await session.execute(stmt)).scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Investigation not found")
+    await session.delete(row)
+    await session.commit()

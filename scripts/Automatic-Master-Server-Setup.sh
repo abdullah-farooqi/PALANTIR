@@ -17,7 +17,8 @@ RED='\033[0;31m'
 NC='\033[0m'
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+cd "$REPO_ROOT"
 
 echo -e "${CYAN}=====================================================${NC}"
 echo -e "${CYAN}     PALANTIR Central Master Server Setup Script    ${NC}"

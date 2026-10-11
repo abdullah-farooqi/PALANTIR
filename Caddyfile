@@ -17,18 +17,6 @@ palantir.home.arpa {
 			}
 		}
 
-		# Netdata webhooks use their own shared secret at the backend.
-		@alert_webhook {
-			path /internal/alert
-			method POST
-		}
-		handle @alert_webhook {
-			reverse_proxy backend:8000 {
-				header_up -Authorization
-				header_up -X-Authentik-Groups
-			}
-		}
-
 		# CORS preflight has no session cookie. FastAPI's explicit origin policy
 		# decides whether it may proceed; it cannot read API data.
 		@preflight {
