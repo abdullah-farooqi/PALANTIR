@@ -1378,35 +1378,136 @@ def _collect_legacy_lxc() -> list[dict[str, Any]] | None:
     return [{"runtime": "lxc", "id": name, "name": name, "image": None, "state": "running" if name in running else "stopped", "status": "running" if name in running else "stopped"} for name in names]
 
 
-def _collect_kubernetes() -> dict[str, Any]:
-    if not KUBERNETES_API_URL or not KUBERNETES_TOKEN:
-        return {"status": "not_configured", "pods": [], "reason": "Kubernetes API URL/token not configured"}
-    headers = {"Authorization": f"Bearer {KUBERNETES_TOKEN}"}
-    verify: str | bool = KUBERNETES_CA_CERT or True
-    try:
-        response = httpx.get(f"{KUBERNETES_API_URL}/api/v1/pods", headers=headers, verify=verify, timeout=5.0)
-        response.raise_for_status()
-        items = response.json().get("items", [])
-        pod_metrics: dict[tuple[str, str], Any] = {}
+def _discover_k8s_endpoint() -> tuple[str, dict[str, str], str | bool]:
+    """Discover Kubernetes API URL and authorization headers from env, in-cluster SA, or kubeconfigs."""
+    if KUBERNETES_API_URL and KUBERNETES_TOKEN:
+        headers = {"Authorization": f"Bearer {KUBERNETES_TOKEN}"}
+        verify: str | bool = KUBERNETES_CA_CERT or False
+        return KUBERNETES_API_URL, headers, verify
+
+    # In-cluster service account
+    sa_token_path = Path("/var/run/secrets/kubernetes.io/serviceaccount/token")
+    sa_ca_path = Path("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt")
+    if sa_token_path.is_file():
         try:
-            metrics_response = httpx.get(f"{KUBERNETES_API_URL}/apis/metrics.k8s.io/v1beta1/pods", headers=headers, verify=verify, timeout=5.0)
-            metrics_response.raise_for_status()
-            for metric in metrics_response.json().get("items", []):
-                metadata = metric.get("metadata", {})
-                pod_metrics[(metadata.get("namespace", "default"), metadata.get("name", ""))] = metric.get("containers", [])
+            token = sa_token_path.read_text().strip()
+            ca = str(sa_ca_path) if sa_ca_path.is_file() else False
+            return "https://kubernetes.default.svc", {"Authorization": f"Bearer {token}"}, ca
+        except OSError:
+            pass
+
+    # K3s / Kubeconfig file discovery (both on root and mounted host root)
+    candidates = [
+        HOST_ROOT / "etc/rancher/k3s/k3s.yaml",
+        Path("/etc/rancher/k3s/k3s.yaml"),
+        HOST_ROOT / "etc/kubernetes/admin.conf",
+        Path("/etc/kubernetes/admin.conf"),
+        HOST_ROOT / "root/.kube/config",
+        Path("/root/.kube/config"),
+        HOST_ROOT / "var/snap/microk8s/current/credentials/client.config",
+    ]
+    for cfg in candidates:
+        try:
+            if cfg.is_file():
+                txt = cfg.read_text(encoding="utf-8", errors="ignore")
+                s_match = re.search(r"server:\s*([^\s]+)", txt)
+                t_match = re.search(r"token:\s*([^\s]+)", txt)
+                server = s_match.group(1).strip() if s_match else ""
+                token = t_match.group(1).strip() if t_match else ""
+                if server and token:
+                    return server.rstrip("/"), {"Authorization": f"Bearer {token}"}, False
+                elif server:
+                    return server.rstrip("/"), {}, False
+        except OSError:
+            continue
+
+    return "", {}, False
+
+
+def _collect_kubernetes() -> dict[str, Any]:
+    api_url, headers, verify = _discover_k8s_endpoint()
+    items = []
+    pod_metrics: dict[tuple[str, str], Any] = {}
+
+    # Attempt 1: Query API server if endpoint discovered
+    if api_url:
+        try:
+            resp = httpx.get(f"{api_url}/api/v1/pods", headers=headers, verify=verify, timeout=5.0)
+            if resp.status_code == 200:
+                items = resp.json().get("items", [])
+                try:
+                    m_resp = httpx.get(f"{api_url}/apis/metrics.k8s.io/v1beta1/pods", headers=headers, verify=verify, timeout=4.0)
+                    if m_resp.status_code == 200:
+                        for metric in m_resp.json().get("items", []):
+                            m_meta = metric.get("metadata", {})
+                            pod_metrics[(m_meta.get("namespace", "default"), m_meta.get("name", ""))] = metric.get("containers", [])
+                except (httpx.HTTPError, ValueError):
+                    pass
         except (httpx.HTTPError, ValueError):
             pass
-        pods = []
-        for item in items[:1000]:
-            metadata = item.get("metadata", {})
-            spec = item.get("spec", {})
-            status = item.get("status", {})
-            namespace = metadata.get("namespace", "default")
-            name = metadata.get("name", "")
-            pods.append({"runtime": "kubernetes", "namespace": namespace, "name": name, "node": spec.get("nodeName"), "phase": status.get("phase"), "pod_ip": status.get("podIP"), "containers": status.get("containerStatuses", []), "resource_metrics": pod_metrics.get((namespace, name), [])})
-        return {"status": "available", "pods": pods}
-    except (httpx.HTTPError, ValueError) as exc:
-        return {"status": "unavailable", "pods": [], "reason": str(exc)[:300]}
+
+    # Attempt 2: Local unauthenticated Kubelet read-only port (10255)
+    if not items:
+        try:
+            k_resp = httpx.get("http://127.0.0.1:10255/pods", timeout=2.5)
+            if k_resp.status_code == 200:
+                items = k_resp.json().get("items", [])
+        except (httpx.HTTPError, ValueError):
+            pass
+
+    # Attempt 3: CLI fallback (k3s kubectl or kubectl)
+    if not items:
+        for cli in ("kubectl", "k3s"):
+            cmd = [cli, "get", "pods", "-A", "-o", "json"] if cli == "kubectl" else ["k3s", "kubectl", "get", "pods", "-A", "-o", "json"]
+            if shutil.which(cli):
+                try:
+                    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+                    if proc.returncode == 0 and proc.stdout:
+                        items = json.loads(proc.stdout).get("items", [])
+                        break
+                except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+                    pass
+
+    if not items and not api_url:
+        return {"status": "not_configured", "pods": [], "reason": "Kubernetes API URL, kubeconfig, or Kubelet not found"}
+    elif not items:
+        return {"status": "unavailable", "pods": [], "reason": "Kubernetes endpoint found but returned no pods or connection refused"}
+
+    pods = []
+    for item in items[:1000]:
+        metadata = item.get("metadata", {})
+        spec = item.get("spec", {})
+        status = item.get("status", {})
+        namespace = metadata.get("namespace", "default")
+        name = metadata.get("name", "")
+        phase = status.get("phase", "Unknown")
+
+        container_statuses = status.get("containerStatuses", [])
+        containers_spec = spec.get("containers", [])
+        image = ""
+        if container_statuses and isinstance(container_statuses, list) and container_statuses[0].get("image"):
+            image = container_statuses[0].get("image")
+        elif containers_spec and isinstance(containers_spec, list) and containers_spec[0].get("image"):
+            image = containers_spec[0].get("image")
+
+        pods.append({
+            "id": metadata.get("uid") or name,
+            "runtime": "kubernetes",
+            "namespace": namespace,
+            "name": name,
+            "display_name": f"{namespace}/{name}",
+            "node": spec.get("nodeName"),
+            "phase": phase,
+            "state": phase.lower(),
+            "status": phase.lower(),
+            "pod_ip": status.get("podIP"),
+            "image": image,
+            "containers": container_statuses,
+            "created_at": metadata.get("creationTimestamp"),
+            "resource_metrics": pod_metrics.get((namespace, name), []),
+        })
+
+    return {"status": "available", "pods": pods}
 
 
 def _unix_http_get(path: Path, request_path: str) -> Any:
@@ -1661,7 +1762,8 @@ def discover_capabilities() -> dict[str, Any]:
             return False
 
     docker_ok, lxd_ok = is_socket(DOCKER_SOCKET), is_socket(LXD_SOCKET)
-    kube_ok = bool(KUBERNETES_API_URL and KUBERNETES_TOKEN)
+    k8s_endpoint, _, _ = _discover_k8s_endpoint()
+    kube_ok = bool(k8s_endpoint or shutil.which("kubectl") or shutil.which("k3s"))
     legacy_lxc = (HOST_ROOT / "var/lib/lxc").is_dir()
     capabilities["containers"] = {
         "status": "available" if (docker_ok or lxd_ok or kube_ok or legacy_lxc) else "not_configured",

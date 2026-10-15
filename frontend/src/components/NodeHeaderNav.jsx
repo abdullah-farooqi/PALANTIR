@@ -9,9 +9,8 @@ const TABS = [
 ];
 
 export default function NodeHeaderNav({ node, currentView, onViewChange, onBack }) {
-  const hostIp = node?.collector_url
-    ? node.collector_url.replace(/^https?:\/\//, '').split(':')[0]
-    : '';
+  const rawAddr = node?.collector_url ? node.collector_url.replace(/^https?:\/\//, '').replace(/\/.*$/, '') : '';
+  const hostIp = rawAddr.endsWith(':20000') ? rawAddr.replace(':20000', '') : rawAddr;
 
   return (
     <div

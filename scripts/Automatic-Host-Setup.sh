@@ -94,7 +94,8 @@ check_port() {
     echo -e "Choose an option:"
     echo "  [1] Automatically terminate process on port $port and proceed (Recommended)"
     echo "  [2] Quit setup"
-    read -r -p "Select option [1/2]: " choice < /dev/tty || choice="1"
+    echo "Select option [1/2] (default 1): "
+    read -r choice || choice="1"
     case "$choice" in
       1)
         echo -e "${YELLOW}Terminating process occupying port $port...${NC}"
@@ -133,21 +134,26 @@ if [ "$DRY_RUN" != "1" ]; then
 fi
 
 # 6. Check and Pull Latest Palantir Host Collector Image
-COLLECTOR_IMAGE="${COLLECTOR_IMAGE:-abdullahahmadfarooqi/palantir-host-collector:latest}"
-if [ "$DRY_RUN" != "1" ]; then
-  echo -e "${CYAN}Checking for collector image updates (${COLLECTOR_IMAGE})...${NC}"
-  if PULL_OUTPUT=$(docker pull "${COLLECTOR_IMAGE}" 2>&1); then
-    if echo "$PULL_OUTPUT" | grep -iq "Status: Image is up to date"; then
-      echo -e "${GREEN}✓ Image is already up to date. Using existing local image.${NC}"
+if [ -z "${COLLECTOR_IMAGE:-}" ] && docker image inspect palantir-host-collector:local &>/dev/null; then
+  COLLECTOR_IMAGE="palantir-host-collector:local"
+  echo -e "${GREEN}✓ Using locally built collector image: ${COLLECTOR_IMAGE}${NC}"
+else
+  COLLECTOR_IMAGE="${COLLECTOR_IMAGE:-abdullahahmadfarooqi/palantir-host-collector:latest}"
+  if [ "$DRY_RUN" != "1" ]; then
+    echo -e "${CYAN}Checking for collector image updates (${COLLECTOR_IMAGE})...${NC}"
+    if PULL_OUTPUT=$(docker pull "${COLLECTOR_IMAGE}" 2>&1); then
+      if echo "$PULL_OUTPUT" | grep -iq "Status: Image is up to date"; then
+        echo -e "${GREEN}✓ Image is already up to date. Using existing local image.${NC}"
+      else
+        echo -e "${GREEN}✓ Downloaded updated image layers for ${COLLECTOR_IMAGE}.${NC}"
+      fi
+    elif docker image inspect "${COLLECTOR_IMAGE}" &> /dev/null; then
+      echo -e "${YELLOW}WARNING: Could not pull ${COLLECTOR_IMAGE}; using the image already on this host.${NC}"
     else
-      echo -e "${GREEN}✓ Downloaded updated image layers for ${COLLECTOR_IMAGE}.${NC}"
+      echo -e "${RED}ERROR: Could not pull ${COLLECTOR_IMAGE} and no local copy exists:${NC}"
+      echo "$PULL_OUTPUT"
+      exit 1
     fi
-  elif docker image inspect "${COLLECTOR_IMAGE}" &> /dev/null; then
-    echo -e "${YELLOW}WARNING: Could not pull ${COLLECTOR_IMAGE}; using the image already on this host.${NC}"
-  else
-    echo -e "${RED}ERROR: Could not pull ${COLLECTOR_IMAGE} and no local copy exists:${NC}"
-    echo "$PULL_OUTPUT"
-    exit 1
   fi
 fi
 
@@ -165,19 +171,17 @@ configure_access() {
     valid_token "$AGENT_TOKEN" || { echo -e "${RED}ERROR: PALANTIR_AGENT_TOKEN must be at least 32 characters (letters, digits, . _ -).${NC}"; exit 1; }
     ACCESS_MODE="master"; return
   fi
-  # open the terminal once and read every answer from it (stdin may be a pipe, e.g. curl ... | sudo bash)
-  if ! exec 3< "$TTY_DEV" 2>/dev/null; then
-    ACCESS_MODE="readonly"; return
-  fi
 
   echo -e "\n${CYAN}Who should be allowed to control this host (read data, kill processes, stop containers & VMs)?${NC}"
   echo "  [1] Only my PALANTIR master server  (asks for the master's AGENT_AUTH_TOKEN)  - Recommended"
   echo "  [2] Anyone who can reach this host  (no token: anybody on the network can read data and execute controls)"
-  read -r -u 3 -p "Select option [1/2] (default 1): " choice || choice="1"
+  echo "Select option [1/2] (default 1): "
+  read -r choice || choice="1"
 
   if [ "$choice" = "2" ]; then
     echo -e "${YELLOW}WARNING: with no token, anyone who can reach port 20000 can read this host's data, kill processes, and stop containers/VMs.${NC}"
-    read -r -u 3 -p "Type YES to confirm: " confirm || confirm=""
+    echo "Type YES to confirm: "
+    read -r confirm || confirm=""
     if [ "$confirm" = "YES" ]; then
       ACCESS_MODE="anyone"; return
     fi
@@ -186,7 +190,8 @@ configure_access() {
 
   local attempt
   for attempt in 1 2 3; do
-    read -r -s -u 3 -p "Enter the master's AGENT_AUTH_TOKEN (hidden, same value as on the master server): " AGENT_TOKEN || AGENT_TOKEN=""
+    echo "Enter the master's AGENT_AUTH_TOKEN (hidden, same value as on the master server): "
+    read -r -s AGENT_TOKEN || AGENT_TOKEN=""
     echo
     if valid_token "$AGENT_TOKEN"; then ACCESS_MODE="master"; return; fi
     echo -e "${RED}Invalid token: it must be at least 32 characters (letters, digits, . _ -).${NC}"
@@ -227,6 +232,22 @@ if pgrep -f 'qemu-system|/kvm |qemu-kvm' &> /dev/null; then
 fi
 [ -S /run/dbus/system_bus_socket ] && SOURCES_FOUND+=("systemd services")
 { [ -d /var/log/journal ] || [ -d /run/log/journal ]; } && SOURCES_FOUND+=("journal logs")
+
+# Kubernetes auto-detection (K3s, MicroK8s, kubeadm, or kubelet)
+if [ -f /etc/rancher/k3s/k3s.yaml ]; then
+  SOURCES_FOUND+=("Kubernetes (K3s)")
+  EXTRA_ENV+=(-e KUBERNETES_API_URL=https://127.0.0.1:6443)
+  K3S_TOKEN=$(grep -E "^\s*token:" /etc/rancher/k3s/k3s.yaml 2>/dev/null | awk '{print $2}' || true)
+  [ -z "$K3S_TOKEN" ] || EXTRA_ENV+=(-e "KUBERNETES_TOKEN=${K3S_TOKEN}")
+elif [ -f /etc/kubernetes/admin.conf ]; then
+  SOURCES_FOUND+=("Kubernetes (admin.conf)")
+  K8S_SERVER=$(grep -E "^\s*server:" /etc/kubernetes/admin.conf 2>/dev/null | head -n1 | awk '{print $2}' || true)
+  [ -z "$K8S_SERVER" ] || EXTRA_ENV+=(-e "KUBERNETES_API_URL=${K8S_SERVER}")
+elif [ -f /var/snap/microk8s/current/credentials/client.config ]; then
+  SOURCES_FOUND+=("Kubernetes (MicroK8s)")
+elif pgrep -f 'kubelet|k3s|microk8s' &>/dev/null; then
+  SOURCES_FOUND+=("Kubernetes (kubelet active)")
+fi
 
 [ -z "$AGENT_TOKEN" ] || EXTRA_ENV+=(-e "PALANTIR_AGENT_TOKEN=${AGENT_TOKEN}")
 [ "$ACCESS_MODE" != "anyone" ] || EXTRA_ENV+=(-e PALANTIR_ALLOW_ANON_KILL=1)

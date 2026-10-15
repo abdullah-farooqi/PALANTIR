@@ -84,7 +84,8 @@ function NodeCard({ node, onSelect, onRemove, CAN_WRITE }) {
 
   const osInfo = getOsIconAndLabel(node, sys);
   const addressUrl = node.collector_url;
-  const ipAddress = addressUrl ? addressUrl.replace(/^https?:\/\//, '').split(':')[0] : '—';
+  const cleanAddress = addressUrl ? addressUrl.replace(/^https?:\/\//, '').replace(/\/.*$/, '') : '—';
+  const ipAddress = cleanAddress.endsWith(':20000') ? cleanAddress.replace(':20000', '') : cleanAddress;
 
   // Sparkline from real CPU samples only. No samples -> null (the card says "no data").
   const sparklineData = useMemo(() => {

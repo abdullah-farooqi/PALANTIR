@@ -8,7 +8,7 @@ import { api } from '../api';
 
 const SECTIONS = [
   { value: 'services', label: 'SERVICES', hotkey: 's' },
-  { value: 'containers', label: 'CONTAINERS', hotkey: 'c' },
+  { value: 'containers', label: 'CONTAINERS & PODS', hotkey: 'c' },
   { value: 'vms', label: 'VIRTUAL MACHINES', hotkey: 'v' },
   { value: 'sockets', label: 'NETWORK SOCKETS', hotkey: 'k' },
   { value: 'storage', label: 'STORAGE & I/O', hotkey: 'd' },
@@ -228,32 +228,57 @@ function Containers({ latest, filter, containerOverrides = {}, onActionContainer
       label: 'NAME',
       render: (r) => (
         <span style={{ color: '#e2e8f0', fontWeight: 700, fontFamily: 'JetBrains Mono, monospace' }}>
-          {r.name}
+          {r.namespace ? (
+            <>
+              <span style={{ color: '#38bdf8', fontSize: 11, marginRight: 6, fontWeight: 600 }}>[{r.namespace}]</span>
+              {r.name}
+            </>
+          ) : (
+            r.name
+          )}
         </span>
       ),
     },
     {
       key: 'runtime',
       label: 'RUNTIME',
-      render: (r) => (
-        <span style={{ color: '#06b6d4', fontWeight: 600, fontSize: 11 }}>
-          {r.runtime}
-        </span>
-      ),
+      render: (r) => {
+        const isK8s = String(r.runtime || '').toLowerCase() === 'kubernetes';
+        return (
+          <span
+            style={{
+              color: isK8s ? '#38bdf8' : '#06b6d4',
+              fontWeight: 700,
+              fontSize: 10.5,
+              textTransform: 'uppercase',
+              letterSpacing: '0.04em',
+              background: isK8s ? 'rgba(56, 189, 248, 0.1)' : 'transparent',
+              padding: isK8s ? '1px 5px' : '0',
+              borderRadius: isK8s ? 4 : 0,
+              border: isK8s ? '1px solid #0369a1' : 'none',
+            }}
+          >
+            {isK8s ? 'K8S POD' : (r.runtime || 'container')}
+          </span>
+        );
+      },
     },
     {
       key: 'image',
       label: 'IMAGE',
-      render: (r) => (
-        <span style={{ color: '#94a3b8', fontSize: 11.5 }} title={r.image}>
-          {r.image}
-        </span>
-      ),
+      render: (r) => {
+        const img = r.image || (r.containers && r.containers[0] && r.containers[0].image) || '—';
+        return (
+          <span style={{ color: '#94a3b8', fontSize: 11.5 }} title={img}>
+            {img}
+          </span>
+        );
+      },
     },
     {
       key: 'state',
       label: 'STATE',
-      render: (r) => renderStateBadge(r.state || r.status),
+      render: (r) => renderStateBadge(r.phase || r.state || r.status),
     },
     {
       key: 'cpu',
@@ -430,6 +455,29 @@ function Vms({ latest, filter, vmOverrides = {}, onActionVm }) {
       key: 'state',
       label: 'STATE',
       render: (r) => renderStateBadge(r.state || r.status),
+    },
+    {
+      key: 'runtime',
+      label: 'HYPERVISOR',
+      render: (r) => {
+        const rt = (r.runtime || 'VM').toUpperCase();
+        return (
+          <span
+            style={{
+              background: 'rgba(34, 211, 238, 0.1)',
+              border: '1px solid #164e63',
+              color: '#22d3ee',
+              fontWeight: 700,
+              padding: '1px 6px',
+              borderRadius: 4,
+              fontSize: 10.5,
+              letterSpacing: '0.04em',
+            }}
+          >
+            {rt}
+          </span>
+        );
+      },
     },
     {
       key: 'cpu_count',

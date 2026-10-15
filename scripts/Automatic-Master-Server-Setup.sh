@@ -99,7 +99,8 @@ check_and_free_port() {
     echo -e "Choose an option:"
     echo "  [1] Automatically terminate process on port $port and proceed (Recommended)"
     echo "  [2] Quit setup"
-    read -r -p "Select option [1/2]: " choice < /dev/tty || choice="1"
+    echo "Select option [1/2] (default 1): "
+    read -r choice || choice="1"
     case "$choice" in
       1)
         echo -e "${YELLOW}Terminating process occupying port $port...${NC}"
