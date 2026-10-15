@@ -2,14 +2,14 @@ import logging
 from sqlalchemy import select
 from models.node import MonitoredNode
 from models.alert import AlertEvent
+from services.investigations import enqueue_investigation_async
 
 logger = logging.getLogger(__name__)
 
 
 class AlertService:
     """
-    Push flow — receives Netdata webhook, persists, triggers agent.
-    Extension point: swap run_investigation.delay() for your LangGraph call.
+    Push flow — receives and persists alert transitions.
     """
 
     async def receive_and_classify(self, payload, session):
@@ -53,7 +53,12 @@ class AlertService:
             elif "WARN" in raw_status:
                 alert_status = "WARNING"
             else:
-                alert_status = "CLEAR"
+                logger.warning(
+                    "Ignoring alert webhook with unsupported status %r for %s",
+                    raw_status[:32],
+                    safe_hostname,
+                )
+                return None
         else:
             alert_status = raw_status
 
@@ -70,21 +75,19 @@ class AlertService:
             session.add(event)
             await session.flush()
 
-            if alert_status in ("WARNING", "CRITICAL"):
-                # ── Extension point: wire your LangGraph agent here ──────
-                # from workers.agent_tasks import run_investigation
-                # run_investigation.delay(
-                #     node_id=node.id,
-                #     trigger_type="alert",
-                #     trigger_id=event.id,
-                # )
-                # ─────────────────────────────────────────────────────────
-                event.triggered_agent = True
-
             await session.commit()
+            if alert_status in {"WARNING", "CRITICAL"}:
+                try:
+                    await enqueue_investigation_async(
+                        session,
+                        node_id=node.id,
+                        trigger_type="alert",
+                        trigger_id=event.id,
+                    )
+                except Exception:
+                    logger.exception("Could not enqueue an investigation for alert event %s", event.id)
             return event
         except Exception as exc:
             await session.rollback()
             logger.error(f"Failed to record alert event for node {safe_hostname}: {exc}")
             raise
-

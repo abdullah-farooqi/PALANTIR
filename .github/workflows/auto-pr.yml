@@ -1,0 +1,171 @@
+name: PALANTIR Pipeline PR Automation
+
+on:
+  push:
+    branches:
+      - telemetry_pipeline_with_frontend
+      - telemetry_pipeline
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Force check and create missing pull requests"
+        required: false
+        default: true
+        type: boolean
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync-pull-requests:
+    name: Generate Pipeline Pull Requests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure Git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: "Process Stage 1: telemetry_pipeline_with_frontend -> telemetry_pipeline"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          BASE="telemetry_pipeline"
+          HEAD="telemetry_pipeline_with_frontend"
+
+          echo "Checking commits between $HEAD and $BASE..."
+          NEW_COMMITS=$(git rev-list --count "origin/${BASE}..origin/${HEAD}" 2>/dev/null || echo "0")
+
+          if [ "$NEW_COMMITS" -eq 0 ]; then
+            echo "Branch $HEAD has 0 commits ahead of $BASE. Skipping PR creation."
+            exit 0
+          fi
+
+          echo "Found $NEW_COMMITS new commits ahead."
+
+          EXISTING_PR=$(gh pr list --state open --base "$BASE" --head "$HEAD" --json number,url --jq '.[0].url // empty')
+          if [ -n "$EXISTING_PR" ]; then
+            echo "An open Pull Request already exists: $EXISTING_PR"
+            exit 0
+          fi
+
+          echo "Creating new Pull Request: $HEAD -> $BASE..."
+          PR_TITLE="feat(frontend): modern observability dashboard, native telemetry agent, and setup automation"
+          BODY_FILE=$(mktemp)
+
+          cat > "$BODY_FILE" << 'EOF'
+          ## Overview
+
+          Automated pipeline promotion: Merges the complete frontend dashboard, native Python Host Collector agent migration, hardened database schema, and automated infrastructure setup scripts into `telemetry_pipeline`.
+
+          ---
+
+          ### Key Features & Changes
+
+          #### 1. React 18 Observability Dashboard (`frontend/`)
+          - Responsive monitoring interface built with Vite, Tailwind CSS, Lucide icons, and Recharts.
+          - Dedicated tabs: Overview, Fleet Grid, Inventory, Metrics, Alerts, Anomalies, Investigations, Logs, and System Settings.
+          - Node enrollment modal with custom port validation (`<IP>:<PORT>`).
+          - Multi-resolution SVG and PNG branding favicons.
+
+          #### 2. Native Host Collector Agent (`agent/collector.py`)
+          - Complete deprecation and removal of external Netdata dependencies.
+          - Zero-dependency Python 3 daemon collecting CPU, memory, disk, network, temperature, and process stats.
+          - Tokenized endpoint registration and automated systemd service provisioning.
+
+          #### 3. Automated Setup Utilities (`scripts/`)
+          - `Automatic-Master-Server-Setup.sh`: Automated central server installer with live health checks.
+          - `Automatic-Host-Setup.sh`: Automated bare-metal/VM host probe deployment with IP forwarding.
+          - `Automatic-VM-Setup-For-NAT.sh`: Automated static route configuration and persistent systemd service for NAT VMs.
+          - `Automatic-Build-And-Push-Docker-Image.sh`: Multi-arch container image builder and registry publisher.
+
+          #### 4. Database Schema Hardening (`sql/init.sql`)
+          - Resolved PostgreSQL container initialization crash under strict `ON_ERROR_STOP=1`.
+          - Verified all 11 relations and views.
+
+          ---
+
+          ### Verification
+          - 25/25 Pytest integration tests passing in live Docker stack.
+          - Host collector tests passing (`pytest agent/tests`).
+          - Frontend production bundle build verified.
+          EOF
+
+          gh pr create \
+            --base "$BASE" \
+            --head "$HEAD" \
+            --title "$PR_TITLE" \
+            --body-file "$BODY_FILE" \
+            --label "enhancement"
+
+      - name: "Process Stage 2: telemetry_pipeline -> initial_project"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          BASE="initial_project"
+          HEAD="telemetry_pipeline"
+
+          echo "Checking commits between $HEAD and $BASE..."
+          NEW_COMMITS=$(git rev-list --count "origin/${BASE}..origin/${HEAD}" 2>/dev/null || echo "0")
+
+          if [ "$NEW_COMMITS" -eq 0 ]; then
+            echo "Branch $HEAD has 0 commits ahead of $BASE. Skipping PR creation."
+            exit 0
+          fi
+
+          echo "Found $NEW_COMMITS new commits ahead."
+
+          EXISTING_PR=$(gh pr list --state open --base "$BASE" --head "$HEAD" --json number,url --jq '.[0].url // empty')
+          if [ -n "$EXISTING_PR" ]; then
+            echo "An open Pull Request already exists: $EXISTING_PR"
+            exit 0
+          fi
+
+          echo "Creating new Pull Request: $HEAD -> $BASE..."
+          PR_TITLE="feat(telemetry): distributed telemetry pipeline, background workers, and CI/CD automation"
+          BODY_FILE=$(mktemp)
+
+          cat > "$BODY_FILE" << 'EOF'
+          ## Overview
+
+          Automated pipeline promotion: Merges the distributed telemetry ingestion pipeline, Celery background workers, Redis event bus, and enterprise CI/CD workflows into the `initial_project` branch.
+
+          ---
+
+          ### Key Features & Changes
+
+          #### 1. Distributed Telemetry Ingestion & Scheduling
+          - Celery worker and Celery Beat scheduler orchestration for asynchronous metric snapshotting, rollups, and anomaly detection.
+          - Redis integration for caching, heartbeat registration, and message routing.
+          - Time-series partition management with automated snapshot pruning.
+
+          #### 2. API Contract Hardening & Security
+          - Timing-safe HMAC webhook signature validation (`X-PALANTIR-Secret`).
+          - Keyset cursor pagination and robust validation on telemetry metrics endpoints.
+          - Scoped API tokens: admin, read, and node enrollment roles.
+          - Restricted namespace capability checks for containerized collectors.
+
+          #### 3. Continuous Integration & Deployment (CI/CD)
+          - Matrix testing across Python 3.11 and 3.12 with live PostgreSQL 16 and Redis 7 service containers.
+          - Automated Docker Compose smoke testing with endpoint health verification.
+          - Automated multi-registry publishing to Docker Hub and GitHub Container Registry (GHCR).
+          EOF
+
+          gh pr create \
+            --base "$BASE" \
+            --head "$HEAD" \
+            --title "$PR_TITLE" \
+            --body-file "$BODY_FILE" \
+            --label "enhancement"

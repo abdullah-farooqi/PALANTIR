@@ -4,6 +4,10 @@ from .metric import MetricSnapshot
 from .anomaly import AnomalyEvent
 from .alert import AlertEvent
 from .investigation import AgentInvestigation
+from .log_event import LogEvent
+from .category_status import CategoryCollectionStatus
+from .service_heartbeat import ServiceHeartbeat
+from .threshold import SystemAlertThreshold
 
 __all__ = [
     "Base",
@@ -12,4 +16,8 @@ __all__ = [
     "AnomalyEvent",
     "AlertEvent",
     "AgentInvestigation",
+    "LogEvent",
+    "CategoryCollectionStatus",
+    "ServiceHeartbeat",
+    "SystemAlertThreshold",
 ]

@@ -18,7 +18,7 @@ class AnomalyEvent(Base):
     contexts = Column(ARRAY(String), nullable=False)
     scores = Column(JSONB, nullable=False)
     max_score = Column(Float, nullable=False)
-    triggered_agent = Column(Boolean, nullable=False, default=False)
+    triggered_agent = Column(Boolean, nullable=False, default=False)  # legacy; no longer exposed
     investigation_id = Column(Integer, nullable=True)
 
     node = relationship("MonitoredNode", back_populates="anomaly_events")

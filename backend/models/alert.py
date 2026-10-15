@@ -19,7 +19,7 @@ class AlertEvent(Base):
     status = Column(String, nullable=False)  # WARNING, CRITICAL, CLEAR
     value = Column(Float, nullable=True)
     units = Column(String, nullable=True)
-    triggered_agent = Column(Boolean, nullable=False, default=False)
+    triggered_agent = Column(Boolean, nullable=False, default=False)  # legacy; no longer exposed
     investigation_id = Column(Integer, nullable=True)
 
     node = relationship("MonitoredNode", back_populates="alert_events")

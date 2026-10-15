@@ -14,9 +14,17 @@ class AlertWebhookPayload(BaseModel):
     alert: str = Field(default="unknown", min_length=1, max_length=255, description="Alert or alarm name")
     chart: str = Field(default="unknown", min_length=1, max_length=255, description="Chart identifier")
     status: str = Field(default="CLEAR", min_length=1, max_length=32, description="Alert status (e.g. CLEAR, WARNING, CRITICAL)")
-    value: Optional[float] = Field(default=None, description="Numeric metric value")
+    value: Optional[float] = Field(
+        default=None,
+        allow_inf_nan=False,
+        description="Numeric metric value",
+    )
     units: Optional[str] = Field(default=None, max_length=64, description="Metric units")
-    timestamp: Optional[float] = Field(default=None, description="Event Unix timestamp")
+    timestamp: Optional[float] = Field(
+        default=None,
+        allow_inf_nan=False,
+        description="Event Unix timestamp",
+    )
 
     model_config = {
         "extra": "ignore"
@@ -45,5 +53,8 @@ async def receive_alert(
     if not event:
         return {"status": "ignored", "reason": "unregistered node or invalid payload"}
 
-    return {"status": "received", "event_id": event.id}
-
+    return {
+        "status": "received",
+        "event_id": event.id,
+        "investigation_id": event.investigation_id,
+    }

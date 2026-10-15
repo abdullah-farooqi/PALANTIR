@@ -1,5 +1,15 @@
 from datetime import datetime, timezone
-from sqlalchemy import Column, BigInteger, Integer, String, DateTime, ForeignKey, PrimaryKeyConstraint
+from sqlalchemy import (
+    Column,
+    BigInteger,
+    Integer,
+    String,
+    DateTime,
+    ForeignKey,
+    PrimaryKeyConstraint,
+    Float,
+    Index,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship
 from .base import Base
@@ -18,8 +28,17 @@ class MetricSnapshot(Base):
     category = Column(String, nullable=False)
     data = Column(JSONB, nullable=False)
 
+    cpu_pct = Column(Float, nullable=True)
+    ram_used_mb = Column(Float, nullable=True)
+    ram_total_mb = Column(Float, nullable=True)
+    load_avg = Column(Float, nullable=True)
+    swap_used_mb = Column(Float, nullable=True)
+    top_processes = Column(JSONB, nullable=True)
+
     __table_args__ = (
         PrimaryKeyConstraint("id", "collected_at"),
+        Index("idx_snapshots_node_cat_time", "node_id", "category", "collected_at"),
+        Index("idx_snapshots_cpu_pct", "cpu_pct"),
     )
 
     node = relationship("MonitoredNode", back_populates="snapshots")
