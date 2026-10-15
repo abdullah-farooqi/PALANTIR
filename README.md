@@ -1,6 +1,6 @@
-# PALANTIR — Netdata Autonomous Monitoring & Investigation Platform
+# PALANTIR — Autonomous Linux Monitoring & Security Investigation Platform
 
-PALANTIR polls Linux Netdata sensors and a companion host collector every 60 seconds, stores typed telemetry and structured log events, evaluates machine learning anomaly rates, and receives alert webhooks.
+PALANTIR is an autonomous, enterprise-grade Linux observability and security investigation platform. It provides high-frequency telemetry collection, structured security log ingestion, dynamic threshold evaluation, and automated incident investigations across distributed Linux infrastructure.
 
 ---
 
@@ -8,510 +8,309 @@ PALANTIR polls Linux Netdata sensors and a companion host collector every 60 sec
 
 ```mermaid
 flowchart TD
-    subgraph Cluster ["Distributed Infrastructure"]
-        LocalSensor["Local Host Sensor (:19999)"]
-        RemoteSensor["Remote Netdata Sensor (:19999)"]
-        HostCollector["Remote Host Collector (:20000)"]
+    subgraph TargetHosts ["Monitored Linux Infrastructure"]
+        Host1["Target Host Collector (:20000)"]
+        Host2["Target Host Collector (:20000)"]
+        HostN["Local / Edge Collector (:20000)"]
     end
 
-    subgraph CentralServer ["PALANTIR Central Server (Ubuntu)"]
-        Users["LAN Browser"]
-        Gateway["Caddy HTTPS + Authentik"]
+    subgraph MasterServer ["PALANTIR Master Server"]
+        Browser["Operator Browser"]
+        Caddy["Caddy HTTPS + Authentik SSO (:443)"]
+        UI["React 18 Dashboard (:3000)"]
         API["FastAPI Backend (:8000)"]
         Beat["Celery Beat (Scheduler)"]
-        Worker["Celery Worker (Collector & Evaluator)"]
-        DB[(PostgreSQL 16 Partitioned Tables)]
-        Broker[(Redis 7 Broker)]
-        Users -->|"HTTPS session"| Gateway
-        Gateway -->|"role-scoped Bearer"| API
+        Worker["Celery Worker (Scraper & Investigation Engine)"]
+        DB[(PostgreSQL 16 Partitioned Tables :5432)]
+        Broker[(Redis 7 Broker & Cache :6379)]
+        
+        Browser -->|"HTTPS (SSO Auth)"| Caddy
+        Caddy -->|"Proxy /"| UI
+        Caddy -->|"Proxy /api/v1 (Injected Bearer Auth)"| API
+        API --> DB
+        API --> Broker
+        Beat -->|"Schedule 60s Scrapes & Retention"| Broker
+        Broker --> Worker
+        Worker --> DB
     end
 
-    RemoteSensor -->|"HTTPS alert webhook"| Gateway
-    LocalSensor -->|"Push Alerts (POST /internal/alert)"| API
-    Beat -->|"Schedule 60s Scrapes"| Worker
-    Worker -->|"Pull Metrics (:19999/api/v3/data)"| LocalSensor
-    Worker -->|"Pull Metrics (:19998/api/v3/data)"| RemoteSensor
-    Worker -->|"Pull host categories and logs (:20000/api/v1)"| HostCollector
-    Worker -->|"Persist Snapshots"| DB
-    API --> DB
+    Worker -->|"Pull Telemetry & Logs (Bearer Auth :20000)"| Host1
+    Worker -->|"Pull Telemetry & Logs (Bearer Auth :20000)"| Host2
+    Worker -->|"Pull Telemetry & Logs (Bearer Auth :20000)"| HostN
+    TargetHosts -.->|"Proc / Sysfs / Docker / Systemd"| TargetHosts
 ```
 
-- **LAN gateway**: Caddy terminates private HTTPS and uses Authentik forward authentication to assign read, admin, or enrollment access.
-- **Backend**: FastAPI (`/api/v1/*` for role-authenticated UI & management APIs, `/internal/alert` for shared-secret-authenticated push webhooks).
-- **Background Workers**: Celery with Redis broker (60s metric collection across active nodes, 5m ML anomaly evaluation, configurable metric and log retention).
-- **Database**: PostgreSQL 16 with time-range partitioned metric storage and relational event logs.
-- **Remote agent bundle**: Netdata Agent v2.11.1 plus the PALANTIR Linux host collector, deployed together through Docker Compose.
+### Core Architecture Components
+
+1. **Master Control Plane**:
+   - **FastAPI Backend (`:8000`)**: Asynchronous REST API serving telemetry querying, host registration, threshold management, and investigation triggering.
+   - **React 18 Dashboard (`:3000`)**: Modern terminal-styled dashboard for real-time fleet health, interactive telemetry charts, audit event logs, dynamic threshold customization, and security incident investigations.
+   - **PostgreSQL 16 (`:5432`)**: Relational database utilizing monthly range-partitioned tables (`metric_snapshots`, `audit_events`, `system_logs`) for high-throughput, low-latency queries.
+   - **Redis 7 (`:6379`) & Celery**: Distributed task broker and workers executing 60-second host metrics collection, anomaly detection, automated retention pruning, and incident investigations.
+   - **Caddy & Authentik SSO**: Enterprise reverse proxy with automated TLS termination and forward role-based authentication (`read`, `admin`, `enroll`).
+
+2. **Native Host Collector (`:20000`)**:
+   - Lightweight, standalone containerized Python daemon located in `agent/` (Docker image: `abdullahahmadfarooqi/palantir-host-collector:latest`).
+   - Collects kernel, systemd, process, network, storage, container, and security metrics directly from `/proc`, `/sys`, and `/var/run/docker.sock` without third-party agent dependencies.
+   - Protected via Bearer token authentication (`AGENT_AUTH_TOKEN`).
 
 ---
 
-## 1. Quickstart: Central Server (Ubuntu)
+## Key Features
 
-Run the central PALANTIR platform on your primary server:
-
-```bash
-git clone -b telemetry_pipeline https://github.com/abdullah-farooqi/PALANTIR.git
-cd PALANTIR
-
-# Creates a private .env, generates separate secrets, and starts published images.
-./scripts/setup-central.sh --lan-ip <CENTRAL_SERVER_LAN_IP>
-```
-
-The central setup script does not print generated secrets. It creates `.env`
-with mode `600` and a second mode `600` file named `.env.agent-secrets` that
-contains only the webhook, enrollment, collector, and image settings needed by
-remote hosts. Keep both files out of Git and copy only `.env.agent-secrets` to
-trusted remote hosts. The script preserves an existing `.env`; fill its required
-values and set `PALANTIR_LAN_BIND_IP` before rerunning if you already have one.
-
-### Test the published images on another machine
-
-GitHub Actions publishes the backend, Netdata, and host collector images to
-Docker Hub and GitHub Container Registry after the unit and Docker smoke tests
-pass. The central stack uses Docker Hub images by default. To pull those images
-on a test machine, clone this repository for its Compose files and SQL schema,
-then prepare a private environment file:
-
-```bash
-git clone -b telemetry_pipeline https://github.com/abdullah-farooqi/PALANTIR.git
-cd PALANTIR
-cp .env.example .env
-chmod 600 .env
-```
-
-Set the required database passwords, webhook secret, API tokens, collector
-token (`AGENT_AUTH_TOKEN`), and Authentik secret in `.env`. Generate a separate
-value for each with `openssl rand -hex 32`. Set `PALANTIR_LAN_BIND_IP` to the test machine's LAN address if other
-machines need to reach it. Keep `.env` on that machine and out of GitHub.
-
-To use the published images rather than rebuilding or mounting source code,
-run:
-
-```bash
-docker compose -f docker-compose.yml -f docker-compose.images.yml pull
-docker compose -f docker-compose.yml -f docker-compose.images.yml up -d --no-build
-```
-
-Docker Hub images can be pulled without logging in when their repositories are
-public. For private repositories, run `docker login` with a Docker Hub access
-token. The GitHub Actions publish job uses the repository's `DOCKERHUB_TOKEN`
-secret for Docker Hub and its built-in `GITHUB_TOKEN` for GitHub Container
-Registry. These registry credentials are separate from the runtime values in
-`.env`.
-
-On boot, the backend probes the configured Netdata endpoint, discovers the contexts available on that host, and registers `local-node` into PostgreSQL. Context counts are host-specific and must not be hard-coded.
-
-### API access
-
-All `/api/v1` routes require a Bearer token. Read tokens can call read routes;
-admin tokens can also deactivate nodes and request investigations. The optional
-enrollment token can create a node or repeat an identical enrollment, but cannot
-modify or reactivate one. Tokens are distinct, random values of at least 32
-characters and stay in the server `.env`. Caddy removes browser-supplied
-authorization and identity headers, then injects a role-scoped token after
-Authentik authenticates the session. The only caller-supplied token accepted at
-the proxy is the restricted enrollment token, and only for `POST /api/v1/nodes`;
-the backend further limits it to create-only registration. The backend listens
-on host loopback, so LAN clients use the proxy. Never put shared tokens in
-browser JavaScript. `AGENT_AUTH_TOKEN` is a separate collector credential; set
-the same value as `PALANTIR_AGENT_TOKEN` on every remote host. Enrollment
-registration makes the central service probe the supplied endpoint URLs; only
-give the enrollment token to trusted host administrators and protect the
-central server with LAN firewall rules.
-
-### LAN proxy and Authentik setup
-
-The included Caddy and Authentik services use `palantir.home.arpa` and
-`auth.palantir.home.arpa`. Add both names to the LAN DNS server (or each client’s
-hosts file), pointing them to the central server’s static LAN IP. Keep Caddy
-bound to that LAN interface and allow ports 80/443 only from the LAN. The
-`home.arpa` suffix is reserved for residential home networks; it is not a public
-DNS name.
-
-Before starting Compose, set `POSTGRES_PASSWORD`, `PALANTIR_LAN_BIND_IP`,
-`PALANTIR_API_READ_TOKEN`, `PALANTIR_API_ADMIN_TOKEN`,
-`PALANTIR_API_ENROLL_TOKEN`, `PALANTIR_WEBHOOK_SECRET`, `AGENT_AUTH_TOKEN`,
-`AUTHENTIK_SECRET_KEY`, and `AUTHENTIK_POSTGRES_PASSWORD` in `.env`. Generate
-a different random value of at least 32 characters for each secret/token (for example, run
-`openssl rand -hex 32` separately for each). Keep all values distinct. Without
-a webhook secret, alert webhooks are rejected; without API tokens, API requests
-fail closed. Add both DNS names to the LAN DNS server before clients use them.
-Prefer `./scripts/setup-central.sh --lan-ip <CENTRAL_SERVER_LAN_IP>`; it
-validates the environment, applies the idempotent database schema, and starts
-the published image stack. For manual setup, initialize the schema before
-starting the backend with `docker compose up -d`.
-
-Make an initial TLS request from the server so Caddy creates its local root CA:
-
-```bash
-openssl s_client -connect <PALANTIR_LAN_IP>:443 -servername palantir.home.arpa </dev/null
-```
-
-Export the certificate and install it on each client as described below. Then
-open `https://auth.palantir.home.arpa/if/flow/initial-setup/` (keep the trailing
-slash) and complete Authentik's initial admin setup.
-Create these Authentik groups using the exact names:
-
-- `palantir-read` for UI/API read access.
-- `palantir-admin` for read and management access.
-- `palantir-enroll` for create-only node registration; this group also requires
-  `PALANTIR_API_ENROLL_TOKEN` in `.env`.
-
-Create user accounts and add each account to the group matching its access level.
-
-Create a Proxy Provider in **Forward auth (single application)** mode with
-external host `https://palantir.home.arpa`, create its Application, and assign
-the `palantir-read`, `palantir-admin`, and (if enabled) `palantir-enroll` groups
-to that application with group policy bindings. Add the application to
-Authentik's embedded outpost under **Applications → Outposts**. Caddy routes the
-outpost callback and maps these group names to the matching server-side API
-token. Read users can only read; admin users can read and use management
-routes; enrollment users can only POST to `/api/v1/nodes`.
-
-For LAN HTTPS, Caddy creates a private local certificate authority. Export its
-root certificate from `palantir-caddy`:
-
-```bash
-docker cp palantir-caddy:/data/caddy/pki/authorities/local/root.crt ./caddy-root.crt
-```
-
-Install it as trusted on each client before opening either site. On Debian or
-Ubuntu clients:
-
-```bash
-sudo install -m 0644 caddy-root.crt /usr/local/share/ca-certificates/palantir-caddy.crt
-sudo update-ca-certificates
-```
-
-The Caddy root CA is stored in the persistent `caddy_data` volume. Copy only its
-public root certificate to clients. `scripts/setup-agent.sh` configures both
-the node enroller and Netdata webhook client to trust it. The root file
-`central-ca.crt` is only a placeholder for manual `docker-compose.agent.yml`
-deployments. Caddy's local certificates do not need public DNS or external port
-access.
-
-This proxy setup expects the React UI to use the same origin as the API, so
-leave `CORS_ALLOWED_ORIGINS` empty. Cross-origin browser access needs a separate
-session and credential design; setting an origin alone is insufficient while
-CORS credentials remain disabled.
+- **8 Core Telemetry Categories**:
+  - `system`: CPU core utilization, load averages, memory, swap, uptime.
+  - `storage`: Mount points, disk usage, partition capacity, read/write I/O operations.
+  - `network`: Interface bandwidth, packet rates, errors, drop rates.
+  - `services`: Systemd units, active/failed service statuses.
+  - `processes`: Top resource-consuming processes, thread counts, process states.
+  - `connections`: Active listening ports, established TCP/UDP network connections.
+  - `containers`: Docker container states, CPU/memory resource usage.
+  - `vms`: Virtual machine hypervisor telemetry (LXD, KVM/QEMU, Proxmox).
+- **Dynamic Threshold Engine**: Real-time evaluation of metric conditions (Warning/Critical) with full UI customization.
+- **Automated Security Investigations**: Background correlation of system alerts with audit logs, process anomalies, and network connections.
+- **Time-Partitioned Storage**: Monthly metric partition maintenance and metric pruning handled automatically by Celery background workers.
 
 ---
 
-## 2. Deploying on Remote Endpoints / VMs (Zero-Touch)
+## 1. Quickstart: Central Master Server (Ubuntu)
 
-Remote hosts do **not** run PostgreSQL, Redis, Celery, or the central backend. Deploy the Netdata sensor and PALANTIR host collector together with Compose. The Compose enroller registers both endpoints.
-
-### Configure a remote endpoint
-
-On the central server, first export Caddy's public root certificate after the
-central stack is running:
-
-```bash
-docker cp palantir-caddy:/data/caddy/pki/authorities/local/root.crt ./caddy-root.crt
-```
-
-Copy only the agent-specific secrets file and public CA certificate to the
-remote host over SSH. Create a private staging directory first:
-
-```bash
-ssh <REMOTE_USER>@<REMOTE_IP> 'install -d -m 700 ~/palantir-bootstrap'
-scp .env.agent-secrets caddy-root.crt <REMOTE_USER>@<REMOTE_IP>:palantir-bootstrap/
-```
-
-On the remote Ubuntu host, clone the deployment branch and run the host setup
-script as root:
+Run the automated master installer on your primary Ubuntu server:
 
 ```bash
 git clone -b telemetry_pipeline https://github.com/abdullah-farooqi/PALANTIR.git
 cd PALANTIR
-sudo ./scripts/setup-agent.sh \
-  --secrets-file "$HOME/palantir-bootstrap/.env.agent-secrets" \
-  --ca-cert "$HOME/palantir-bootstrap/caddy-root.crt"
+
+# Run the master setup script
+sudo bash scripts/Automatic-Master-Server-Setup.sh
 ```
 
-The script asks for a unique node name and the IP address/ports the central
-server can reach. It writes `/opt/palantir-agent/.env.agent` with mode `600`,
-copies the Compose file and CA certificate, pulls the Netdata and collector
-images, starts them, waits for health, and submits the restricted enrollment
-request. It does not print the secrets. After successful setup, remove the
-staged secrets file from the remote host:
+### What the Master Setup Script Does:
+1. **System & Dependency Verification**: Checks Docker engine and Node.js / npm (v18+) requirements.
+2. **Automated Secret Generation**: Generates 32-character cryptographic hex secrets in `.env` with strict permissions (`chmod 600`).
+3. **Port Conflict Resolution**: Automatically detects and frees ports `3000`, `8000`, `5432`, and `6379` if occupied.
+4. **Backend Stack Initialization**: Launches `palantir-backend`, `palantir-celery-worker`, `palantir-celery-beat`, `palantir-postgres`, and `palantir-redis` via Docker Compose.
+5. **Schema & Partition Migration**: Applies PostgreSQL initializations, B-tree indexes, GIN indexes, and range-partitioned tables (`sql/init.sql`).
+6. **Frontend Dashboard Launch**: Installs UI dependencies in `frontend/` and starts the React dashboard on `http://localhost:3000`.
+
+---
+
+## 2. Quickstart: Monitored Target Hosts (Remote / Edge / VMs)
+
+Remote hosts do not run PostgreSQL, Redis, Celery, or the central backend. To monitor any remote Linux server or VM, run the automated host setup script:
 
 ```bash
-rm -f "$HOME/palantir-bootstrap/.env.agent-secrets"
+git clone -b telemetry_pipeline https://github.com/abdullah-farooqi/PALANTIR.git
+cd PALANTIR
+
+# Run the host collector setup script
+sudo bash scripts/Automatic-Host-Setup.sh
 ```
 
-You can omit `--secrets-file` to enter the central URL and secrets through
-hidden prompts instead.
+### What the Host Setup Script Does:
+1. Verifies Docker engine installation on the target host.
+2. Stops any conflicting collector processes and frees port `20000`.
+3. Opens inbound port `20000/tcp` on the local firewall (UFW) if enabled.
+4. Pulls the latest container image: `abdullahahmadfarooqi/palantir-host-collector:latest`.
+5. Deploys the collector daemon (`palantir-collector`) listening on port `20000` with read-only host mounts (`/proc`, `/sys`, `/etc`, `/var/run/docker.sock`).
+6. Detects the host's LAN IP address and prints the enrollment parameters for your Master UI.
 
-The environment values are assigned as follows:
-
-- **Central `.env`:** database passwords; webhook secret; read, admin, and
-  restricted enrollment API tokens; Authentik signing key and database password;
-  `AGENT_AUTH_TOKEN`; and the central server's LAN bind IP.
-- **Remote `.env.agent`:** central HTTPS URL; node name; remote advertised IP and
-  ports; the same webhook, enrollment, and collector tokens; the Caddy root CA
-  path; and the sensor/collector image names.
-- **Never copy:** the central `.env`, read token, admin token, Docker Hub token,
-  or GitHub Actions token to a remote host. The registry images are public, so
-  remote Docker pulls do not need the CI publishing credential.
-
-For a VirtualBox remote VM, bridged networking is recommended so the central
-host can reach its advertised IP. Inbound TCP ports `19999` and `20000` on the
-remote host should be allowed from the central server only. Central outbound
-traffic must reach those ports; the remote host must reach central HTTPS on 443.
-
-The restricted enrollment token can create a node or repeat an unchanged
-enrollment; it cannot read data, modify existing nodes, or deactivate them. If
-you do not use automatic enrollment, register the endpoint later from the
-central host with `scripts/register-node.sh` and an admin token.
-
-The older `scripts/install-agent.sh` remains available for compatibility. For
-new deployments, use `scripts/setup-agent.sh` so secrets are entered via a
-protected file or hidden prompts instead of command-line arguments.
-
-The bundle exposes Netdata on port `19999` and the host collector on `20000`. The collector mounts host `/proc`, `/sys`, `/var/log`, `/run`, and `/` read-only so it can inspect mount usage and host files. That grants it read access to host files; the mounted Docker socket can also issue Docker API operations even through a read-only filesystem mount. Restrict network access to the agent ports and deploy it only on trusted hosts.
-
-Optional host integrations are discovered and skipped when unavailable. Docker and LXD use their local sockets; libvirt uses the host system connection. Kubernetes and Proxmox API integrations can be configured with `KUBERNETES_API_URL`, `KUBERNETES_TOKEN`, `KUBERNETES_CA_CERT`, `PROXMOX_API_URL`, `PROXMOX_API_TOKEN`, and `PROXMOX_CA_CERT` in the agent Compose environment. Proxmox tokens use the API token value expected by its `PVEAPIToken` authorization scheme. Direct containerd CRI and legacy LXC collection are reported as not configured. Application log paths are configurable with `APP_LOG_GLOBS`; the collector starts tailing files from their current end and parses new JSON, syslog, or plain-text lines into events. It includes debug-level records by default; set `LOG_MIN_PRIORITY=6` to omit debug events.
-
-The setup script pulls the published images automatically. Use
-`scripts/build-and-push.sh` only when publishing a new development build.
-
-### Existing single-container installations
-
-The old `docker run` command deploys only Netdata. Replace it with the Compose bundle to enable host collection. Legacy nodes registered with only `netdata_url` continue to be polled for their existing Netdata categories.
-
-For a locally checked-out copy of this repository, run:
-
+To inspect the running collector on a target host:
 ```bash
-sudo ./scripts/setup-agent.sh \
-  --secrets-file /path/to/.env.agent-secrets \
-  --ca-cert /path/to/caddy-root.crt
+docker ps --filter "name=palantir-collector"
+docker logs -f --tail 50 palantir-collector
 ```
-
-The older `install-agent.sh` wrapper rejects secret command-line arguments and
-delegates to the secure setup flow.
 
 ---
 
 ## 3. VirtualBox / NAT VM Networking Guide
 
-If deploying the remote agent inside a virtual machine (e.g., VirtualBox with default NAT IP `10.0.2.15`), the host cannot route inbound traffic into `10.0.2.15:19999` directly. Choose one of two options:
+If deploying the host collector inside a virtual machine (e.g., VirtualBox with default NAT IP `10.0.2.15`), the central server cannot route inbound traffic directly into `10.0.2.15:20000`. Choose one of two options:
 
-### Option 1: Bridged Networking (Recommended for LAN)
-1. In VirtualBox: VM **Settings** -> **Network** -> **Adapter 1** -> Change **NAT** to **Bridged Adapter**.
-2. Inside the VM: renew IP (`sudo dhclient -v`). The VM receives a LAN IP (e.g., `192.168.18.X`), directly reachable by the host.
+### Option 1: Bridged Networking (Recommended)
+1. In VirtualBox: **VM Settings → Network → Adapter 1 → Attached to: Bridged Adapter**.
+2. Inside the VM, renew DHCP lease: `sudo dhclient -v`.
+3. The VM receives a direct LAN IP (e.g., `192.168.1.X`), directly reachable by the central server on port `20000`.
 
 ### Option 2: Live Port Forwarding (While Keeping NAT)
-From the host machine, forward host port `19998` to guest port `19999` without restarting the VM:
+From the VM host machine, forward a host port (e.g. `20001`) to the guest's port `20000` without restarting the VM:
 
 ```bash
-VBoxManage controlvm "<VM_NAME>" natpf1 "netdata-agent,tcp,,19998,,19999"
+VBoxManage controlvm "<VM_NAME>" natpf1 "palantir-collector,tcp,,20001,,20000"
 ```
-
-Then register the node in the PALANTIR UI while signed in as a member of the
-`palantir-admin` group. The proxy intentionally drops browser-supplied Bearer
-headers and chooses the token from the Authentik session instead.
+Then register the node in the PALANTIR Master UI specifying the host IP and forwarded port `http://<HOST_IP>:20001`.
 
 ---
 
-## 4. Backend telemetry APIs and retention
+## 4. Reverse Proxy & Authentik SSO Setup (Optional LAN Gateway)
 
-The authenticated read API provides these telemetry contracts:
+For enterprise deployments requiring HTTPS and single sign-on, Caddy and Authentik manage authentication and forward-proxying to the backend.
 
-- `GET /api/v1/fleet/summary` returns total/enabled/disabled nodes, enabled-node
-  reachability counts, the latest metric timestamp, currently active alerts,
-  anomalies from the previous 24 hours, and API/database plus collection and
-  anomaly-task health. A worker heartbeat reports task execution and partial
-  node-level failures; it does not guarantee that every node/category scrape succeeded.
-- `GET /api/v1/events` returns a fleet-wide alert/anomaly feed. Filters are
-  `event_type=alert|anomaly|all`, `node_id`, alert `severity`, anomaly
-  `min_score`, `since`, and `until`. `limit` is 1–500; `cursor` is an opaque
-  keyset cursor. Follow it with the same filters. Responses contain `items`,
-  `has_more`, and `next_cursor`.
-- `GET /api/v1/nodes/{node_id}` and the node list include `last_seen_at`,
-  `last_collection_at`, and derived `reachability`. Defaults are reachable at
-  180 seconds since contact and stale at 900 seconds; `active` continues to
-  mean administratively enabled. Configure with `NODE_REACHABLE_SECONDS` and
-  `NODE_STALE_SECONDS`.
-- `GET /api/v1/nodes/{node_id}/collection-status` reports eight categories
-  (`system`, `storage`, `network`, `services`, `processes`, `connections`,
-  `containers`, `vms`) for Netdata and the optional PALANTIR agent. Statuses
-  include `available`, `not_configured`, `unsupported`, `collection_error`,
-  `unknown`, and derived `stale`; each source includes last attempt/success and
-  safe error information. Category freshness defaults to 180 seconds and is
-  configurable with `METRIC_STALE_SECONDS`.
-- `GET /api/v1/nodes/{node_id}/metrics/{category}/series` accepts timezone-aware
-  `since`/`until`, optional `source`, `limit` (1–1,000), and opaque `cursor`.
-  Optional `bucket_seconds` (10–86,400) returns source-grouped server-side
-  average/minimum/maximum values for typed numeric fields and sample counts.
-  Requested windows cannot predate or exceed `METRICS_RETENTION_HOURS`; each
-  response returns the requested window, retention cutoff, aggregation, and
-  paging state. Use the cursor with unchanged filters.
-- `GET /api/v1/metrics/schema` returns schema version 1, the common snapshot
-  envelope, category/source support, and typed metric names, types, units, and
-  labels. Additional raw JSON keys are collector-defined and may be absent.
-
-The legacy `/api/v1/nodes/{node_id}/metrics/{category}` history route remains
-available with a 100-snapshot cap. `/api/v1/nodes/{node_id}/capabilities`
-reports host-collector capabilities. Structured log events are available from
-`/api/v1/nodes/{node_id}/logs` with `since`, `until`, `severity`, `source`,
-`limit`, and `offset` filters. Alert active state is derived from the latest
-transition by node, alert name, and chart.
-
-Additional Priority 2/3 APIs are:
-
-- `GET /api/v1/logs` searches messages across the fleet with full-text `q`,
-  `node_id`, `service`, `pid`, `source`, `severity`, `since`, and `until`
-  filters. `limit` is 1–500 and pages use a stable `cursor`, `has_more`, and
-  `next_cursor` contract.
-- `POST /api/v1/investigations` (admin) queues a manual investigation or one
-  tied to an alert/anomaly owned by the requested node. It returns HTTP 202
-  after Redis/Celery accepts the job. WARNING/CRITICAL alerts and qualifying
-  anomaly events enqueue investigations automatically. Dispatch failures are
-  persisted and return HTTP 503 with the failed investigation ID.
-- Investigation records expose `job_id`, `queued_at`, `started_at`,
-  `completed_at`, `progress`, `queue_delay_ms`, terminal status, and safe
-  failure details. `GET /api/v1/investigations/search` filters by node, status,
-  trigger type, and time range with stable cursor paging. Result schema version
-  1 enforces a strict bounded contract for metric, alert, anomaly, and trigger
-  evidence before persistence. It does not infer a root cause.
-- `GET /api/v1/nodes/search` provides hostname search, enabled/OS/reachability,
-  top-level capability, category/source status filters, and stable keyset pages.
-  The original `/api/v1/nodes` list keeps its array response for compatibility.
-- `GET /api/v1/health/operations` reports database and Redis checks, Celery
-  worker ping, beat-dispatch heartbeat, Redis queue depth, scheduled task
-  duration/failure rates, and investigation queue-delay statistics. The
-  `/healthz` route remains a process-only check.
-
-The Redis service uses append-only persistence for queued work. On a new
-database volume, PostgreSQL applies `sql/init.sql` during its first startup. On
-an existing volume, stop the old API and Celery services, start PostgreSQL, and
-apply the idempotent migration before starting the upgraded services:
-
-```bash
-docker compose stop backend celery_worker celery_beat
-docker compose up -d postgres
-docker exec -i palantir-postgres psql -v ON_ERROR_STOP=1 -U palantir -d palantir < sql/init.sql
-docker compose up -d --build
+### DNS Configuration
+The included Caddy reverse proxy uses `palantir.home.arpa` and `auth.palantir.home.arpa`. Add both domain names to your LAN DNS server (or local `/etc/hosts`), pointing to your central server's static LAN IP:
+```
+<CENTRAL_SERVER_LAN_IP> palantir.home.arpa auth.palantir.home.arpa
 ```
 
-Replace `palantir` in the `psql` command if `POSTGRES_USER` or `POSTGRES_DB` is
-customized. The migration expands investigation lifecycle columns, heartbeat
-counters, and search indexes. Polling remains the current UI contract; add
-SSE/WebSocket only if measured UI load or latency shows cursor polling is
-inadequate.
-
-Metric snapshots default to 24 hours of retention (`METRICS_RETENTION_HOURS`). Structured logs default to 7 days (`LOG_RETENTION_DAYS`). Set these variables in the central `.env` file to adjust retention.
-
-Apply the idempotent `sql/init.sql` migration before starting upgraded API or
-worker containers. It adds node collection timestamps, per-category statuses,
-worker heartbeats, and supporting event/source indexes.
-
-## 5. Verification & Testing
-
-### Verify a live Netdata host
-
-Run the host-endpoint checks before trusting a new agent or upgrade:
-
+### Initial TLS Certificate Setup
+Caddy generates an internal Certificate Authority (CA) for private HTTPS. Make an initial TLS handshake from the server:
 ```bash
-cd backend
-NETDATA_URL=http://localhost:19999 ./venv/bin/python scripts/verify_live.py
-# Or from the repository root:
-NETDATA_URL=http://localhost:19999 ./backend/venv/bin/python backend/scripts/verify_live.py
+openssl s_client -connect <PALANTIR_LAN_IP>:443 -servername palantir.home.arpa </dev/null
+```
+Export Caddy's root certificate and install it on client machines:
+```bash
+# Export from Caddy container
+docker cp palantir-caddy:/data/caddy/pki/authorities/local/root.crt ./caddy-root.crt
+
+# Install on Ubuntu / Debian client machines:
+sudo install -m 0644 caddy-root.crt /usr/local/share/ca-certificates/palantir-caddy.crt
+sudo update-ca-certificates
 ```
 
-The verifier checks the v1 host-label and v3 identity split, host-derived RAM,
-context discovery, non-empty recent `contexts` queries, JSON2 row shape,
-unknown-context behavior, the `anomaly-rate` method echo, and the v3
-current-alert envelope. A healthy host may have no current alert instances.
+### Authentik Group Roles
+Open `https://auth.palantir.home.arpa/if/flow/initial-setup/` and complete initial setup. Create the following groups:
+- `palantir-read`: UI/API read-only access.
+- `palantir-admin`: Read, threshold editing, node deactivation, and investigation management.
+- `palantir-enroll`: Machine-to-machine node registration (`POST /api/v1/nodes`).
 
-### Verify Live Ingestion on Central Server (Ubuntu)
+Caddy inspects incoming sessions, strips browser-supplied authorization headers, and injects the corresponding server-side Bearer token (`PALANTIR_API_READ_TOKEN`, `PALANTIR_API_ADMIN_TOKEN`, `PALANTIR_API_ENROLL_TOKEN`) directly into the backend request.
+
+---
+
+## 5. Backend REST Telemetry APIs & Data Retention
+
+All `/api/v1/*` routes require a Bearer token (`Authorization: Bearer <TOKEN>`).
+
+### Telemetry & Fleet APIs
+- `GET /api/v1/fleet/summary`: Fleet-wide summary showing total/enabled/disabled nodes, reachability counts, latest metric timestamp, active alerts, 24h anomaly statistics, and backend/worker health status.
+- `GET /api/v1/events`: Fleet-wide alert and anomaly feed supporting `event_type` (`alert` | `anomaly` | `all`), `node_id`, severity, and opaque keyset cursor pagination (`next_cursor`).
+- `GET /api/v1/nodes/{node_id}`: Detailed node state including `last_seen_at`, `last_collection_at`, and reachability status (derived via `NODE_REACHABLE_SECONDS=180` and `NODE_STALE_SECONDS=900`).
+- `GET /api/v1/nodes/{node_id}/collection-status`: Status report across all 8 categories (`system`, `storage`, `network`, `services`, `processes`, `connections`, `containers`, `vms`) detailing last attempt/success and error details.
+- `GET /api/v1/nodes/{node_id}/metrics/{category}/series`: Time-series query route supporting `since`, `until`, `limit` (1–1000), `bucket_seconds` (10–86400 for server-side min/max/avg rollups), and cursor pagination.
+- `GET /api/v1/metrics/schema`: Versioned snapshot schema detailing supported categories, metric names, data types, units, and label definitions.
+
+### Investigation & Log APIs
+- `GET /api/v1/logs`: Full-text search across ingested fleet logs supporting `q`, `node_id`, `service`, `pid`, `severity`, and cursor pagination.
+- `POST /api/v1/investigations`: Enqueues an automated security investigation. Automatically dispatched on `WARNING` or `CRITICAL` alerts or qualifying anomaly events.
+- `GET /api/v1/investigations/search`: Query and filter investigations by node, status (`queued`, `running`, `completed`, `failed`), and trigger type.
+- `GET /api/v1/health/operations`: Operational health check returning database ping, Redis connectivity, Celery worker status, beat scheduler heartbeat, and task failure rates.
+
+### Data Retention
+- Metric snapshots are retained for 24 hours by default (`METRICS_RETENTION_HOURS=24`).
+- Structured security logs are retained for 7 days by default (`LOG_RETENTION_DAYS=7`).
+- Scheduled Celery maintenance tasks automatically prune partitions and expired data based on these settings.
+
+---
+
+## 6. Verification & Testing
+
+### Verify Live Ingestion on Central Master
 ```bash
-# 1. Watch incoming snapshot count update every 60s
+# 1. Watch incoming metric snapshot ingestion rate (updates every 60s)
 watch -n 5 "docker exec palantir-postgres psql -U palantir -d palantir -c \
   'SELECT category, count(*), max(collected_at) AS latest_stream FROM metric_snapshots GROUP BY category;'"
 
-# 2. Query live real-time metrics for a specific node (e.g. node 5)
-curl -s http://localhost:8000/api/v1/nodes/5/metrics | python3 -m json.tool
+# 2. Query live node metrics via REST API
+curl -s http://localhost:8000/api/v1/nodes/1/metrics | python3 -m json.tool
 
-# 3. Stream clean Celery worker collection logs
-docker logs -f --tail 20 palantir-celery-worker 2>&1 | grep --line-buffered "19998"
+# 3. Stream background Celery worker collection logs
+docker logs -f --tail 25 palantir-celery-worker
 ```
 
-### Existing backend test suite
-
-For the Priority 2/3 API contracts, run the focused test first against a local
-development environment (not a production database):
-
+### Running Backend Integration & Unit Tests
 ```bash
-cd backend
-./venv/bin/pytest -q tests/test_priority_api_contracts.py
-```
+# Run prioritized API contract test suite
+docker exec palantir-backend pytest -v tests/test_priority_api_contracts.py
 
-The API integration fixture supplies a test-only admin role and mocks Celery
-dispatch; authentication behavior is tested separately. Run the suite against
-a local test database with the current `sql/init.sql` migration applied, never
-against production data.
-
-```bash
-# Host virtual environment (run from backend so pyproject.toml is loaded)
-cd backend
-./venv/bin/pytest -q
-
-# Running stack
-docker exec palantir-backend pytest -v
-```
-The prior 58-test baseline covers API contracts, Netdata JSON2 parsing, GUID
-normalization, typed metric persistence, constant-time webhook secret validation,
-and Celery pipelines. It predates the expanded host collector and does not
-validate those new paths.
-
----
-
-## 5. Netdata API-v3 Rules
-
-PALANTIR uses the host endpoint as the source of truth. API-v3 is permissive:
-several incorrect requests return valid-looking responses instead of errors.
-
-| Concern | Required behavior | Failure mode to avoid |
-|---|---|---|
-| Data selection | Use `contexts=...`, never `chart=...` | `chart` can be silently ignored and return unrelated contexts |
-| Time window | Send `after=-60` (or another explicit window) | A fresh agent's default window can predate startup and return no rows |
-| Instances | Send `group_by=instance` for NICs, mounts, processes, and containers | Omitting it aggregates instances together |
-| Data shape | Request `format=json2`; parse values as `[value, anomaly, flags]` triples | Treating dimensions as scalars corrupts values |
-| Response envelope | Read rows from `result.data` and labels from `result.labels` | Looking for top-level `data` reports false emptiness |
-| Anomaly scores | Use `/api/v3/weights?...&method=anomaly-rate` | Other method names can silently select a different calculation |
-| Alert definitions | Use `/api/v1/alarms?all` | `/api/v1/alerts` is not the endpoint; `all=1` is not equivalent to bare `all` |
-| Current alerts | POST `/api/v3/alerts` with `options` | A healthy host may return only `api`, `nodes`, and `timings` |
-| Alert configuration | GET `/api/v3/alert_config?config=<hash>` | The configuration hash is required |
-
-The live verifier is intentionally a semantic check, not just an HTTP health
-probe. In particular, an empty current-alert set is not evidence that the
-health subsystem is stopped; inspect the envelope and the agent's health
-capability before drawing that conclusion.
-
-## 6. Structured Metric Storage
-
-`metric_snapshots` retains cleaned JSONB in `data` for compatibility and
-promotes common values into nullable typed columns: `cpu_pct`, `ram_used_mb`,
-`ram_total_mb`, `load_avg`, `swap_used_mb`, and `top_processes`. The schema is
-partitioned by `collected_at`, has node/category/time indexes, B-tree indexes
-for typed resource values, and a partial GIN index for `top_processes`.
-
-The checked-in `sql/init.sql` is safe to rerun against an existing volume: it
-uses `IF NOT EXISTS` for tables and indexes and `ADD COLUMN IF NOT EXISTS` for
-the typed migration. It also applies the one-time correction for legacy agent
-dispatch flags. For an already-running stack, apply it explicitly:
-
-```bash
-docker exec -i palantir-postgres psql -v ON_ERROR_STOP=1 \
-  -U palantir -d palantir < sql/init.sql
+# Run security & authentication test suite
+docker exec palantir-backend pytest -v tests/test_security.py
 ```
 
 ---
 
-## 7. Branching & Contribution Strategy
+## 7. Configuration Reference
 
-The PALANTIR development workflow follows a phased branch hierarchy:
-1. `telemetry_pipeline` (Feature branch): Active development of sensor collection, parsers, and node enrollment.
-2. `initial_project` (Integration branch): Staging branch for reviewing and integrating complete functional milestones.
-3. `main` (Production branch): Protected branch for stable, mature application releases.
+All environment variables are declared in `.env` (template provided in `.env.example`).
+
+| Variable | Description | Default / Example |
+| :--- | :--- | :--- |
+| `POSTGRES_USER` | PostgreSQL database user | `palantir` |
+| `POSTGRES_PASSWORD` | PostgreSQL database password | Secure random hex |
+| `POSTGRES_DB` | Primary database name | `palantir` |
+| `DATABASE_URL` | Async SQLAlchemy database URL | `postgresql+asyncpg://palantir:...@localhost:5432/palantir` |
+| `SYNC_DATABASE_URL` | Sync psycopg database URL for Celery | `postgresql+psycopg://palantir:...@localhost:5432/palantir` |
+| `REDIS_URL` | Redis broker and caching URL | `redis://localhost:6379/0` |
+| `PALANTIR_API_READ_TOKEN` | Bearer token for read-only API access | Secure 32-char hex |
+| `PALANTIR_API_ADMIN_TOKEN` | Bearer token for administrator API access | Secure 32-char hex |
+| `PALANTIR_API_ENROLL_TOKEN`| Bearer token for automated node enrollment | Secure 32-char hex |
+| `AGENT_AUTH_TOKEN` | Shared secret for Host Collector (`:20000`) | Secure 32-char hex |
+| `PALANTIR_WEBHOOK_SECRET` | Secret for alert webhook integration | Secure 32-char hex |
+| `PALANTIR_LAN_BIND_IP` | Reverse proxy LAN bind address | `127.0.0.1` |
+| `METRICS_RETENTION_HOURS` | Retention window for raw metric snapshots | `24` |
+| `LOG_RETENTION_DAYS` | Retention window for security log events | `7` |
+| `NODE_REACHABLE_SECONDS` | Timeout before node is marked unreachable | `180` |
+| `NODE_STALE_SECONDS` | Timeout before node is marked stale | `900` |
+
+---
+
+## 8. Security & Network Ports
+
+| Port | Service | Access / Boundary |
+| :--- | :--- | :--- |
+| `3000` | React UI Dashboard | Operator LAN / Localhost |
+| `8000` | FastAPI Backend & REST API | Master Server Localhost (`/docs` for OpenAPI Swagger) |
+| `20000` | PALANTIR Host Collector | Target Host (Protected by Bearer Token) |
+| `5432` | PostgreSQL 16 Database | Master Server Localhost / Docker internal network |
+| `6379` | Redis 7 Task Broker & Cache | Master Server Localhost / Docker internal network |
+
+---
+
+## 9. Project Directory Structure
+
+```
+PALANTIR/
+├── agent/                  # Standalone Linux Host Collector daemon (:20000)
+│   ├── collector.py        # Host telemetry & log scraper
+│   ├── Dockerfile          # Agent container definition
+│   ├── requirements.txt    # Agent Python dependencies
+│   └── tests/              # Collector unit tests
+├── backend/                # FastAPI Master Backend & Celery Workers
+│   ├── api/v1/             # REST API routers (nodes, metrics, alerts, thresholds)
+│   ├── core/               # App configuration, database, Redis & authentication
+│   ├── models/             # SQLAlchemy ORM models (Nodes, Snapshots, Alerts)
+│   ├── services/           # Metric scrapers, threshold engine, investigations
+│   ├── workers/            # Celery background tasks (scrapes, pruning, health)
+│   ├── Dockerfile          # Production backend multi-stage Docker build
+│   └── pyproject.toml      # Backend dependencies & tools configuration
+├── frontend/               # React 18 / Vite Dashboard (:3000)
+│   ├── src/                # UI components, API client, hooks & state
+│   ├── package.json        # Frontend npm dependencies
+│   └── vite.config.js      # Vite build and proxy configuration
+├── scripts/                # Deployment and operations automation
+│   ├── Automatic-Master-Server-Setup.sh        # One-click Master server deployment
+│   ├── Automatic-Host-Setup.sh                 # One-click Target Host deployment
+│   └── Automatic-Build-And-Push-Docker-Image.sh # Automated Docker build & push
+├── sql/
+│   └── init.sql            # PostgreSQL schema, indexes & time partitions
+├── Caddyfile               # Production HTTPS reverse proxy configuration
+├── docker-compose.yml      # Master stack compose definition (Postgres, Redis, Backend, Workers)
+├── .env.example            # Environment variables configuration template
+└── USEFUL_INFO.md          # Comprehensive reference guide & operational handbook
+```
+
+---
+
+## 10. Building and Publishing Docker Images
+
+To build and push updated production images:
+
+```bash
+# Run the automated build & push script
+bash scripts/Automatic-Build-And-Push-Docker-Image.sh
+```
+
+---
+
+## 11. License
+
+Licensed under the MIT License. See [LICENSE](file:///home/ma542005/PALANTIR/LICENSE) for details.

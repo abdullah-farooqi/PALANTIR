@@ -1,11 +1,11 @@
-name: PALANTIR CI/CD Pipeline
+name: PALANTIR CI Pipeline
 
 on:
   push:
-    branches: [ "main", "initial_project" , "telemetry_pipeline" ]
+    branches: [ "main", "initial_project", "telemetry_pipeline", "telemetry_pipeline_with_frontend" ]
     tags: [ "v*" ]
   pull_request:
-    branches: [ "main", "initial_project" ,  "telemetry_pipeline" ]
+    branches: [ "main", "initial_project", "telemetry_pipeline", "telemetry_pipeline_with_frontend" ]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -13,7 +13,7 @@ concurrency:
 
 jobs:
   unit-tests:
-    name: Unit Tests (Python ${{ matrix.python-version }})
+    name: Backend Unit Tests (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -70,14 +70,60 @@ jobs:
         run: |
           pytest -v
 
+  agent-tests:
+    name: Host Collector Tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: agent/requirements.txt
+
+      - name: Install host collector and test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r agent/requirements.txt pytest
+
+      - name: Run host collector tests
+        run: pytest -q agent/tests
+
+  frontend-build:
+    name: Frontend Build & Verification
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Build production bundle
+        working-directory: frontend
+        run: npm run build
+
   docker-smoke-test:
     name: Docker Stack Build & Smoke Test
     runs-on: ubuntu-latest
-    needs: [unit-tests, agent-tests]
+    needs: [unit-tests, agent-tests, frontend-build]
     permissions:
       contents: read
-    # Disposable credentials for the throwaway Compose stack. These override
-    # the intentionally blank values in .env.example and are not production secrets.
+    # Disposable credentials for the throwaway Compose stack.
     env:
       POSTGRES_PASSWORD: ci-only-postgres-password-20261005
       PALANTIR_WEBHOOK_SECRET: ci-webhook-secret-0123456789abcdef0123456789abcdef
@@ -121,7 +167,6 @@ jobs:
 
       - name: Verify Webhook Authentication
         run: |
-          # Test invalid secret rejection (HTTP 403)
           STATUS_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://localhost:8000/internal/alert \
             -H "Content-Type: application/json" \
             -H "X-PALANTIR-Secret: invalid-key" \
@@ -136,16 +181,15 @@ jobs:
         run: |
           docker compose exec -T backend pytest tests/ -v
 
-      - name: Save smoke-tested images for publishing
-        if: github.event_name == 'push' && (github.ref == 'refs/heads/telemetry_pipeline' || startsWith(github.ref, 'refs/tags/v'))
+      - name: Save smoke-tested images for CD delivery
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/telemetry_pipeline' || github.ref == 'refs/heads/telemetry_pipeline_with_frontend' || github.ref == 'refs/heads/initial_project' || startsWith(github.ref, 'refs/tags/v'))
         run: |
           docker save --output palantir-images.tar \
             abdullahahmadfarooqi/palantir-backend:latest \
-            abdullahahmadfarooqi/palantir-netdata:latest \
             palantir-host-collector:latest
 
       - name: Upload smoke-tested images
-        if: github.event_name == 'push' && (github.ref == 'refs/heads/telemetry_pipeline' || startsWith(github.ref, 'refs/tags/v'))
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/telemetry_pipeline' || github.ref == 'refs/heads/telemetry_pipeline_with_frontend' || github.ref == 'refs/heads/initial_project' || startsWith(github.ref, 'refs/tags/v'))
         uses: actions/upload-artifact@v4
         with:
           name: palantir-images-${{ github.run_id }}-${{ github.run_attempt }}
@@ -161,102 +205,3 @@ jobs:
       - name: Clean Up Containers
         if: always()
         run: docker compose down -v
-
-  agent-tests:
-    name: Host Collector Tests
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Python 3.12
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-          cache: "pip"
-          cache-dependency-path: agent/requirements.txt
-
-      - name: Install host collector and test dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r agent/requirements.txt pytest
-
-      - name: Run host collector tests
-        run: pytest -q agent/tests
-
-  publish-images:
-    name: Publish smoke-tested images
-    runs-on: ubuntu-latest
-    needs: docker-smoke-test
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/telemetry_pipeline' || startsWith(github.ref, 'refs/tags/v'))
-    permissions:
-      contents: read
-      packages: write
-
-    steps:
-      - name: Download smoke-tested images
-        uses: actions/download-artifact@v4
-        with:
-          name: palantir-images-${{ github.run_id }}-${{ github.run_attempt }}
-
-      - name: Load smoke-tested images
-        run: docker load --input palantir-images.tar
-
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: abdullahahmadfarooqi
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Tag and publish smoke-tested images
-        env:
-          PUSH_REF: ${{ github.ref }}
-          COMMIT_SHA: ${{ github.sha }}
-        run: |
-          set -euo pipefail
-          if [[ "$PUSH_REF" == "refs/heads/telemetry_pipeline" ]]; then
-            suffixes=(latest telemetry_pipeline "sha-${COMMIT_SHA}")
-          elif [[ "$PUSH_REF" == refs/tags/v* ]]; then
-            version="${PUSH_REF#refs/tags/v}"
-            [[ "$version" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]] || {
-              echo "Release tag has an invalid Docker tag suffix." >&2
-              exit 1
-            }
-            suffixes=(latest "$version" "sha-${COMMIT_SHA}")
-          else
-            echo "Unsupported image publish ref: ${PUSH_REF}" >&2
-            exit 1
-          fi
-
-          for image in backend netdata collector; do
-            case "$image" in
-              backend)
-                docker_name=palantir-backend
-                source_image=abdullahahmadfarooqi/palantir-backend:latest
-                ;;
-              netdata)
-                docker_name=palantir-netdata
-                source_image=abdullahahmadfarooqi/palantir-netdata:latest
-                ;;
-              collector)
-                docker_name=palantir-host-collector
-                source_image=palantir-host-collector:latest
-                ;;
-            esac
-            for suffix in "${suffixes[@]}"; do
-              for target_image in "abdullahahmadfarooqi/${docker_name}" "ghcr.io/abdullah-farooqi/${docker_name}"; do
-                docker tag "$source_image" "${target_image}:${suffix}"
-                docker push "${target_image}:${suffix}"
-              done
-            done
-          done

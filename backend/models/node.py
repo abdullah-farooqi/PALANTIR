@@ -9,8 +9,8 @@ class MonitoredNode(Base):
     __tablename__ = "monitored_nodes"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    hostname = Column(String, nullable=False, unique=True)
-    netdata_url = Column(String, nullable=False)
+    machine_id = Column(String, nullable=True, unique=True, index=True)
+    hostname = Column(String, nullable=False, index=True)
     collector_url = Column(String, nullable=True)
     capabilities = Column(JSONB, nullable=True)
     os_type = Column(String, nullable=False, default="linux")

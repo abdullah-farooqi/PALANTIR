@@ -121,15 +121,16 @@ class Settings(BaseSettings):
     MIN_CONTEXTS_ANOMALOUS: int = Field(default=2, ge=1)
     COOLDOWN_MINUTES: int = Field(default=10, ge=0)
 
-    # Netdata default client timeout
-    NETDATA_TIMEOUT_SECONDS: float = Field(default=5.0, gt=0, le=120)
+    # Optional: register the host collector running next to the central stack at startup
+    LOCAL_COLLECTOR_URL: str = Field(default="", description="e.g. http://host.docker.internal:20000")
+    LOCAL_NODE_HOSTNAME: str = Field(default="local-node")
     AGENT_AUTH_TOKEN: str = Field(
         default="",
         description="Optional shared token sent to PALANTIR host collector endpoints",
     )
     METRICS_RETENTION_HOURS: int = Field(default=24, ge=1)
     LOG_RETENTION_DAYS: int = Field(default=7, ge=1)
-    NODE_REACHABLE_SECONDS: int = Field(default=180, ge=60)
+    NODE_REACHABLE_SECONDS: int = Field(default=180, ge=30)
     NODE_STALE_SECONDS: int = Field(default=900, ge=60)
     METRIC_STALE_SECONDS: int = Field(default=180, ge=60)
     WORKER_HEARTBEAT_STALE_SECONDS: int = Field(default=180, ge=60)

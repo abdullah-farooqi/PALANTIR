@@ -7,14 +7,14 @@ from sqlalchemy import and_, exists, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from core.database import get_session
 from core.api_auth import require_admin, require_node_enrollment, require_read
-from core.security import validate_netdata_url
+from core.security import validate_collector_url
 from models.node import MonitoredNode
 from models.category_status import CategoryCollectionStatus
-from services.nodes import NodeService
+from integrations.agent.client import AgentCollectorClient
+from services.nodes import CollectorUnavailable, NodeService
 from services.collection_status import summarize_category_statuses
 from core.config import settings
 from core.cursors import decode_cursor, encode_cursor
-from integrations.netdata.exceptions import NetdataUnavailable
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/nodes", tags=["Nodes"])
@@ -28,43 +28,26 @@ class NodeRegisterRequest(BaseModel):
         pattern=r"^[a-zA-Z0-9_\.\-]+$",
         description="Node hostname",
     )
-    netdata_url: str = Field(
+    collector_url: str = Field(
         ...,
         min_length=7,
         max_length=2048,
-        description="Base URL of the Netdata agent",
-    )
-    collector_url: Optional[str] = Field(
-        default=None,
-        min_length=7,
-        max_length=2048,
-        description="Optional base URL of the PALANTIR Linux host collector",
+        description="Base URL of the PALANTIR Linux host collector",
     )
     os_type: str = Field(
         default="linux",
         min_length=1,
-        max_length=16,
-        pattern=r"^(linux|windows)$",
-        description="Operating system type",
+        max_length=64,
+        description="Operating system type or distro name",
     )
 
-    model_config = {"extra": "forbid"}
-
-    @field_validator("netdata_url")
-    @classmethod
-    def validate_url(cls, v: str) -> str:
-        try:
-            return validate_netdata_url(v)
-        except ValueError as err:
-            raise ValueError(f"Invalid netdata_url: {err}")
+    model_config = {"extra": "ignore"}
 
     @field_validator("collector_url")
     @classmethod
-    def validate_collector_url(cls, v: Optional[str]) -> Optional[str]:
-        if v is None:
-            return None
+    def validate_collector_url(cls, v: str) -> str:
         try:
-            return validate_netdata_url(v)
+            return validate_collector_url(v)
         except ValueError as err:
             raise ValueError(f"Invalid collector_url: {err}")
 
@@ -76,8 +59,8 @@ class NodeRegisterRequest(BaseModel):
 
 class NodeResponse(BaseModel):
     id: int
+    machine_id: Optional[str] = None
     hostname: str
-    netdata_url: str
     collector_url: Optional[str] = None
     capabilities: Optional[dict] = None
     os_type: str
@@ -86,6 +69,8 @@ class NodeResponse(BaseModel):
     alert_count: Optional[int] = None
     last_seen_at: datetime
     last_collection_at: Optional[datetime] = None
+
+    active_alerts_count: int = 0
 
     @computed_field
     @property
@@ -134,7 +119,7 @@ async def search_monitored_nodes(
         default=None,
         pattern="^(available|not_configured|unsupported|stale|collection_error|unknown)$",
     ),
-    source: Optional[str] = Query(default=None, pattern="^(netdata|palantir-agent)$"),
+    source: Optional[str] = Query(default=None, pattern="^(palantir-agent)$"),
     limit: int = Query(default=100, ge=1, le=500),
     cursor: Optional[str] = None,
     session: AsyncSession = Depends(get_session),
@@ -209,9 +194,9 @@ async def search_monitored_nodes(
                 CategoryCollectionStatus.source == source,
                 CategoryCollectionStatus.status == "unknown",
             ))
-            source_expected = (
-                source == "netdata" and category in {"system", "network", "processes", "containers"}
-            ) or (source == "palantir-agent" and MonitoredNode.collector_url.is_not(None))
+            source_expected = and_(
+                source == "palantir-agent", MonitoredNode.collector_url.is_not(None)
+            ) if source == "palantir-agent" else False
             missing_status = exists(select(1).where(
                 CategoryCollectionStatus.node_id == MonitoredNode.id,
                 CategoryCollectionStatus.category == category,
@@ -265,7 +250,6 @@ async def register_monitored_node(
         if existing:
             if (
                 existing.active
-                and existing.netdata_url == req.netdata_url
                 and existing.collector_url == req.collector_url
                 and existing.os_type == req.os_type
             ):
@@ -278,7 +262,6 @@ async def register_monitored_node(
     try:
         node = await NodeService.register_node(
             hostname=req.hostname,
-            netdata_url=req.netdata_url,
             os_type=req.os_type,
             session=session,
             collector_url=req.collector_url,
@@ -289,11 +272,11 @@ async def register_monitored_node(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(e),
         )
-    except NetdataUnavailable as e:
-        logger.warning(f"Netdata Agent unreachable during registration of {req.hostname}: {e}")
+    except CollectorUnavailable as e:
+        logger.warning(f"Host collector unreachable during registration of {req.hostname}: {e}")
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="Netdata Agent unreachable or returned an invalid response",
+            detail="Host collector unreachable or returned an invalid response",
         )
     except Exception as e:
         logger.exception(f"Unexpected failure registering node {req.hostname}")
@@ -366,3 +349,171 @@ async def deactivate_monitored_node(
     success = await NodeService.deactivate_node(node_id, session)
     if not success:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Node not found")
+
+
+@router.post("/{node_id}/processes/{pid}/kill")
+async def kill_node_process(
+    node_id: int = Path(..., ge=1, description="Monitored node ID"),
+    pid: int = Path(..., ge=2, description="Target process ID to terminate"),
+    signal_type: str = Query(default="SIGTERM", pattern="^(SIGTERM|SIGKILL|15|9)$"),
+    session: AsyncSession = Depends(get_session),
+    _role: None = Depends(require_admin),
+):
+    node = await NodeService.get_node(node_id, session)
+    if not node:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Node not found")
+    if not node.collector_url:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Node does not have an active collector")
+    collector = AgentCollectorClient(node.collector_url)
+    try:
+        res = await collector.kill_process(pid, signal_type=signal_type)
+        return res
+    except Exception as exc:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Failed to terminate process: {exc}")
+
+
+@router.post("/{node_id}/containers/{container_id}/stop")
+async def stop_node_container(
+    node_id: int = Path(..., ge=1, description="Monitored node ID"),
+    container_id: str = Path(..., min_length=1, max_length=128, description="Container ID or name"),
+    timeout_seconds: int = Query(default=10, ge=0, le=60),
+    session: AsyncSession = Depends(get_session),
+    _role: None = Depends(require_admin),
+):
+    node = await NodeService.get_node(node_id, session)
+    if not node:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Node not found")
+    if not node.collector_url:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Node does not have an active collector")
+    collector = AgentCollectorClient(node.collector_url)
+    try:
+        res = await collector.stop_container(container_id, timeout_seconds=timeout_seconds)
+        return res
+    except Exception as exc:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Failed to stop container: {exc}")
+
+
+@router.post("/{node_id}/vms/{vm_id}/stop")
+async def stop_node_vm(
+    node_id: int = Path(..., ge=1, description="Monitored node ID"),
+    vm_id: str = Path(..., min_length=1, max_length=128, description="VM ID or name"),
+    force: bool = Query(default=False),
+    session: AsyncSession = Depends(get_session),
+    _role: None = Depends(require_admin),
+):
+    node = await NodeService.get_node(node_id, session)
+    if not node:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Node not found")
+    if not node.collector_url:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Node does not have an active collector")
+    collector = AgentCollectorClient(node.collector_url)
+    try:
+        res = await collector.stop_vm(vm_id, force=force)
+        return res
+    except Exception as exc:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Failed to stop VM: {exc}")
+
+
+@router.post("/{node_id}/containers/{container_id}/start")
+async def start_node_container(
+    node_id: int = Path(..., ge=1, description="Monitored node ID"),
+    container_id: str = Path(..., min_length=1, max_length=128, description="Container ID or name"),
+    session: AsyncSession = Depends(get_session),
+    _role: None = Depends(require_admin),
+):
+    node = await NodeService.get_node(node_id, session)
+    if not node:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Node not found")
+    if not node.collector_url:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Node does not have an active collector")
+    collector = AgentCollectorClient(node.collector_url)
+    try:
+        res = await collector.start_container(container_id)
+        return res
+    except Exception as exc:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Failed to start container: {exc}")
+
+
+@router.post("/{node_id}/containers/{container_id}/restart")
+async def restart_node_container(
+    node_id: int = Path(..., ge=1, description="Monitored node ID"),
+    container_id: str = Path(..., min_length=1, max_length=128, description="Container ID or name"),
+    timeout_seconds: int = Query(default=10, ge=0, le=60),
+    session: AsyncSession = Depends(get_session),
+    _role: None = Depends(require_admin),
+):
+    node = await NodeService.get_node(node_id, session)
+    if not node:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Node not found")
+    if not node.collector_url:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Node does not have an active collector")
+    collector = AgentCollectorClient(node.collector_url)
+    try:
+        res = await collector.restart_container(container_id, timeout_seconds=timeout_seconds)
+        return res
+    except Exception as exc:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Failed to restart container: {exc}")
+
+
+@router.get("/{node_id}/containers/{container_id}/logs")
+async def get_node_container_logs(
+    node_id: int = Path(..., ge=1, description="Monitored node ID"),
+    container_id: str = Path(..., min_length=1, max_length=128, description="Container ID or name"),
+    tail: int = Query(default=200, ge=1, le=5000),
+    session: AsyncSession = Depends(get_session),
+    _role: None = Depends(require_admin),
+):
+    node = await NodeService.get_node(node_id, session)
+    if not node:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Node not found")
+    if not node.collector_url:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Node does not have an active collector")
+    collector = AgentCollectorClient(node.collector_url)
+    try:
+        res = await collector.get_container_logs(container_id, tail=tail)
+        return res
+    except Exception as exc:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Failed to fetch container logs: {exc}")
+
+
+@router.post("/{node_id}/vms/{vm_id}/start")
+async def start_node_vm(
+    node_id: int = Path(..., ge=1, description="Monitored node ID"),
+    vm_id: str = Path(..., min_length=1, max_length=128, description="VM ID or name"),
+    session: AsyncSession = Depends(get_session),
+    _role: None = Depends(require_admin),
+):
+    node = await NodeService.get_node(node_id, session)
+    if not node:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Node not found")
+    if not node.collector_url:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Node does not have an active collector")
+    collector = AgentCollectorClient(node.collector_url)
+    try:
+        res = await collector.start_vm(vm_id)
+        return res
+    except Exception as exc:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Failed to start VM: {exc}")
+
+
+@router.post("/{node_id}/vms/{vm_id}/restart")
+async def restart_node_vm(
+    node_id: int = Path(..., ge=1, description="Monitored node ID"),
+    vm_id: str = Path(..., min_length=1, max_length=128, description="VM ID or name"),
+    force: bool = Query(default=False),
+    session: AsyncSession = Depends(get_session),
+    _role: None = Depends(require_admin),
+):
+    node = await NodeService.get_node(node_id, session)
+    if not node:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Node not found")
+    if not node.collector_url:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Node does not have an active collector")
+    collector = AgentCollectorClient(node.collector_url)
+    try:
+        res = await collector.restart_vm(vm_id, force=force)
+        return res
+    except Exception as exc:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Failed to restart VM: {exc}")
+
+

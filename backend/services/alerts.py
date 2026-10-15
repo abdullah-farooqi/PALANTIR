@@ -9,7 +9,7 @@ logger = logging.getLogger(__name__)
 
 class AlertService:
     """
-    Push flow — receives and persists Netdata alert transitions.
+    Push flow — receives and persists alert transitions.
     """
 
     async def receive_and_classify(self, payload, session):

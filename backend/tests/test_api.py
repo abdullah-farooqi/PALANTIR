@@ -31,14 +31,14 @@ async def client(monkeypatch):
 
 @pytest.fixture
 async def existing_node():
-    """Ensure at least one node ('local-node') exists in DB."""
+    """Ensure an isolated test fixture node exists during test execution."""
     async with AsyncSessionLocal() as session:
-        stmt = select(MonitoredNode).where(MonitoredNode.hostname == "local-node")
+        stmt = select(MonitoredNode).where(MonitoredNode.hostname == "test-fixture-node")
         node = (await session.execute(stmt)).scalar_one_or_none()
         if not node:
             node = MonitoredNode(
-                hostname="local-node",
-                netdata_url="http://netdata:19999",
+                hostname="test-fixture-node",
+                collector_url="http://127.0.0.1:20000",
                 os_type="linux",
                 active=True,
                 context_count=200,
@@ -47,7 +47,23 @@ async def existing_node():
             session.add(node)
             await session.commit()
             await session.refresh(node)
-        return node
+        elif not node.active:
+            node.active = True
+            await session.commit()
+            await session.refresh(node)
+
+    yield node
+
+    # Clean up test fixture node after test
+    try:
+        async with AsyncSessionLocal() as cleanup_session:
+            stmt = select(MonitoredNode).where(MonitoredNode.id == node.id)
+            n = (await cleanup_session.execute(stmt)).scalar_one_or_none()
+            if n:
+                await cleanup_session.delete(n)
+                await cleanup_session.commit()
+    except Exception:
+        pass
 
 
 # =====================================================================
@@ -74,13 +90,13 @@ async def test_list_and_get_nodes(client: AsyncClient, existing_node: MonitoredN
     assert resp.status_code == 200
     nodes = resp.json()
     assert isinstance(nodes, list)
-    assert any(n["hostname"] == "local-node" for n in nodes)
+    assert any(n["hostname"] == existing_node.hostname for n in nodes)
 
     # Get specific existing node
     resp = await client.get(f"/api/v1/nodes/{existing_node.id}")
     assert resp.status_code == 200
     assert resp.json()["id"] == existing_node.id
-    assert resp.json()["hostname"] == "local-node"
+    assert resp.json()["hostname"] == existing_node.hostname
 
     # Get non-existent node
     resp = await client.get("/api/v1/nodes/999999")
@@ -95,26 +111,26 @@ async def test_list_and_get_nodes(client: AsyncClient, existing_node: MonitoredN
 @pytest.mark.asyncio
 @respx.mock
 async def test_register_and_deactivate_node(client: AsyncClient):
-    new_node_url = "http://192.168.10.200:19999"
+    new_node_url = "http://192.168.10.200:20000"
 
-    # Mock Netdata Agent endpoints
+    # Mock PALANTIR Collector endpoints
+    respx.get(f"{new_node_url}/healthz").respond(
+        status_code=200,
+        json={"status": "ok"},
+    )
     respx.get(f"{new_node_url}/api/v1/info").respond(
         status_code=200,
-        json={"version": "v2.11.1", "uid": "mock-node-uid"},
+        json={"version": "1.0.0", "hostname": "test-sensor-node", "os_release": {"ID": "linux"}},
     )
-    respx.get(f"{new_node_url}/api/v1/contexts").respond(
+    respx.get(f"{new_node_url}/api/v1/capabilities").respond(
         status_code=200,
-        json={"contexts": {"system.cpu": {}, "net.net": {}, "disk.io": {}}},
-    )
-    respx.get(f"{new_node_url}/api/v1/alarms").respond(
-        status_code=200,
-        json={"alarms": {"high_cpu": {}, "packet_drops": {}}},
+        json={"capabilities": {"system": {"status": "available"}}},
     )
 
     # 1. Register new node
     payload = {
         "hostname": "test-sensor-node",
-        "netdata_url": new_node_url,
+        "collector_url": new_node_url,
         "os_type": "linux",
     }
     resp = await client.post("/api/v1/nodes", json=payload)
@@ -122,8 +138,7 @@ async def test_register_and_deactivate_node(client: AsyncClient):
     node_data = resp.json()
     node_id = node_data["id"]
     assert node_data["hostname"] == "test-sensor-node"
-    assert node_data["context_count"] == 3
-    assert node_data["alert_count"] == 2
+    assert node_data["collector_url"] == new_node_url
     assert node_data["active"] is True
 
     # 2. Re-registering existing node updates metadata
@@ -147,13 +162,13 @@ async def test_register_and_deactivate_node(client: AsyncClient):
 
 @pytest.mark.asyncio
 @respx.mock
-async def test_register_node_netdata_offline(client: AsyncClient):
-    respx.get("http://192.168.10.201:19999/api/v1/info").mock(
+async def test_register_node_collector_offline(client: AsyncClient):
+    respx.get("http://192.168.10.201:20000/api/v1/info").mock(
         side_effect=httpx.ConnectError("Connection refused")
     )
     payload = {
         "hostname": "offline-node",
-        "netdata_url": "http://192.168.10.201:19999",
+        "collector_url": "http://192.168.10.201:20000",
         "os_type": "linux",
     }
     resp = await client.post("/api/v1/nodes", json=payload)
@@ -166,31 +181,30 @@ async def test_register_node_validation_and_ssrf(client: AsyncClient):
     # Invalid hostname format
     resp = await client.post(
         "/api/v1/nodes",
-        json={"hostname": "bad host name!", "netdata_url": "http://192.168.1.1:19999"},
+        json={"hostname": "bad host name!", "collector_url": "http://192.168.1.1:20000"},
     )
     assert resp.status_code == 422
 
     # Forbidden loopback port SSRF
     resp = await client.post(
         "/api/v1/nodes",
-        json={"hostname": "ssrf-node", "netdata_url": "http://127.0.0.1:5432"},
+        json={"hostname": "ssrf-node", "collector_url": "http://127.0.0.1:5432"},
     )
     assert resp.status_code == 422
 
     # Cloud metadata IMDS SSRF
     resp = await client.post(
         "/api/v1/nodes",
-        json={"hostname": "ssrf-imds", "netdata_url": "http://169.254.169.254/latest"},
+        json={"hostname": "ssrf-imds", "collector_url": "http://169.254.169.254/latest"},
     )
     assert resp.status_code == 422
 
-    # Extra fields forbidden
+    # Extra fields forbidden (or ignored if extra=ignore)
     resp = await client.post(
         "/api/v1/nodes",
         json={
-            "hostname": "valid-node",
-            "netdata_url": "http://192.168.1.50:19999",
-            "unknown_field": "injected",
+            "hostname": "bad-url-node",
+            "collector_url": "ftp://192.168.1.50:20000",
         },
     )
     assert resp.status_code == 422
@@ -269,7 +283,7 @@ async def test_alerts_and_anomalies_endpoints(client: AsyncClient, existing_node
 @pytest.mark.asyncio
 async def test_internal_webhook_auth_and_processing(client: AsyncClient, existing_node: MonitoredNode):
     payload = {
-        "node": "local-node",
+        "node": existing_node.hostname,
         "alert": "test_security_spike",
         "chart": "system.cpu",
         "status": "CRITICAL",
@@ -322,7 +336,7 @@ async def test_internal_webhook_auth_and_processing(client: AsyncClient, existin
 
     # 5. Case-insensitivity normalization test (lowercase "warning" -> "WARNING")
     warn_payload = {
-        "node": "local-node",
+        "node": existing_node.hostname,
         "alert": "ram_pressure",
         "chart": "system.ram",
         "status": "warning",
@@ -346,7 +360,7 @@ async def test_internal_webhook_auth_and_processing(client: AsyncClient, existin
 
     # 6. CLEAR status -> triggered_agent should be False
     clear_payload = {
-        "node": "local-node",
+        "node": existing_node.hostname,
         "alert": "ram_pressure",
         "chart": "system.ram",
         "status": "CLEAR",

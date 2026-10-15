@@ -5,12 +5,11 @@
 -- Node registry
 CREATE TABLE IF NOT EXISTS monitored_nodes (
     id              SERIAL PRIMARY KEY,
-    hostname        TEXT        NOT NULL UNIQUE,
-    netdata_url     TEXT        NOT NULL,       -- http://<ip>:19999
-    collector_url   TEXT,                       -- optional PALANTIR host collector endpoint
+    machine_id      TEXT,
+    hostname        TEXT        NOT NULL,
+    collector_url   TEXT        NOT NULL,
     capabilities    JSONB,
-    os_type         TEXT        NOT NULL DEFAULT 'linux'
-                                CHECK (os_type IN ('linux', 'windows')),
+    os_type         TEXT        NOT NULL DEFAULT 'linux',
     active          BOOLEAN     NOT NULL DEFAULT TRUE,
     context_count   INT,                        -- set on registration
     alert_count     INT,                        -- set on registration
@@ -46,9 +45,12 @@ ALTER TABLE metric_snapshots ADD COLUMN IF NOT EXISTS ram_total_mb FLOAT;
 ALTER TABLE metric_snapshots ADD COLUMN IF NOT EXISTS load_avg FLOAT;
 ALTER TABLE metric_snapshots ADD COLUMN IF NOT EXISTS swap_used_mb FLOAT;
 ALTER TABLE metric_snapshots ADD COLUMN IF NOT EXISTS top_processes JSONB;
+ALTER TABLE monitored_nodes ADD COLUMN IF NOT EXISTS machine_id TEXT;
 ALTER TABLE monitored_nodes ADD COLUMN IF NOT EXISTS collector_url TEXT;
 ALTER TABLE monitored_nodes ADD COLUMN IF NOT EXISTS capabilities JSONB;
 ALTER TABLE monitored_nodes ADD COLUMN IF NOT EXISTS last_collection_at TIMESTAMPTZ;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_monitored_nodes_machine_id ON monitored_nodes(machine_id) WHERE machine_id IS NOT NULL;
+ALTER TABLE monitored_nodes DROP CONSTRAINT IF EXISTS monitored_nodes_hostname_key;
 
 -- Per-source collection attempts let the API distinguish missing, stale, and failed data.
 CREATE TABLE IF NOT EXISTS node_category_collection_status (
@@ -56,7 +58,7 @@ CREATE TABLE IF NOT EXISTS node_category_collection_status (
     category         VARCHAR(32) NOT NULL
                      CHECK (category IN ('system','storage','network','services','processes','connections','containers','vms')),
     source           VARCHAR(32) NOT NULL
-                     CHECK (source IN ('netdata','palantir-agent')),
+                     CHECK (source IN ('palantir-agent')),
     status           VARCHAR(32) NOT NULL
                      CHECK (status IN ('unknown','available','not_configured','unsupported','collection_error')),
     last_attempt_at  TIMESTAMPTZ,
@@ -92,12 +94,11 @@ INSERT INTO node_category_collection_status (
 )
 SELECT DISTINCT ON (
     node_id,
-    category,
-    CASE WHEN data->>'source' = 'palantir-agent' THEN 'palantir-agent' ELSE 'netdata' END
+    category
 )
     node_id,
     category,
-    CASE WHEN data->>'source' = 'palantir-agent' THEN 'palantir-agent' ELSE 'netdata' END,
+    'palantir-agent',
     'available',
     collected_at,
     collected_at
@@ -105,7 +106,6 @@ FROM metric_snapshots
 ORDER BY
     node_id,
     category,
-    CASE WHEN data->>'source' = 'palantir-agent' THEN 'palantir-agent' ELSE 'netdata' END,
     collected_at DESC,
     id DESC
 ON CONFLICT (node_id, category, source) DO NOTHING;
@@ -155,7 +155,7 @@ CREATE TABLE IF NOT EXISTS anomaly_events (
     investigation_id    INT         -- set after agent completes
 );
 
--- Alert events — from Netdata push webhook
+-- Alert events
 CREATE TABLE IF NOT EXISTS alert_events (
     id                  BIGSERIAL   PRIMARY KEY,
     node_id             INT         NOT NULL REFERENCES monitored_nodes(id) ON DELETE CASCADE,
@@ -270,7 +270,7 @@ CREATE INDEX IF NOT EXISTS idx_snapshots_top_processes_gin
     WHERE top_processes IS NOT NULL;
 
 CREATE INDEX IF NOT EXISTS idx_snapshots_source_category_time
-    ON metric_snapshots ((COALESCE(data->>'source', 'netdata')), category, collected_at DESC);
+    ON metric_snapshots ((COALESCE(data->>'source', 'palantir-agent')), category, collected_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_collection_status_node_category
     ON node_category_collection_status (node_id, category, source);
@@ -350,8 +350,26 @@ CREATE INDEX IF NOT EXISTS idx_investigations_status
     WHERE status = 'running';
 
 -- ─────────────────────────────────────────────────────────────────────
--- Default Seed: Local Netdata Sensor Node (Auto-Registered)
+-- Monitored Nodes: dynamically enrolled via Automatic-Host-Setup.sh or UI
 -- ─────────────────────────────────────────────────────────────────────
-INSERT INTO monitored_nodes (hostname, netdata_url, os_type, active)
-VALUES ('local-node', 'http://netdata:19999', 'linux', TRUE)
-ON CONFLICT (hostname) DO NOTHING;
+
+-- Dynamic threshold settings for collector native alert evaluation
+CREATE TABLE IF NOT EXISTS system_alert_thresholds (
+    id VARCHAR(64) PRIMARY KEY,
+    name VARCHAR(128) NOT NULL,
+    chart VARCHAR(64) NOT NULL,
+    metric_key VARCHAR(64) NOT NULL,
+    units VARCHAR(32) NOT NULL,
+    warning_val FLOAT NOT NULL,
+    critical_val FLOAT NOT NULL,
+    description TEXT,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+INSERT INTO system_alert_thresholds (id, name, chart, metric_key, units, warning_val, critical_val, description)
+VALUES 
+  ('cpu', 'high_cpu_utilization', 'system.cpu', 'cpu_pct', '%', 5.0, 80.0, 'Host CPU utilization threshold'),
+  ('ram', 'ram_in_use', 'system.ram', 'ram_pct', '%', 50.0, 85.0, 'Host memory utilization threshold'),
+  ('disk', 'root_disk_space', 'system.disk', 'root_used_pct', '%', 80.0, 90.0, 'Root disk partition used percentage')
+ON CONFLICT (id) DO NOTHING;
+

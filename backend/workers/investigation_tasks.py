@@ -29,7 +29,7 @@ def _set_progress(session, investigation_id: int, progress: int) -> AgentInvesti
 
 def _evidence(session, investigation: AgentInvestigation, node: MonitoredNode, now: datetime) -> dict:
     since = now - timedelta(hours=min(settings.METRICS_RETENTION_HOURS, 24))
-    source = func.coalesce(MetricSnapshot.data["source"].as_string(), "netdata")
+    source = func.coalesce(MetricSnapshot.data["source"].as_string(), "palantir-agent")
     metric_rows = session.execute(
         select(
             MetricSnapshot.category,
@@ -40,8 +40,13 @@ def _evidence(session, investigation: AgentInvestigation, node: MonitoredNode, n
             MetricSnapshot.ram_total_mb,
             MetricSnapshot.load_avg,
             MetricSnapshot.swap_used_mb,
+            MetricSnapshot.data,
         )
-        .where(MetricSnapshot.node_id == node.id, MetricSnapshot.collected_at >= since)
+        .where(
+            MetricSnapshot.node_id == node.id,
+            MetricSnapshot.collected_at >= since,
+            MetricSnapshot.data["sample"].as_string().is_(None),  # ignore per-second CPU sample rows
+        )
         .order_by(MetricSnapshot.collected_at.desc(), MetricSnapshot.id.desc())
         .limit(200)
     ).all()
@@ -50,11 +55,67 @@ def _evidence(session, investigation: AgentInvestigation, node: MonitoredNode, n
         key = (row.category, row.source)
         if key in newest_metrics:
             continue
-        values = {
-            name: getattr(row, name)
-            for name in ("cpu_pct", "ram_used_mb", "ram_total_mb", "load_avg", "swap_used_mb")
-            if getattr(row, name) is not None
-        }
+        values = {}
+        if row.category == "system":
+            values = {
+                name: getattr(row, name)
+                for name in ("cpu_pct", "ram_used_mb", "ram_total_mb", "load_avg", "swap_used_mb")
+                if getattr(row, name) is not None
+            }
+        else:
+            raw_inner = (row.data or {}).get("data") if isinstance(row.data, dict) else {}
+            if isinstance(raw_inner, dict):
+                if row.category == "storage":
+                    fs_list = raw_inner.get("filesystems") or []
+                    io_list = raw_inner.get("disk_io") or []
+                    values = {
+                        "filesystems": len(fs_list),
+                        "disk_devices": len(io_list),
+                    }
+                    if fs_list:
+                        root_fs = next((f for f in fs_list if f.get("mountpoint") == "/"), fs_list[0])
+                        if root_fs.get("percent") is not None:
+                            values["root_used_pct"] = round(float(root_fs["percent"]), 1)
+                elif row.category == "processes":
+                    values = {
+                        "process_count": raw_inner.get("process_count") or len(raw_inner.get("top_by_rss") or []),
+                    }
+                    oom = raw_inner.get("oom_counters")
+                    if isinstance(oom, dict):
+                        values["oom_kills"] = sum(v for v in oom.values() if isinstance(v, (int, float)))
+                elif row.category == "connections":
+                    values = {
+                        "sockets_count": raw_inner.get("count") or len(raw_inner.get("sockets") or []),
+                    }
+                elif row.category == "containers":
+                    containers = raw_inner.get("containers") or []
+                    running = sum(1 for c in containers if (c.get("state") or c.get("status") or "").lower() in ("running", "up"))
+                    values = {
+                        "containers_total": len(containers),
+                        "containers_running": running,
+                    }
+                elif row.category == "vms":
+                    vms = raw_inner.get("vms") or []
+                    running_vms = sum(1 for v in vms if (v.get("state") or "").lower() == "running")
+                    values = {
+                        "vms_total": len(vms),
+                        "vms_running": running_vms,
+                    }
+                elif row.category == "services":
+                    services = raw_inner.get("services") or []
+                    active_svc = sum(1 for s in services if s.get("active") == "active")
+                    failed_svc = sum(1 for s in services if s.get("active") == "failed")
+                    values = {
+                        "services_total": len(services),
+                        "active": active_svc,
+                        "failed": failed_svc,
+                    }
+                elif row.category == "network":
+                    ifaces = raw_inner.get("interfaces") or {}
+                    values = {
+                        "interfaces_count": len(ifaces) if isinstance(ifaces, dict) else 0,
+                    }
+
         newest_metrics[key] = {
             "category": row.category,
             "source": row.source,
