@@ -39,6 +39,110 @@ safe_prompt() {
   eval "$var_target=\"\$val\""
 }
 
+# VirtualBox keeps its registered VM list in the user's home directory. When
+# this script is started with sudo, use the invoking desktop user's registry
+# instead of root's empty or unrelated VirtualBox registry.
+vboxmanage() {
+  if [ "$EUID" -eq 0 ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+    sudo -H -u "$SUDO_USER" -- "$VBOXMANAGE_BIN" "$@"
+  else
+    "$VBOXMANAGE_BIN" "$@"
+  fi
+}
+
+validate_vbox_vm() {
+  local vm_name="$1"
+
+  if [ -z "$vm_name" ]; then
+    echo -e "${RED}ERROR: VM name cannot be empty.${NC}"
+    exit 1
+  fi
+
+  if ! vboxmanage showvminfo "$vm_name" --machinereadable >/dev/null 2>&1; then
+    echo -e "${RED}ERROR: VirtualBox cannot find the registered VM '${vm_name}'.${NC}"
+    echo -e "Use one of the exact names or UUIDs listed below:${NC}"
+    vboxmanage list vms || true
+    exit 1
+  fi
+}
+
+vbox_vm_is_running() {
+  vboxmanage showvminfo "$1" --machinereadable 2>/dev/null | grep -Fxq 'VMState="running"'
+}
+
+auto_configure_virtualbox() {
+  if ! command -v VBoxManage &>/dev/null; then
+    echo -e "${RED}ERROR: VBoxManage was not found. Automatic setup requires VirtualBox on this machine.${NC}"
+    echo -e "For another hypervisor, run this script with ${CYAN}--manual${NC}."
+    return 1
+  fi
+
+  VBOXMANAGE_BIN="$(command -v VBoxManage)"
+  local vm_name="${PALANTIR_VM_NAME:-PALANTIR-Debian}"
+  # The main machine's own collector listens on 20000, so NAT guests use 20001.
+  local host_port="${PALANTIR_HOST_PORT:-20001}"
+  local guest_port="${PALANTIR_GUEST_PORT:-20000}"
+
+  if ! [[ "$host_port" =~ ^[0-9]{1,5}$ ]] || ! [[ "$guest_port" =~ ^[0-9]{1,5}$ ]] ||
+    (( 10#$host_port < 1 || 10#$host_port > 65535 || 10#$guest_port < 1 || 10#$guest_port > 65535 )); then
+    echo -e "${RED}ERROR: Host and guest ports must be between 1 and 65535.${NC}"
+    return 1
+  fi
+
+  local vm_info
+  if ! vm_info="$(vboxmanage showvminfo "$vm_name" --machinereadable 2>/dev/null)"; then
+    echo -e "${RED}ERROR: VirtualBox could not find '${vm_name}' in the invoking user's VM registry.${NC}"
+    echo -e "Registered VirtualBox VMs:"
+    vboxmanage list vms || true
+    echo -e "Set PALANTIR_VM_NAME to the registered VM name to change the automatic target."
+    return 1
+  fi
+
+  local nat_index
+  nat_index="$(printf '%s\n' "$vm_info" | awk -F= '$1 ~ /^nic[1-8]$/ && $2 == "\"nat\"" {sub(/^nic/, "", $1); print $1; exit}')"
+  if [ -z "$nat_index" ]; then
+    echo -e "${RED}ERROR: '${vm_name}' has no NAT network adapter; no changes were made.${NC}"
+    echo -e "Automatic port forwarding requires a VirtualBox NAT adapter."
+    return 1
+  fi
+
+  local vm_state
+  vm_state="$(printf '%s\n' "$vm_info" | awk -F= '$1 == "VMState" {gsub(/"/, "", $2); print $2; exit}')"
+
+  local host_lan_ip
+  host_lan_ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<NF;i++)if($i=="src"){print $(i+1);exit}}')"
+  if [ -z "$host_lan_ip" ]; then
+    host_lan_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  fi
+  if [ -z "$host_lan_ip" ]; then
+    echo -e "${RED}ERROR: Could not detect this host's LAN IP; no forwarding rule was changed.${NC}"
+    return 1
+  fi
+
+  if [ "$vm_state" = "running" ]; then
+    vboxmanage controlvm "$vm_name" "natpf${nat_index}" delete palantir 2>/dev/null || true
+    if ! vboxmanage controlvm "$vm_name" "natpf${nat_index}" "palantir,tcp,,${host_port},,${guest_port}"; then
+      echo -e "${RED}ERROR: Could not apply the live VirtualBox forwarding rule.${NC}"
+      return 1
+    fi
+  elif [ "$vm_state" = "poweroff" ]; then
+    vboxmanage modifyvm "$vm_name" "--natpf${nat_index}" delete palantir 2>/dev/null || true
+    if ! vboxmanage modifyvm "$vm_name" "--natpf${nat_index}" "palantir,tcp,,${host_port},,${guest_port}"; then
+      echo -e "${RED}ERROR: Could not save the VirtualBox forwarding rule.${NC}"
+      return 1
+    fi
+  else
+    echo -e "${RED}ERROR: '${vm_name}' is in VirtualBox state '${vm_state:-unknown}'. Start it or fully power it off, then rerun.${NC}"
+    return 1
+  fi
+
+  echo -e "\n${GREEN}✓ VirtualBox port forwarding configured automatically.${NC}"
+  echo -e "VM                        : ${CYAN}${vm_name}${NC}"
+  echo -e "Host address              : ${CYAN}${host_lan_ip}:${host_port}${NC}"
+  echo -e "Guest port                : ${YELLOW}${guest_port}${NC}"
+  echo -e "\nRegister this node in PALANTIR as ${YELLOW}${host_lan_ip}:${host_port}${NC}."
+}
+
 apply_kernel_route() {
   local target_subnet="$1"
   local gateway_ip="$2"
@@ -97,6 +201,19 @@ EOF
   echo -e "=====================================================\n"
 }
 
+case "${1:-}" in
+  ""|--auto)
+    auto_configure_virtualbox
+    exit 0
+    ;;
+  --manual)
+    ;;
+  *)
+    echo -e "Usage: $0 [--auto|--manual]"
+    exit 2
+    ;;
+esac
+
 echo -e "${CYAN}${BOLD}=====================================================${NC}"
 echo -e "${CYAN}${BOLD}   PALANTIR Universal VM & NAT Network Manager       ${NC}"
 echo -e "${CYAN}${BOLD}=====================================================${NC}"
@@ -122,32 +239,33 @@ if [ "$CHOICE" = "1" ]; then
 
   if [ "$VBOX_MODE" = "1" ]; then
     if command -v VBoxManage &>/dev/null; then
+      VBOXMANAGE_BIN="$(command -v VBoxManage)"
       echo -e "${GREEN}✓ Detected Oracle VirtualBox (VBoxManage) on this machine.${NC}"
       echo -e "\n${BOLD}Available Virtual Machines:${NC}"
-      VBoxManage list vms || true
+      vboxmanage list vms || true
       echo ""
 
       safe_prompt "Enter exact VM Name (or UUID)" VM_NAME ""
-      if [ -z "$VM_NAME" ]; then
-        echo -e "${RED}ERROR: VM name cannot be empty.${NC}"
-        exit 1
-      fi
+      validate_vbox_vm "$VM_NAME"
 
-      safe_prompt "Enter Host Port to expose on this PC" HOST_PORT "20000"
+      safe_prompt "Enter Host Port to expose on this PC" HOST_PORT "20001"
       safe_prompt "Enter Guest Agent Port inside VM" GUEST_PORT "20000"
 
-      VBoxManage controlvm "$VM_NAME" natpf1 delete palantir 2>/dev/null || true
-      VBoxManage modifyvm "$VM_NAME" --natpf1 delete palantir 2>/dev/null || true
+      vboxmanage controlvm "$VM_NAME" natpf1 delete palantir 2>/dev/null || true
+      vboxmanage modifyvm "$VM_NAME" --natpf1 delete palantir 2>/dev/null || true
 
-      if VBoxManage list runningvms | grep -q "$VM_NAME"; then
+      if vbox_vm_is_running "$VM_NAME"; then
         echo -e "\n[INFO] VM '$VM_NAME' is running. Applying live rule..."
-        VBoxManage controlvm "$VM_NAME" natpf1 "palantir,tcp,,${HOST_PORT},,${GUEST_PORT}"
+        vboxmanage controlvm "$VM_NAME" natpf1 "palantir,tcp,,${HOST_PORT},,${GUEST_PORT}"
       else
         echo -e "\n[INFO] VM '$VM_NAME' is powered off. Updating VM configuration..."
-        VBoxManage modifyvm "$VM_NAME" --natpf1 "palantir,tcp,,${HOST_PORT},,${GUEST_PORT}"
+        vboxmanage modifyvm "$VM_NAME" --natpf1 "palantir,tcp,,${HOST_PORT},,${GUEST_PORT}"
       fi
 
-      HOST_LAN_IP=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++)if($i=="dev"){print $(i+2);exit}}' || hostname -I | awk '{print $1}')
+      HOST_LAN_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<NF;i++)if($i=="src"){print $(i+1);exit}}')
+      if [ -z "$HOST_LAN_IP" ]; then
+        HOST_LAN_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+      fi
       echo -e "\n${GREEN}=====================================================${NC}"
       echo -e "${GREEN}   ✓ VIRTUALBOX PORT FORWARDING CONFIGURED           ${NC}"
       echo -e "${GREEN}=====================================================${NC}"
@@ -161,7 +279,7 @@ if [ "$CHOICE" = "1" ]; then
     else
       echo -e "${YELLOW}VBoxManage not detected locally. Assuming script is running on Master Server.${NC}"
       safe_prompt "Enter LAN IP of the PC hosting VirtualBox (e.g. PC2)" HOST_PC_IP ""
-      safe_prompt "Enter the forwarded port for this VM" TARGET_PORT "20000"
+      safe_prompt "Enter the forwarded port for this VM" TARGET_PORT "20001"
 
       if [ -z "$HOST_PC_IP" ]; then
         echo -e "${RED}ERROR: Host PC IP cannot be empty.${NC}"
@@ -184,11 +302,13 @@ if [ "$CHOICE" = "1" ]; then
       echo -e "${RED}ERROR: VBoxManage not found. Run this on the machine hosting VirtualBox.${NC}"
       exit 1
     fi
-    VBoxManage list vms || true
+    VBOXMANAGE_BIN="$(command -v VBoxManage)"
+    vboxmanage list vms || true
     safe_prompt "Enter exact VM Name" VM_NAME ""
+    validate_vbox_vm "$VM_NAME"
     DEFAULT_IFACE=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++)if($i=="dev"){print $(i+1);exit}}')
     safe_prompt "Enter Host Network Interface to bridge" BRIDGE_IFACE "$DEFAULT_IFACE"
-    VBoxManage modifyvm "$VM_NAME" --nic1 bridged --bridgeadapter1 "$BRIDGE_IFACE"
+    vboxmanage modifyvm "$VM_NAME" --nic1 bridged --bridgeadapter1 "$BRIDGE_IFACE"
     echo -e "${GREEN}✓ VM '$VM_NAME' switched to Bridged mode on ${BRIDGE_IFACE}.${NC}"
     exit 0
   fi
