@@ -92,6 +92,25 @@ const renderStateBadge = (val) => {
       </span>
     );
   }
+  if (['not_ready', 'not ready', 'pending'].includes(s) || String(s).startsWith('not_ready')) {
+    return (
+      <span
+        style={{
+          background: 'rgba(245, 158, 11, 0.18)',
+          border: '1px solid #f59e0b',
+          color: '#fbbf24',
+          fontWeight: 700,
+          padding: '1px 6px',
+          borderRadius: 4,
+          fontSize: 10.5,
+          textTransform: 'uppercase',
+          letterSpacing: '0.04em',
+        }}
+      >
+        {val}
+      </span>
+    );
+  }
   if (['exited', 'inactive', 'stopped', 'shut off', 'paused'].includes(s)) {
     return (
       <span

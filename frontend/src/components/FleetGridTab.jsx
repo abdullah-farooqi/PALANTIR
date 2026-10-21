@@ -437,7 +437,33 @@ export default function FleetGridTab({ nodes, query, setQuery, onSelectNode, onA
       </div>
 
       {processedNodes.length === 0 ? (
-        <Empty>No hosts found matching your search and filter criteria.</Empty>
+        <div style={{ textAlign: 'center', padding: '36px 16px', background: 'rgba(8, 15, 10, 0.4)', border: '1px dashed #1a3821', borderRadius: '12px' }}>
+          <div style={{ color: '#a3c4aa', fontSize: '14.5px', marginBottom: '14px' }}>
+            No hosts found matching your search or active filter.
+          </div>
+          <div style={{ display: 'flex', gap: '10px', justifyContent: 'center' }}>
+            {(query || filterState !== 'all') && (
+              <button
+                type="button"
+                className="btn"
+                onClick={() => { setQuery(''); setFilterState('all'); }}
+                style={{ fontSize: '13px', padding: '6px 14px' }}
+              >
+                Reset Filters
+              </button>
+            )}
+            {CAN_WRITE && (
+              <button
+                type="button"
+                className="btn primary"
+                onClick={onAddNode}
+                style={{ fontSize: '13px', padding: '6px 16px', background: '#39e569', color: '#000', fontWeight: '700' }}
+              >
+                + Add Host
+              </button>
+            )}
+          </div>
+        </div>
       ) : (
         <div className="fleet-cards-grid">
           {processedNodes.map((n) => (

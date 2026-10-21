@@ -233,7 +233,7 @@ fi
 [ -S /run/dbus/system_bus_socket ] && SOURCES_FOUND+=("systemd services")
 { [ -d /var/log/journal ] || [ -d /run/log/journal ]; } && SOURCES_FOUND+=("journal logs")
 
-# Kubernetes auto-detection (K3s, MicroK8s, kubeadm, or kubelet)
+# Kubernetes auto-detection (K3s, MicroK8s, kubeadm, minikube, or kubelet)
 if [ -f /etc/rancher/k3s/k3s.yaml ]; then
   SOURCES_FOUND+=("Kubernetes (K3s)")
   EXTRA_ENV+=(-e KUBERNETES_API_URL=https://127.0.0.1:6443)
@@ -245,7 +245,13 @@ elif [ -f /etc/kubernetes/admin.conf ]; then
   [ -z "$K8S_SERVER" ] || EXTRA_ENV+=(-e "KUBERNETES_API_URL=${K8S_SERVER}")
 elif [ -f /var/snap/microk8s/current/credentials/client.config ]; then
   SOURCES_FOUND+=("Kubernetes (MicroK8s)")
-elif pgrep -f 'kubelet|k3s|microk8s' &>/dev/null; then
+elif [ -f "${HOME}/.kube/config" ] || [ -f "/root/.kube/config" ]; then
+  K8S_CFG="${HOME}/.kube/config"
+  [ -f "$K8S_CFG" ] || K8S_CFG="/root/.kube/config"
+  SOURCES_FOUND+=("Kubernetes (kubeconfig)")
+  K8S_SERVER=$(grep -E "^\s*server:" "$K8S_CFG" 2>/dev/null | head -n1 | awk '{print $2}' || true)
+  [ -z "$K8S_SERVER" ] || EXTRA_ENV+=(-e "KUBERNETES_API_URL=${K8S_SERVER}")
+elif pgrep -f 'kubelet|k3s|microk8s|minikube' &>/dev/null; then
   SOURCES_FOUND+=("Kubernetes (kubelet active)")
 fi
 

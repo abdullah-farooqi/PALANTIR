@@ -1337,10 +1337,13 @@ def collect_containers() -> dict[str, Any]:
         rows.extend(lxc_rows)
         sources["lxc"] = {"status": "available", "count": len(lxc_rows)}
 
-    kube = _collect_kubernetes()
-    if kube["status"] == "available":
-        rows.extend(kube["pods"])
-    sources["kubernetes"] = {"status": kube["status"], "reason": kube.get("reason"), "count": len(kube.get("pods", []))}
+    try:
+        kube = _collect_kubernetes()
+        if kube["status"] == "available":
+            rows.extend(kube["pods"])
+        sources["kubernetes"] = {"status": kube["status"], "reason": kube.get("reason"), "count": len(kube.get("pods", []))}
+    except Exception as exc:
+        sources["kubernetes"] = {"status": "unavailable", "reason": str(exc)[:300], "count": 0}
     source_statuses = [item.get("status") for item in sources.values()]
     # "available" = at least one runtime answered (even with 0 containers); a runtime that is present
     # but failing is "unavailable"; nothing present at all is "not_configured".
@@ -1378,8 +1381,8 @@ def _collect_legacy_lxc() -> list[dict[str, Any]] | None:
     return [{"runtime": "lxc", "id": name, "name": name, "image": None, "state": "running" if name in running else "stopped", "status": "running" if name in running else "stopped"} for name in names]
 
 
-def _discover_k8s_endpoint() -> tuple[str, dict[str, str], str | bool]:
-    """Discover Kubernetes API URL and authorization headers from env, in-cluster SA, or kubeconfigs."""
+def _discover_k8s_endpoint() -> tuple[str, dict[str, str], str | bool | httpx.CertTypes]:
+    """Discover Kubernetes API URL and authorization headers from env, in-cluster SA, minikube or kubeconfigs."""
     if KUBERNETES_API_URL and KUBERNETES_TOKEN:
         headers = {"Authorization": f"Bearer {KUBERNETES_TOKEN}"}
         verify: str | bool = KUBERNETES_CA_CERT or False
@@ -1396,7 +1399,7 @@ def _discover_k8s_endpoint() -> tuple[str, dict[str, str], str | bool]:
         except OSError:
             pass
 
-    # K3s / Kubeconfig file discovery (both on root and mounted host root)
+    # Multi-path kubeconfig discovery (K3s, Kubeadm, Minikube, user kubeconfigs)
     candidates = [
         HOST_ROOT / "etc/rancher/k3s/k3s.yaml",
         Path("/etc/rancher/k3s/k3s.yaml"),
@@ -1406,6 +1409,18 @@ def _discover_k8s_endpoint() -> tuple[str, dict[str, str], str | bool]:
         Path("/root/.kube/config"),
         HOST_ROOT / "var/snap/microk8s/current/credentials/client.config",
     ]
+
+    # Search user home directories on host for .kube/config (supports regular user and minikube)
+    for home_base in (HOST_ROOT / "home", Path("/home")):
+        if home_base.is_dir():
+            try:
+                for u_dir in home_base.iterdir():
+                    cfg = u_dir / ".kube" / "config"
+                    if cfg.is_file():
+                        candidates.append(cfg)
+            except (OSError, PermissionError):
+                pass
+
     for cfg in candidates:
         try:
             if cfg.is_file():
@@ -1417,10 +1432,38 @@ def _discover_k8s_endpoint() -> tuple[str, dict[str, str], str | bool]:
                 if server and token:
                     return server.rstrip("/"), {"Authorization": f"Bearer {token}"}, False
                 elif server:
+                    # Check client cert and key for mutual TLS (standard minikube kubeconfig)
+                    client_cert_match = re.search(r"client-certificate:\s*([^\s]+)", txt)
+                    client_key_match = re.search(r"client-key:\s*([^\s]+)", txt)
+                    ca_match = re.search(r"certificate-authority:\s*([^\s]+)", txt)
+
+                    client_cert = client_cert_match.group(1).strip() if client_cert_match else None
+                    client_key = client_key_match.group(1).strip() if client_key_match else None
+                    ca_cert = ca_match.group(1).strip() if ca_match else None
+
+                    # If paths are on host, remap with HOST_ROOT
+                    def _resolve_host_path(p: str | None) -> str | None:
+                        if not p:
+                            return None
+                        raw = Path(p)
+                        if raw.is_file():
+                            return str(raw)
+                        remapped = HOST_ROOT / p.lstrip("/")
+                        if remapped.is_file():
+                            return str(remapped)
+                        return None
+
+                    cert_file = _resolve_host_path(client_cert)
+                    key_file = _resolve_host_path(client_key)
+                    ca_file = _resolve_host_path(ca_cert) or False
+
+                    if cert_file and key_file:
+                        return server.rstrip("/"), {"_cert": f"{cert_file}:{key_file}"}, ca_file
                     return server.rstrip("/"), {}, False
         except OSError:
             continue
 
+    # Also detect active minikube docker container or apiserver port if mapped
     return "", {}, False
 
 
@@ -1432,17 +1475,22 @@ def _collect_kubernetes() -> dict[str, Any]:
     # Attempt 1: Query API server if endpoint discovered
     if api_url:
         try:
-            resp = httpx.get(f"{api_url}/api/v1/pods", headers=headers, verify=verify, timeout=5.0)
-            if resp.status_code == 200:
-                items = resp.json().get("items", [])
-                try:
-                    m_resp = httpx.get(f"{api_url}/apis/metrics.k8s.io/v1beta1/pods", headers=headers, verify=verify, timeout=4.0)
-                    if m_resp.status_code == 200:
-                        for metric in m_resp.json().get("items", []):
-                            m_meta = metric.get("metadata", {})
-                            pod_metrics[(m_meta.get("namespace", "default"), m_meta.get("name", ""))] = metric.get("containers", [])
-                except (httpx.HTTPError, ValueError):
-                    pass
+            cert_val = None
+            req_headers = dict(headers)
+            if "_cert" in req_headers:
+                cert_val = tuple(req_headers.pop("_cert").split(":", 1))
+            with httpx.Client(cert=cert_val, verify=verify, timeout=5.0) as client:
+                resp = client.get(f"{api_url}/api/v1/pods", headers=req_headers)
+                if resp.status_code == 200:
+                    items = resp.json().get("items", [])
+                    try:
+                        m_resp = client.get(f"{api_url}/apis/metrics.k8s.io/v1beta1/pods", headers=req_headers)
+                        if m_resp.status_code == 200:
+                            for metric in m_resp.json().get("items", []):
+                                m_meta = metric.get("metadata", {})
+                                pod_metrics[(m_meta.get("namespace", "default"), m_meta.get("name", ""))] = metric.get("containers", [])
+                    except (httpx.HTTPError, ValueError):
+                        pass
         except (httpx.HTTPError, ValueError):
             pass
 
@@ -1490,6 +1538,14 @@ def _collect_kubernetes() -> dict[str, Any]:
         elif containers_spec and isinstance(containers_spec, list) and containers_spec[0].get("image"):
             image = containers_spec[0].get("image")
 
+        # Compute real readiness from container statuses
+        is_ready = True
+        if container_statuses:
+            is_ready = all(bool(c.get("ready")) for c in container_statuses if isinstance(c, dict))
+        computed_state = phase.lower()
+        if phase.lower() == "running" and not is_ready:
+            computed_state = "not_ready"
+
         pods.append({
             "id": metadata.get("uid") or name,
             "runtime": "kubernetes",
@@ -1498,8 +1554,9 @@ def _collect_kubernetes() -> dict[str, Any]:
             "display_name": f"{namespace}/{name}",
             "node": spec.get("nodeName"),
             "phase": phase,
-            "state": phase.lower(),
-            "status": phase.lower(),
+            "state": computed_state,
+            "status": "not_ready (0/1)" if (phase.lower() == "running" and not is_ready) else phase.lower(),
+            "is_ready": is_ready,
             "pod_ip": status.get("podIP"),
             "image": image,
             "containers": container_statuses,
@@ -1667,12 +1724,111 @@ def _collect_libvirt(qemu: list[dict[str, Any]]) -> dict[str, Any]:
         return {"status": "unavailable", "vms": [], "reason": str(exc)[:300]}
 
 
+def _virtualbox_processes() -> list[dict[str, Any]]:
+    """Running Oracle VirtualBox VMs read directly from host process table (VBoxHeadless / VirtualBoxVM)."""
+    rates = _RATE_SAMPLER.process_rates()
+    cores = (len(_CPU_SAMPLER.current()["cores"]) if _CPU_SAMPLER.current() else 0) or psutil.cpu_count(logical=True) or 1
+    guests: list[dict[str, Any]] = []
+
+    for proc in psutil.process_iter(attrs=["pid", "name", "cmdline", "memory_info", "create_time"]):
+        try:
+            info = proc.info
+            name = str(info.get("name") or "")
+            args = info.get("cmdline") or []
+            is_vbox = name.startswith("VBoxHeadless") or name.startswith("VirtualBoxVM") or any("VBoxHeadless" in str(a) or "VirtualBoxVM" in str(a) for a in args)
+            if not is_vbox:
+                continue
+
+            vm_name = None
+            for idx, arg in enumerate(args[:-1]):
+                if arg in ("--startvm", "-s", "-startvm"):
+                    vm_name = args[idx + 1].strip("'\"")
+                    break
+                elif arg == "--comment":
+                    vm_name = args[idx + 1].strip("'\"")
+
+            if not vm_name:
+                for arg in args:
+                    if str(arg).startswith("--startvm="):
+                        vm_name = str(arg).split("=", 1)[1].strip("'\"")
+                        break
+
+            memory = info.get("memory_info")
+            measured = rates.get(info["pid"])
+            core_pct = measured[1] if measured and info.get("create_time") is not None and abs(float(info["create_time"]) - measured[0]) <= PID_REUSE_TOLERANCE_SECONDS else None
+
+            guests.append({
+                "runtime": "virtualbox",
+                "name": vm_name or f"virtualbox-{info['pid']}",
+                "state": "running",
+                "pid": info["pid"],
+                "cpu_count": None,
+                "max_memory": None,
+                "used_memory": memory.rss if memory else None,
+                "rss_bytes": memory.rss if memory else None,
+                "cpu_pct": round(min(100.0, core_pct / cores), 2) if core_pct is not None else None,
+                "cpu_core_pct": round(core_pct, 2) if core_pct is not None else None,
+            })
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+
+    return guests
+
+
+def _vboxmanage_vms() -> list[dict[str, Any]]:
+    """Query VBoxManage CLI if installed on the host."""
+    vbox_cli = shutil.which("VBoxManage") or shutil.which("vboxmanage")
+    if not vbox_cli:
+        return []
+    try:
+        res = subprocess.run([vbox_cli, "list", "vms"], capture_output=True, text=True, timeout=5, check=False)
+        running_res = subprocess.run([vbox_cli, "list", "runningvms"], capture_output=True, text=True, timeout=5, check=False)
+        if res.returncode != 0:
+            return []
+        running_names = set()
+        for line in running_res.stdout.splitlines():
+            m = re.match(r'^"([^"]+)"', line.strip())
+            if m:
+                running_names.add(m.group(1))
+
+        vms = []
+        for line in res.stdout.splitlines():
+            m = re.match(r'^"([^"]+)"\s+\{([^}]+)\}', line.strip())
+            if m:
+                vm_name = m.group(1)
+                vm_uuid = m.group(2)
+                is_running = vm_name in running_names
+                vms.append({
+                    "runtime": "virtualbox",
+                    "name": vm_name,
+                    "uuid": vm_uuid,
+                    "state": "running" if is_running else "poweroff",
+                    "cpu_count": None,
+                    "max_memory": None,
+                    "used_memory": None,
+                })
+        return vms
+    except Exception:
+        return []
+
+
 def collect_vms() -> dict[str, Any]:
     qemu = _qemu_processes()
     libvirt = _collect_libvirt(qemu)
     proxmox = _collect_proxmox()
+    vbox_procs = _virtualbox_processes()
+    vbox_cli_vms = _vboxmanage_vms()
 
-    vms: list[dict[str, Any]] = list(libvirt["vms"]) + list(proxmox.get("vms", []))
+    # Merge VirtualBox CLI data and active process data
+    vbox_by_name = {vm["name"]: vm for vm in vbox_cli_vms}
+    for proc_vm in vbox_procs:
+        if proc_vm["name"] in vbox_by_name:
+            vbox_by_name[proc_vm["name"]].update(proc_vm)
+        else:
+            vbox_by_name[proc_vm["name"]] = proc_vm
+    virtualbox_vms = list(vbox_by_name.values())
+
+    vms: list[dict[str, Any]] = list(libvirt["vms"]) + list(proxmox.get("vms", [])) + virtualbox_vms
     known_names = {str(vm.get("name")) for vm in vms}
     known_vmids = {vm.get("vmid") for vm in proxmox.get("vms", []) if vm.get("vmid") is not None}
     # Guests visible only as QEMU processes (Proxmox without API token, plain QEMU, libvirt without a socket)
@@ -1688,6 +1844,11 @@ def collect_vms() -> dict[str, Any]:
     sources = {
         "libvirt": {"status": libvirt["status"], "count": len(libvirt["vms"]), "reason": libvirt.get("reason")},
         "proxmox": {"status": proxmox["status"], "count": len(proxmox.get("vms", [])), "reason": proxmox.get("reason")},
+        "virtualbox": {
+            "status": "available" if virtualbox_vms else ("available" if shutil.which("VBoxManage") else "not_configured"),
+            "count": len(virtualbox_vms),
+            "reason": None if virtualbox_vms else "No VirtualBox VM process or VBoxManage detected"
+        },
         "qemu_processes": {"status": "available" if qemu else "not_configured", "count": len(process_only),
                            "reason": None if qemu else "No QEMU/KVM guest process is running on this host"},
     }
@@ -1700,7 +1861,7 @@ def collect_vms() -> dict[str, Any]:
         status = "not_configured"
     data: dict[str, Any] = {"sources": sources, "vms": vms}
     if status == "not_configured":
-        data["reason"] = "No hypervisor (libvirt / Proxmox / QEMU) is running on this host"
+        data["reason"] = "No hypervisor (libvirt / Proxmox / VirtualBox / QEMU) is running on this host"
     return _status_data(data, status)
 
 
@@ -2184,6 +2345,13 @@ def stop_vm(
         if res.returncode == 0:
             return {"success": True, "vm_id": target, "action": action, "runtime": "libvirt"}
 
+    vbox_cli = shutil.which("VBoxManage") or shutil.which("vboxmanage")
+    if vbox_cli:
+        sub = "poweroff" if force else "acpipowerbutton"
+        res = subprocess.run([vbox_cli, "controlvm", target, sub], capture_output=True, text=True, timeout=10, check=False)
+        if res.returncode == 0:
+            return {"success": True, "vm_id": target, "action": sub, "runtime": "virtualbox"}
+
     if PROXMOX_API_URL and PROXMOX_API_TOKEN:
         headers = {"Authorization": f"PVEAPIToken={PROXMOX_API_TOKEN}"}
         verify: str | bool = False if PROXMOX_INSECURE_TLS else (PROXMOX_CA_CERT or True)
@@ -2366,6 +2534,12 @@ def start_vm(
         if res.returncode == 0:
             return {"success": True, "vm_id": target, "action": "start", "runtime": "libvirt"}
 
+    vbox_cli = shutil.which("VBoxManage") or shutil.which("vboxmanage")
+    if vbox_cli:
+        res = subprocess.run([vbox_cli, "startvm", target, "--type", "headless"], capture_output=True, text=True, timeout=15, check=False)
+        if res.returncode == 0:
+            return {"success": True, "vm_id": target, "action": "start", "runtime": "virtualbox"}
+
     if PROXMOX_API_URL and PROXMOX_API_TOKEN:
         headers = {"Authorization": f"PVEAPIToken={PROXMOX_API_TOKEN}"}
         verify: str | bool = False if PROXMOX_INSECURE_TLS else (PROXMOX_CA_CERT or True)
@@ -2410,6 +2584,13 @@ def restart_vm(
         res = subprocess.run([virsh, "--connect", uri, action, target], capture_output=True, text=True, timeout=10, check=False)
         if res.returncode == 0:
             return {"success": True, "vm_id": target, "action": action, "runtime": "libvirt"}
+
+    vbox_cli = shutil.which("VBoxManage") or shutil.which("vboxmanage")
+    if vbox_cli:
+        sub = "reset" if force else "acpireboot"
+        res = subprocess.run([vbox_cli, "controlvm", target, sub], capture_output=True, text=True, timeout=10, check=False)
+        if res.returncode == 0:
+            return {"success": True, "vm_id": target, "action": sub, "runtime": "virtualbox"}
 
     if PROXMOX_API_URL and PROXMOX_API_TOKEN:
         headers = {"Authorization": f"PVEAPIToken={PROXMOX_API_TOKEN}"}
