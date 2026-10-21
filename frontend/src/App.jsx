@@ -186,12 +186,108 @@ function Dashboard() {
         </div>
       </div>
     );
+  } else if (view === 'settings') {
+    body = (
+      <SettingsTab
+        node={node}
+        data={nodeData.data}
+        fleet={fleet}
+        refreshMs={refreshMs}
+        setRefreshMs={setRefreshMs}
+        onRefresh={refreshAll}
+        refreshing={fleet.refreshing || nodeData.refreshing}
+        onBack={goBackFromSettings}
+        onToast={notify}
+      />
+    );
   } else if (nodes.length === 0) {
     body = (
-      <Empty>
-        No nodes registered. The central stack registers <b>local-node</b> on boot; remote hosts enrol with <span className="tone-fg">scripts/setup-agent.sh</span>.
-        {CAN_WRITE ? ' Press “a” to add one by hand.' : ''}
-      </Empty>
+      <div style={{ maxWidth: 860, margin: '30px auto', padding: '0 16px' }}>
+        <div
+          className="box hot"
+          style={{
+            background: '#070c08',
+            borderColor: '#193822',
+            borderRadius: '14px',
+            padding: '28px 24px',
+            boxShadow: '0 0 35px rgba(20, 60, 30, 0.35)',
+            marginBottom: '24px'
+          }}
+        >
+          <div className="box-title" style={{ fontSize: '14px', marginBottom: '16px' }}>
+            <span className="t-edge">┐</span>
+            <span className="t-chip">
+              <span className="t-name" style={{ fontSize: '15px', color: '#39e569' }}>
+                Welcome to PALANTIR — No Hosts Enrolled
+              </span>
+            </span>
+            <span className="t-edge">┌</span>
+            <span className="t-line" />
+          </div>
+
+          <div style={{ color: '#a3c4aa', fontSize: '14px', lineHeight: '1.6', marginBottom: '18px' }}>
+            There are currently no machines registered in your cluster. You can register this master host or any remote server, VM, or cloud instance.
+          </div>
+
+          <div
+            style={{
+              background: '#040705',
+              border: '1px solid #16301d',
+              borderRadius: '8px',
+              padding: '14px 18px',
+              fontFamily: 'JetBrains Mono, monospace',
+              fontSize: '13px',
+              color: '#728c78',
+              lineHeight: '1.7'
+            }}
+          >
+            <div style={{ color: '#39e569', fontWeight: 600, marginBottom: '6px' }}>
+              How to setup and enroll target hosts:
+            </div>
+            <div>
+              1. On any physical host, VM, or local system, run:
+            </div>
+            <div style={{ color: '#22d3ee', margin: '4px 0 8px 12px' }}>
+              sudo bash scripts/Automatic-Host-Setup.sh
+            </div>
+            <div>
+              2. For VirtualBox / VMware / NAT VMs, configure port forwarding with:
+            </div>
+            <div style={{ color: '#22d3ee', margin: '4px 0 8px 12px' }}>
+              sudo bash scripts/Automatic-VM-Setup-For-NAT.sh
+            </div>
+            <div>
+              3. Once the collector is active on port 20000, add the node below.
+            </div>
+          </div>
+        </div>
+
+        {CAN_WRITE && (
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 320px))', gap: '20px' }}>
+            <div
+              className="cyber-node-card add-node-card"
+              onClick={() => setShowAdd(true)}
+              style={{
+                cursor: 'pointer',
+                borderRadius: '14px',
+                minHeight: '220px',
+                border: '1.5px dashed #275635',
+                background: 'rgba(8, 15, 10, 0.6)'
+              }}
+            >
+              <div className="add-node-content">
+                <div className="add-node-icon" style={{ fontSize: '32px', color: '#39e569', fontWeight: 700 }}>+</div>
+                <div className="add-node-title" style={{ fontSize: '16px', fontWeight: 700, color: '#39e569' }}>
+                  Register First Host
+                </div>
+                <div style={{ fontSize: '12px', color: '#728c78', maxWidth: '200px', marginTop: '4px' }}>
+                  Click to add a host IP or press hotkey “a”
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
     );
   } else if (view === 'fleet') {
     body = (
@@ -205,8 +301,6 @@ function Dashboard() {
         CAN_WRITE={CAN_WRITE}
       />
     );
-  } else if (view === 'settings') {
-    body = <SettingsTab node={node} data={nodeData.data} fleet={fleet} refreshMs={refreshMs} setRefreshMs={setRefreshMs} onRefresh={refreshAll} refreshing={fleet.refreshing || nodeData.refreshing} onBack={goBackFromSettings} onToast={notify} />;
   } else if (!node) {
     body = <Empty>Select a node.</Empty>;
   } else if (view === 'overview') {

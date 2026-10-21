@@ -375,42 +375,42 @@ export default function SettingsTab({ node, data, fleet, refreshMs, setRefreshMs
         </Box>
       </div>
 
-      {/* Box 3: Host Telemetry Sources Status */}
-      <Box
-        n={3}
-        title="COLLECTOR STATUS & SOURCES"
-        hot
-        right={<span className="tone-dim">HOST AGENT SENSORS</span>}
-      >
-        <div style={{ padding: '6px 4px' }}>
-          <p style={{ color: '#7a9680', fontSize: '12px', marginTop: 0, marginBottom: 12 }}>
-            Status of telemetry categories actively collected by the PALANTIR host collector.
-          </p>
+      {/* Box 3: Host Telemetry Sources Status (when a node is selected) */}
+      {node && (
+        <Box
+          n={3}
+          title="COLLECTOR STATUS & SOURCES"
+          hot
+          right={<span className="tone-dim">{node.hostname}</span>}
+        >
+          <div style={{ padding: '6px 4px' }}>
+            <p style={{ color: '#7a9680', fontSize: '12px', marginTop: 0, marginBottom: 12 }}>
+              Status of telemetry categories actively collected by the PALANTIR host collector on <b>{node.hostname}</b>.
+            </p>
 
-          {data && data.errors && data.errors.status && <ErrorLine warn>collection-status: {data.errors.status}</ErrorLine>}
+            {data && data.errors && data.errors.status && <ErrorLine warn>collection-status: {data.errors.status}</ErrorLine>}
 
-          {cats.length === 0 ? (
-            <Empty>No collection status telemetry available yet.</Empty>
-          ) : (
-            <div className="box-scroll" style={{ overflowX: 'auto', marginBottom: 14 }}>
-              <table className="tbl">
-                <thead>
-                  <tr>
-                    <th />
-                    {cats.map((c) => <th key={c.category}>{c.label || c.category}</th>)}
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr>
-                    <td className="tone-dim" style={{ fontWeight: 700, color: '#a3c4aa' }}>collector</td>
-                    {cats.map((c) => <td key={c.category}>{cell(c, AGENT)}</td>)}
-                  </tr>
-                </tbody>
-              </table>
-            </div>
-          )}
+            {cats.length === 0 ? (
+              <Empty>No collection status telemetry available yet.</Empty>
+            ) : (
+              <div className="box-scroll" style={{ overflowX: 'auto', marginBottom: 14 }}>
+                <table className="tbl">
+                  <thead>
+                    <tr>
+                      <th />
+                      {cats.map((c) => <th key={c.category}>{c.label || c.category}</th>)}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr>
+                      <td className="tone-dim" style={{ fontWeight: 700, color: '#a3c4aa' }}>collector</td>
+                      {cats.map((c) => <td key={c.category}>{cell(c, AGENT)}</td>)}
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            )}
 
-          {node && (
             <div style={{ paddingTop: 10, borderTop: '1px solid #142e1a', color: '#728c78', fontSize: 11.5, fontFamily: 'JetBrains Mono, monospace' }}>
               <div>
                 last contact: <span style={{ color: '#d8dee9' }}>{formatRelative(node.last_seen_at)}</span> • last collection: <span style={{ color: '#d8dee9' }}>{formatRelative(node.last_collection_at)}</span>
@@ -419,9 +419,9 @@ export default function SettingsTab({ node, data, fleet, refreshMs, setRefreshMs
                 collector endpoint: <span style={{ color: '#06b6d4' }}>{node.collector_url || 'not configured'}</span>
               </div>
             </div>
-          )}
-        </div>
-      </Box>
+          </div>
+        </Box>
+      )}
 
       {/* Box 4: Background Workers & Operational Health */}
       {fleet?.data && (

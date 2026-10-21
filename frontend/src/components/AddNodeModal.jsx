@@ -95,17 +95,20 @@ export default function AddNodeModal({ onClose, onCreated }) {
 
           <div>
             <label className="lbl" htmlFor="n-ip" style={{ fontSize: '14px', fontWeight: '600', color: '#a3c4aa', marginBottom: '6px' }}>
-              Target Host IP Address
+              Target Host IP / Port
             </label>
             <input
               id="n-ip"
               className="in"
               style={{ width: '100%', padding: '10px 14px', fontSize: '14.5px', borderRadius: '8px', background: '#000', borderColor: '#1c4026', color: '#fff' }}
               required
-              placeholder="e.g. 192.168.1.50 or 172.17.0.1"
+              placeholder="e.g. 192.168.1.50 or 192.168.1.50:20001"
               value={hostIp}
               onChange={(e) => setHostIp(e.target.value)}
             />
+            <div style={{ fontSize: '12px', color: '#728c78', marginTop: '6px', lineHeight: '1.4' }}>
+              Direct hosts use port <span style={{ color: '#39e569' }}>20000</span> by default. For NAT VMs (VirtualBox, VMware, WSL2, Hyper-V), append your forwarded port (e.g. <span style={{ color: '#22d3ee' }}>192.168.1.50:20001</span>).
+            </div>
           </div>
 
           <div className="row" style={{ justifyContent: 'space-between', marginTop: 8, alignItems: 'center' }}>
