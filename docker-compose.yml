@@ -42,7 +42,6 @@ services:
     image: ${PALANTIR_BACKEND_IMAGE:-abdullahahmadfarooqi/palantir-backend:latest}
     container_name: palantir-backend
     restart: unless-stopped
-    network_mode: "host"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
@@ -53,9 +52,9 @@ services:
     volumes:
       - ./backend:/app
     environment:
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-palantir}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@127.0.0.1:5432/${POSTGRES_DB:-palantir}
-      SYNC_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-palantir}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@127.0.0.1:5432/${POSTGRES_DB:-palantir}
-      REDIS_URL: redis://127.0.0.1:6379/0
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-palantir}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-palantir}
+      SYNC_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-palantir}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-palantir}
+      REDIS_URL: redis://redis:6379/0
       PALANTIR_WEBHOOK_SECRET: ${PALANTIR_WEBHOOK_SECRET:?Set PALANTIR_WEBHOOK_SECRET in .env}
       PALANTIR_API_READ_TOKEN: ${PALANTIR_API_READ_TOKEN:-}
       PALANTIR_API_ADMIN_TOKEN: ${PALANTIR_API_ADMIN_TOKEN:-}
@@ -101,7 +100,7 @@ services:
       AUTHENTIK_POSTGRESQL__USER: authentik
       AUTHENTIK_POSTGRESQL__NAME: authentik
       AUTHENTIK_POSTGRESQL__PASSWORD: ${AUTHENTIK_POSTGRES_PASSWORD:?Set AUTHENTIK_POSTGRES_PASSWORD in .env}
-      AUTHENTIK_WEB__BASE_URL: https://auth.palantir.home.arpa
+      AUTHENTIK_WEB__BASE_URL: https://auth.palantir.home.arpa:${PALANTIR_HTTPS_PORT:-8443}
       AUTHENTIK_ERROR_REPORTING__ENABLED: "false"
     volumes:
       - authentik_media:/media
@@ -137,12 +136,14 @@ services:
       PALANTIR_API_READ_TOKEN: ${PALANTIR_API_READ_TOKEN:?Set PALANTIR_API_READ_TOKEN in .env}
       PALANTIR_API_ADMIN_TOKEN: ${PALANTIR_API_ADMIN_TOKEN:?Set PALANTIR_API_ADMIN_TOKEN in .env}
       PALANTIR_API_ENROLL_TOKEN: ${PALANTIR_API_ENROLL_TOKEN:-}
+      PALANTIR_HTTP_PORT: ${PALANTIR_HTTP_PORT:-8080}
+      PALANTIR_HTTPS_PORT: ${PALANTIR_HTTPS_PORT:-8443}
     ports:
-      # Set PALANTIR_LAN_BIND_IP to the server's static LAN address in .env.
-      # The loopback default keeps the proxy private until that is configured.
-      - "${PALANTIR_LAN_BIND_IP:-127.0.0.1}:80:80"
-      - "${PALANTIR_LAN_BIND_IP:-127.0.0.1}:443:443"
-      - "${PALANTIR_LAN_BIND_IP:-127.0.0.1}:443:443/udp"
+      # High defaults work with rootless Docker. Set both variables to 80/443
+      # when running rootful Docker and standard web ports are available.
+      - "${PALANTIR_LAN_BIND_IP:-127.0.0.1}:${PALANTIR_HTTP_PORT:-8080}:${PALANTIR_HTTP_PORT:-8080}"
+      - "${PALANTIR_LAN_BIND_IP:-127.0.0.1}:${PALANTIR_HTTPS_PORT:-8443}:${PALANTIR_HTTPS_PORT:-8443}"
+      - "${PALANTIR_LAN_BIND_IP:-127.0.0.1}:${PALANTIR_HTTPS_PORT:-8443}:${PALANTIR_HTTPS_PORT:-8443}/udp"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
@@ -155,7 +156,6 @@ services:
     image: ${PALANTIR_BACKEND_IMAGE:-abdullahahmadfarooqi/palantir-backend:latest}
     container_name: palantir-celery-worker
     restart: unless-stopped
-    network_mode: "host"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     command: celery -A workers.celery_app.celery_app worker --loglevel=info
@@ -169,9 +169,9 @@ services:
     volumes:
       - ./backend:/app
     environment:
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-palantir}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@127.0.0.1:5432/${POSTGRES_DB:-palantir}
-      SYNC_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-palantir}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@127.0.0.1:5432/${POSTGRES_DB:-palantir}
-      REDIS_URL: redis://127.0.0.1:6379/0
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-palantir}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-palantir}
+      SYNC_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-palantir}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-palantir}
+      REDIS_URL: redis://redis:6379/0
       PALANTIR_WEBHOOK_SECRET: ${PALANTIR_WEBHOOK_SECRET:?Set PALANTIR_WEBHOOK_SECRET in .env}
       AGENT_AUTH_TOKEN: ${AGENT_AUTH_TOKEN:?Set AGENT_AUTH_TOKEN in .env; it must match PALANTIR_AGENT_TOKEN on each remote host}
       METRICS_RETENTION_HOURS: ${METRICS_RETENTION_HOURS:-24}
@@ -184,7 +184,6 @@ services:
     image: ${PALANTIR_BACKEND_IMAGE:-abdullahahmadfarooqi/palantir-backend:latest}
     container_name: palantir-celery-beat
     restart: unless-stopped
-    network_mode: "host"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     command: celery -A workers.celery_app.celery_app beat --loglevel=info
@@ -196,9 +195,9 @@ services:
     volumes:
       - ./backend:/app
     environment:
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-palantir}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@127.0.0.1:5432/${POSTGRES_DB:-palantir}
-      SYNC_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-palantir}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@127.0.0.1:5432/${POSTGRES_DB:-palantir}
-      REDIS_URL: redis://127.0.0.1:6379/0
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-palantir}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-palantir}
+      SYNC_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-palantir}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-palantir}
+      REDIS_URL: redis://redis:6379/0
       PALANTIR_WEBHOOK_SECRET: ${PALANTIR_WEBHOOK_SECRET:?Set PALANTIR_WEBHOOK_SECRET in .env}
 
 volumes:

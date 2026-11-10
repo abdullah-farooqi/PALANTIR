@@ -1,3 +1,8 @@
+{
+	http_port {$PALANTIR_HTTP_PORT}
+	https_port {$PALANTIR_HTTPS_PORT}
+}
+
 palantir.home.arpa {
 	tls internal
 

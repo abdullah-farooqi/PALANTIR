@@ -16,7 +16,7 @@ flowchart TD
 
     subgraph MasterServer ["PALANTIR Master Server"]
         Browser["Operator Browser"]
-        Caddy["Caddy HTTPS + Authentik SSO (:443)"]
+        Caddy["Caddy HTTPS + Authentik SSO (:8443 default)"]
         UI["React 18 Dashboard (:3000)"]
         API["FastAPI Backend (:8000)"]
         Beat["Celery Beat (Scheduler)"]
@@ -144,7 +144,7 @@ Then register the node in the PALANTIR Master UI specifying the host IP and forw
 
 ## 4. Reverse Proxy & Authentik SSO Setup (Optional LAN Gateway)
 
-For enterprise deployments requiring HTTPS and single sign-on, Caddy and Authentik manage authentication and forward-proxying to the backend.
+For deployments requiring HTTPS and single sign-on, Caddy and Authentik manage authentication and forward-proxying to the backend. The default host ports are `8080` (HTTP) and `8443` (HTTPS), which work with rootless Docker. Set `PALANTIR_HTTP_PORT=80` and `PALANTIR_HTTPS_PORT=443` in `.env` when using rootful Docker and standard ports are available.
 
 ### DNS Configuration
 The included Caddy reverse proxy uses `palantir.home.arpa` and `auth.palantir.home.arpa`. Add both domain names to your LAN DNS server (or local `/etc/hosts`), pointing to your central server's static LAN IP:
@@ -155,7 +155,7 @@ The included Caddy reverse proxy uses `palantir.home.arpa` and `auth.palantir.ho
 ### Initial TLS Certificate Setup
 Caddy generates an internal Certificate Authority (CA) for private HTTPS. Make an initial TLS handshake from the server:
 ```bash
-openssl s_client -connect <PALANTIR_LAN_IP>:443 -servername palantir.home.arpa </dev/null
+openssl s_client -connect <PALANTIR_LAN_IP>:8443 -servername palantir.home.arpa </dev/null
 ```
 Export Caddy's root certificate and install it on client machines:
 ```bash
@@ -168,7 +168,7 @@ sudo update-ca-certificates
 ```
 
 ### Authentik Group Roles
-Open `https://auth.palantir.home.arpa/if/flow/initial-setup/` and complete initial setup. Create the following groups:
+Open `https://auth.palantir.home.arpa:8443/if/flow/initial-setup/` and complete initial setup. Create the following groups:
 - `palantir-read`: UI/API read-only access.
 - `palantir-admin`: Read, threshold editing, node deactivation, and investigation management.
 - `palantir-enroll`: Machine-to-machine node registration (`POST /api/v1/nodes`).
@@ -246,6 +246,8 @@ All environment variables are declared in `.env` (template provided in `.env.exa
 | `AGENT_AUTH_TOKEN` | Shared secret for Host Collector (`:20000`) | Secure 32-char hex |
 | `PALANTIR_WEBHOOK_SECRET` | Secret for alert webhook integration | Secure 32-char hex |
 | `PALANTIR_LAN_BIND_IP` | Reverse proxy LAN bind address | `127.0.0.1` |
+| `PALANTIR_HTTP_PORT` | Caddy HTTP host/container port | `8080` (rootless Docker default) |
+| `PALANTIR_HTTPS_PORT` | Caddy HTTPS host/container port | `8443` (rootless Docker default) |
 | `METRICS_RETENTION_HOURS` | Retention window for raw metric snapshots | `24` |
 | `LOG_RETENTION_DAYS` | Retention window for security log events | `7` |
 | `NODE_REACHABLE_SECONDS` | Timeout before node is marked unreachable | `180` |
@@ -262,6 +264,8 @@ All environment variables are declared in `.env` (template provided in `.env.exa
 | `20000` | PALANTIR Host Collector | Target Host (Protected by Bearer Token) |
 | `5432` | PostgreSQL 16 Database | Master Server Localhost / Docker internal network |
 | `6379` | Redis 7 Task Broker & Cache | Master Server Localhost / Docker internal network |
+| `8080` | Caddy HTTP redirect | Loopback by default; configurable with `PALANTIR_HTTP_PORT` |
+| `8443` | Caddy HTTPS + Authentik SSO | Loopback by default; configurable with `PALANTIR_HTTPS_PORT` |
 
 ---
 
