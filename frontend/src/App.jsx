@@ -14,6 +14,10 @@ import InvestigationsTab from './components/InvestigationsTab';
 import SettingsTab from './components/SettingsTab';
 import AddNodeModal from './components/AddNodeModal';
 import { Empty, ErrorLine, Toast } from './components/ui';
+import ObservabilityTab from './components/ObservabilityTab';
+import PcapTab from './components/PcapTab';
+import AgentChatbotTab from './components/AgentChatbotTab';
+import FleetGridTab from './components/FleetGridTab';
 
 const read = (k, d) => {
   try {
@@ -31,10 +35,8 @@ const write = (k, v) => {
   }
 };
 
-import FleetGridTab from './components/FleetGridTab';
-
 function Dashboard() {
-  const [view, setView] = useState(() => (VIEWS.some((v) => v.key === read('palantir.view')) ? read('palantir.view') : 'fleet'));
+  const [view, setView] = useState(() => (VIEWS.some((v) => v.key === read('palantir.view')) ? read('palantir.view') : 'observability'));
   const [selectedId, setSelectedId] = useState(() => Number(read('palantir.node', 0)) || null);
   const [range, setRangeState] = useState(() => RANGES.find((r) => r.key === read('palantir.range')) || RANGES[0]);
   const [refreshMs, setRefreshMsState] = useState(() => {
@@ -46,9 +48,10 @@ function Dashboard() {
   const [scope, setScope] = useState('node'); // events / logs / investigations: this node or whole fleet
   const [focusInv, setFocusInv] = useState(null);
   const [showAdd, setShowAdd] = useState(false);
+  const [pendingRemoveNode, setPendingRemoveNode] = useState(null);
   const [toast, setToast] = useState(null);
   const toastTimer = useRef(null);
-  const [prevView, setPrevView] = useState('fleet');
+  const [prevView, setPrevView] = useState('observability');
   const [killedPids, setKilledPids] = useState(() => new Set());
   const handleKilledPids = useCallback((pids) => {
     if (!pids) return;
@@ -132,17 +135,10 @@ function Dashboard() {
   async function removeNode(targetNode) {
     const toRemove = targetNode || node;
     if (!toRemove) return;
-    if (!window.confirm(`Deactivate ${toRemove.hostname}? History is kept; polling stops.`)) return;
-    try {
-      await api.deleteNode(toRemove.id);
-      notify(`${toRemove.hostname} deactivated`);
-      fleet.refresh();
-    } catch (err) {
-      notify(err.message, true);
-    }
+    setPendingRemoveNode(toRemove);
   }
 
-  // ---- keyboard (btop-style) ----------------------------------------------------
+  // ---- keyboard (Forensic Instrument hotkeys) -----------------------------------
   useEffect(() => {
     function onKey(e) {
       if (e.metaKey || e.ctrlKey || e.altKey) return;
@@ -151,15 +147,24 @@ function Dashboard() {
         if (e.key === 'Escape') e.target.blur();
         return;
       }
-      if (showAdd) return;
-      const idx = nodes.findIndex((n) => n.id === selectedId);
-      if (e.key === '[' && nodes.length) setSelectedId(nodes[(idx - 1 + nodes.length) % nodes.length].id);
-      else if (e.key === ']' && nodes.length) setSelectedId(nodes[(idx + 1) % nodes.length].id);
+      if (showAdd || pendingRemoveNode) return;
+      if (e.key === '1') changeView('observability');
+      else if (e.key === '2') changeView('pcap');
+      else if (e.key === '3') changeView('agent');
+      else if (e.key === '4') changeView('fleet');
+      else if (e.key === '[' && nodes.length) {
+        const idx = nodes.findIndex((n) => n.id === selectedId);
+        setSelectedId(nodes[(idx - 1 + nodes.length) % nodes.length].id);
+      }
+      else if (e.key === ']' && nodes.length) {
+        const idx = nodes.findIndex((n) => n.id === selectedId);
+        setSelectedId(nodes[(idx + 1) % nodes.length].id);
+      }
       else if (e.key === 'r') refreshAll();
       else if (e.key === 't') setRange(RANGES[(RANGES.findIndex((r) => r.key === range.key) + 1) % RANGES.length]);
       else if (e.key === 'a' && CAN_WRITE) { e.preventDefault(); setShowAdd(true); }
       else if (e.key === '/') {
-        const el = document.querySelector('input.in');
+        const el = document.querySelector('input.in') || document.getElementById('global-instrument-search');
         if (el) { e.preventDefault(); el.focus(); }
       } else if (view === 'inventory') {
         const s = INVENTORY_SECTIONS.find((x) => x.hotkey === e.key);
@@ -168,7 +173,7 @@ function Dashboard() {
     }
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [nodes, selectedId, range, view, showAdd, refreshAll, changeView, setRange]);
+  }, [nodes, selectedId, range, view, showAdd, pendingRemoveNode, refreshAll, changeView, setRange]);
 
   // ---- render -------------------------------------------------------------------
   let body;
@@ -289,6 +294,19 @@ function Dashboard() {
         )}
       </div>
     );
+  } else if (view === 'observability') {
+    body = (
+      <ObservabilityTab
+        nodes={nodes}
+        searchFilter={query}
+        onSelectNode={selectNodeDetail}
+        onChangeView={changeView}
+      />
+    );
+  } else if (view === 'pcap') {
+    body = <PcapTab onToast={notify} />;
+  } else if (view === 'agent') {
+    body = <AgentChatbotTab onToast={notify} />;
   } else if (view === 'fleet') {
     body = (
       <FleetGridTab
@@ -302,7 +320,20 @@ function Dashboard() {
       />
     );
   } else if (!node) {
-    body = <Empty>Select a node.</Empty>;
+    body = (
+      <div style={{ textAlign: 'center', padding: '48px 16px', background: '#14171B', border: '1px dashed #262B32', borderRadius: '6px', maxWidth: 640, margin: '40px auto' }}>
+        <p style={{ color: '#8B93A0', fontSize: '13px', marginBottom: '16px' }}>
+          No target host node selected for deep telemetry investigation.
+        </p>
+        <button
+          className="btn primary"
+          onClick={() => changeView('fleet')}
+          style={{ background: '#C6FF00', color: '#0A0B0D', fontWeight: 700, padding: '7px 20px', borderRadius: '4px', fontSize: '12px' }}
+        >
+          Select from Hosts Grid
+        </button>
+      </div>
+    );
   } else if (view === 'overview') {
     body = <OverviewTab node={node} state={nodeData} range={range} setRange={setRange} onBack={goBack} onChangeView={changeView} onToast={notify} onRefresh={nodeData.refresh} killedPids={killedPids} onKilledPids={handleKilledPids} />;
   } else if (view === 'inventory') {
@@ -330,11 +361,105 @@ function Dashboard() {
         setQuery={setQuery}
       />
       <main className="term-main">
-        {nodeData.error && node && nodeData.data && view !== 'logs' && view !== 'investigations' && view !== 'fleet' && <ErrorLine warn>{nodeData.error}</ErrorLine>}
-        {nodeData.error && node && !nodeData.data && view !== 'logs' && view !== 'investigations' && view !== 'fleet' && <ErrorLine>{nodeData.error}</ErrorLine>}
+        {nodeData.error && node && nodeData.data && view !== 'logs' && view !== 'investigations' && view !== 'fleet' && view !== 'observability' && view !== 'pcap' && view !== 'agent' && <ErrorLine warn>{nodeData.error}</ErrorLine>}
+        {nodeData.error && node && !nodeData.data && view !== 'logs' && view !== 'investigations' && view !== 'fleet' && view !== 'observability' && view !== 'pcap' && view !== 'agent' && <ErrorLine>{nodeData.error}</ErrorLine>}
         {body}
       </main>
       {showAdd && <AddNodeModal onClose={() => setShowAdd(false)} onCreated={(n) => { setShowAdd(false); setSelectedId(n.id); fleet.refresh(); notify(`registered ${n.hostname}`); }} />}
+      
+      {/* Themed Safe Deactivation Confirmation Modal */}
+      {pendingRemoveNode && (
+        <div
+          className="modal-back"
+          style={{
+            position: 'fixed',
+            inset: 0,
+            background: 'rgba(10, 11, 13, 0.85)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            zIndex: 1000,
+          }}
+          onMouseDown={(e) => {
+            if (e.target === e.currentTarget) setPendingRemoveNode(null);
+          }}
+        >
+          <div
+            className="box modal hot"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="deactivate-dialog-title"
+            style={{
+              maxWidth: 440,
+              width: '90%',
+              padding: '22px 20px',
+              background: '#14171B',
+              border: '1px solid #E5484D',
+              borderRadius: 6,
+              boxShadow: '0 10px 30px rgba(0,0,0,0.8)',
+            }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 12 }}>
+              <span style={{ color: '#E5484D', fontSize: 18 }} aria-hidden="true">⚠</span>
+              <h3 id="deactivate-dialog-title" style={{ margin: 0, fontSize: 15, fontWeight: 700, color: '#FFA4A7', fontFamily: 'Space Grotesk, sans-serif' }}>
+                DEACTIVATE HOST NODE
+              </h3>
+            </div>
+
+            <p style={{ margin: '0 0 18px', fontSize: 13, color: '#E8EAED', lineHeight: 1.5, fontFamily: 'Space Grotesk, sans-serif' }}>
+              Deactivate host <b style={{ color: '#C6FF00', fontFamily: 'JetBrains Mono, monospace' }}>{pendingRemoveNode.hostname}</b>? Historical snapshots will be retained, but active polling and alert evaluation will stop.
+            </p>
+
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10 }}>
+              <button
+                type="button"
+                className="btn"
+                onClick={() => setPendingRemoveNode(null)}
+                style={{
+                  background: 'transparent',
+                  border: '1px solid #262B32',
+                  color: '#8B93A0',
+                  padding: '6px 14px',
+                  borderRadius: 4,
+                  cursor: 'pointer',
+                  fontWeight: 600,
+                  fontSize: 12,
+                }}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="btn"
+                onClick={async () => {
+                  const toRemove = pendingRemoveNode;
+                  setPendingRemoveNode(null);
+                  try {
+                    await api.deleteNode(toRemove.id);
+                    notify(`${toRemove.hostname} deactivated`);
+                    fleet.refresh();
+                  } catch (err) {
+                    notify(err.message, true);
+                  }
+                }}
+                style={{
+                  background: '#E5484D',
+                  border: 'none',
+                  color: '#0A0B0D',
+                  padding: '6px 16px',
+                  borderRadius: 4,
+                  cursor: 'pointer',
+                  fontWeight: 700,
+                  fontSize: 12,
+                }}
+              >
+                Confirm Deactivation
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       <Toast toast={toast} />
     </div>
   );

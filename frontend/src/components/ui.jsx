@@ -85,10 +85,17 @@ export function Chips({ options, value, onChange }) {
 
 // ------------------------------------------------------------------ Meter
 // Segmented bar like btop's `■■■■▪▪▪`. tone: usage (green->red), free (red->green), cool, warm.
-export function Meter({ pct, tone = 'usage' }) {
+export function Meter({ pct, tone = 'usage', label }) {
   const p = Number.isFinite(pct) ? Math.max(0, Math.min(100, pct)) : 0;
   return (
-    <div className={`meter ${tone}`} role="progressbar" aria-valuenow={p} aria-valuemin={0} aria-valuemax={100}>
+    <div
+      className={`meter ${tone}`}
+      role="progressbar"
+      aria-valuenow={p}
+      aria-valuemin={0}
+      aria-valuemax={100}
+      aria-label={label ? `${label}: ${Math.round(p)}%` : `Progress: ${Math.round(p)}%`}
+    >
       <i style={{ left: `${p}%` }} />
     </div>
   );
@@ -103,7 +110,7 @@ export function MeterRow({ label, pct, value, tone, sub }) {
         <span>{value}</span>
       </div>
       <div className="row">
-        <Meter pct={pct} tone={tone} />
+        <Meter pct={pct} tone={tone} label={label} />
         <span className="tone-dim" style={{ minWidth: '3.6em', textAlign: 'right' }}>
           {Number.isFinite(pct) ? `${Math.round(pct)}%` : '—'}
         </span>
@@ -208,7 +215,13 @@ export function DotGraph({ values = [], mirror = null, max, height = 110, palett
   }, [values, mirror, peak, width, height, palette, mirrorPalette, gutterW]);
 
   return (
-    <div className="graph-wrap" ref={wrap} style={{ height }}>
+    <div
+      className="graph-wrap"
+      ref={wrap}
+      style={{ height }}
+      role="img"
+      aria-label={topLabel ? `Telemetry graph: ${topLabel}` : 'Telemetry chart'}
+    >
       <canvas ref={canvas} />
       {topLabel && <span className="graph-label" style={{ top: 0 }}>{topLabel}</span>}
       {bottomLabel && <span className="graph-label" style={{ bottom: 0 }}>{bottomLabel}</span>}
@@ -277,7 +290,19 @@ export function DataTable({ columns, rows, rowKey, filter = '', initialSort, lim
           {view.slice(0, limit).map((row, i) => {
             const k = rowKey ? rowKey(row, i) : i;
             return (
-              <tr key={k} className={`${onRowClick ? 'click' : ''} ${selectedKey !== undefined && selectedKey === k ? 'sel' : ''}`} onClick={onRowClick ? () => onRowClick(row) : undefined}>
+              <tr
+                key={k}
+                role={onRowClick ? 'button' : 'row'}
+                tabIndex={onRowClick ? 0 : undefined}
+                className={`${onRowClick ? 'click focus-visible:ring-1 focus-visible:ring-[#C6FF00]' : ''} ${selectedKey !== undefined && selectedKey === k ? 'sel' : ''}`}
+                onClick={onRowClick ? () => onRowClick(row) : undefined}
+                onKeyDown={onRowClick ? (e) => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    onRowClick(row);
+                  }
+                } : undefined}
+              >
                 {columns.map((c) => (
                   <td key={c.key} className={c.num ? 'num' : ''}>
                     {c.render ? c.render(row) : row[c.key] ?? '—'}

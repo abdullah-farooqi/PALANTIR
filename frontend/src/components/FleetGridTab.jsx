@@ -121,17 +121,27 @@ function NodeCard({ node, onSelect, onRemove, CAN_WRITE }) {
 
   return (
     <div
+      role="button"
+      tabIndex={0}
+      aria-label={`Host ${node.hostname}, IP ${ipAddress}, status ${statusLabel}, CPU ${sys?.cpuPct != null ? Math.round(sys.cpuPct) : 0} percent`}
       className={`cyber-node-card ${!isOnline ? 'offline-card' : ''}`}
-      style={!isOnline ? { opacity: 0.65 } : {}}
+      style={!isOnline ? { opacity: 0.75 } : {}}
       onClick={() => onSelect(node.id)}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          onSelect(node.id);
+        }
+      }}
     >
       {/* 1. Header Section */}
       <div className="cyber-card-header">
         <div className="header-left">
           <img
             src={osInfo.img}
-            alt={osInfo.label}
+            alt={`${osInfo.label} icon`}
             className="cyber-os-logo"
+            aria-hidden="true"
             onError={(e) => {
               if (osInfo.fallbackImg && e.target.src !== window.location.origin + osInfo.fallbackImg) {
                 e.target.src = osInfo.fallbackImg;
@@ -154,6 +164,7 @@ function NodeCard({ node, onSelect, onRemove, CAN_WRITE }) {
                 e.stopPropagation();
                 onRemove(node);
               }}
+              aria-label={`Deactivate host ${node.hostname}`}
               title="Deactivate node"
             >
               ✕
@@ -163,26 +174,28 @@ function NodeCard({ node, onSelect, onRemove, CAN_WRITE }) {
             <div
               className="cyber-status-pill"
               style={{
-                background: 'rgba(239, 68, 68, 0.16)',
-                border: '1px solid #ef4444',
-                color: '#f87171',
+                background: 'rgba(229, 72, 77, 0.16)',
+                border: '1px solid #E5484D',
+                color: '#FFA4A7',
                 padding: '2px 8px',
-                borderRadius: '999px',
-                fontSize: '10.5px',
+                borderRadius: '4px',
+                fontSize: '11px',
                 fontWeight: 800,
                 display: 'inline-flex',
                 alignItems: 'center',
                 gap: 5,
-                boxShadow: '0 0 10px rgba(239, 68, 68, 0.25)',
               }}
               title={`${node.active_alerts_count} active warning/critical alert(s)`}
             >
-              <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#ef4444', boxShadow: '0 0 6px #ef4444' }}></span>
+              <span aria-hidden="true">✖</span>
               <span>{node.active_alerts_count} ALERT{node.active_alerts_count > 1 ? 'S' : ''}</span>
             </div>
           )}
+          {/* Multi-modal status badge: Color + Text + Shape */}
           <div className={`cyber-status-pill status-${badgeTone}`}>
-            <span className="status-dot"></span>
+            <span aria-hidden="true">
+              {isOnline ? '✔' : isStale ? '▲' : '✖'}
+            </span>
             <span className="status-text">{statusLabel}</span>
           </div>
         </div>
@@ -367,11 +380,10 @@ export default function FleetGridTab({ nodes, query, setQuery, onSelectNode, onA
           alignItems: 'center',
           flexWrap: 'wrap',
           marginBottom: 16,
-          background: '#070c08',
-          border: '1.5px solid #193822',
-          borderRadius: '12px',
+          background: '#14171B',
+          border: '1px solid #262B32',
+          borderRadius: '6px',
           padding: '8px 12px',
-          boxShadow: '0 0 15px rgba(20, 50, 25, 0.25)'
         }}
       >
         <input
@@ -379,14 +391,16 @@ export default function FleetGridTab({ nodes, query, setQuery, onSelectNode, onA
           style={{
             flex: '1 1 240px',
             padding: '8px 14px',
-            fontSize: '14px',
-            borderRadius: '8px',
-            background: 'transparent',
-            border: 'none',
+            fontSize: '13px',
+            borderRadius: '4px',
+            background: '#0A0B0D',
+            border: '1px solid #262B32',
             outline: 'none',
-            color: '#fff'
+            color: '#E8EAED',
+            fontFamily: 'JetBrains Mono, monospace',
           }}
-          placeholder="Search host by name, OS, or IP address..."
+          aria-label="Filter target hosts by hostname, OS, or IP address"
+          placeholder="Filter host by name, OS, or IP..."
           value={query || ''}
           onChange={(e) => setQuery(e.target.value)}
         />
@@ -425,7 +439,8 @@ export default function FleetGridTab({ nodes, query, setQuery, onSelectNode, onA
             className="in sort-select"
             value={sortBy}
             onChange={(e) => setSortBy(e.target.value)}
-            style={{ padding: '8px 12px', fontSize: '13px', borderRadius: '8px', background: '#0b160f', borderColor: '#193822', color: '#39e569', fontWeight: '700', cursor: 'pointer' }}
+            aria-label="Sort target hosts"
+            style={{ padding: '8px 12px', fontSize: '12px', borderRadius: '4px', background: '#1B1F24', borderColor: '#262B32', color: '#E8EAED', fontWeight: '700', cursor: 'pointer', fontFamily: 'JetBrains Mono, monospace' }}
           >
             <option value="name-asc">Name (A-Z)</option>
             <option value="cpu-desc">CPU Usage (High to Low)</option>
@@ -437,8 +452,8 @@ export default function FleetGridTab({ nodes, query, setQuery, onSelectNode, onA
       </div>
 
       {processedNodes.length === 0 ? (
-        <div style={{ textAlign: 'center', padding: '36px 16px', background: 'rgba(8, 15, 10, 0.4)', border: '1px dashed #1a3821', borderRadius: '12px' }}>
-          <div style={{ color: '#a3c4aa', fontSize: '14.5px', marginBottom: '14px' }}>
+        <div style={{ textAlign: 'center', padding: '36px 16px', background: '#14171B', border: '1px dashed #262B32', borderRadius: '6px' }}>
+          <div style={{ color: '#8B93A0', fontSize: '13.5px', marginBottom: '14px' }}>
             No hosts found matching your search or active filter.
           </div>
           <div style={{ display: 'flex', gap: '10px', justifyContent: 'center' }}>
@@ -447,7 +462,7 @@ export default function FleetGridTab({ nodes, query, setQuery, onSelectNode, onA
                 type="button"
                 className="btn"
                 onClick={() => { setQuery(''); setFilterState('all'); }}
-                style={{ fontSize: '13px', padding: '6px 14px' }}
+                style={{ fontSize: '12px', padding: '6px 14px' }}
               >
                 Reset Filters
               </button>
@@ -457,7 +472,7 @@ export default function FleetGridTab({ nodes, query, setQuery, onSelectNode, onA
                 type="button"
                 className="btn primary"
                 onClick={onAddNode}
-                style={{ fontSize: '13px', padding: '6px 16px', background: '#39e569', color: '#000', fontWeight: '700' }}
+                style={{ fontSize: '12px', padding: '6px 16px', background: '#C6FF00', color: '#0A0B0D', fontWeight: '700' }}
               >
                 + Add Host
               </button>
@@ -476,10 +491,18 @@ export default function FleetGridTab({ nodes, query, setQuery, onSelectNode, onA
             />
           ))}
           {CAN_WRITE && filterState === 'all' && !query && (
-            <div className="cyber-node-card add-node-card" onClick={onAddNode}>
+            <div
+              role="button"
+              tabIndex={0}
+              aria-label="Register a new target host node"
+              className="cyber-node-card add-node-card focus-visible:ring-2 focus-visible:ring-[#C6FF00]"
+              onClick={onAddNode}
+              onKeyDown={(e) => (e.key === 'Enter' || e.key === ' ') && onAddNode()}
+            >
               <div className="add-node-content">
-                <div className="add-node-icon">+</div>
-                <div className="add-node-title">Add Host</div>
+                <div className="add-node-icon" style={{ color: '#C6FF00' }}>+</div>
+                <div className="add-node-title" style={{ color: '#E8EAED' }}>Add Host</div>
+                <span style={{ fontSize: '11px', color: '#8B93A0' }}>Press [a] to quickly enroll</span>
               </div>
             </div>
           )}
