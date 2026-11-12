@@ -1,4 +1,6 @@
 import pytest
+from datetime import datetime, timezone
+from uuid import uuid4
 import respx
 import httpx
 from httpx import AsyncClient, ASGITransport
@@ -7,8 +9,11 @@ from core.config import settings
 from core.api_auth import get_api_role
 from models.node import MonitoredNode
 from models.alert import AlertEvent
+from models.investigation_evidence import InvestigationEvidence
+from models.investigation import AgentInvestigation
 from core.database import AsyncSessionLocal
 from services import investigations as investigation_service
+from services import alerts as alert_service
 from sqlalchemy import select
 
 
@@ -19,6 +24,12 @@ async def client(monkeypatch):
     app.dependency_overrides[get_api_role] = lambda: "admin"
     monkeypatch.setattr(settings, "PALANTIR_WEBHOOK_SECRET", "test-webhook-secret-" + "x" * 40)
     monkeypatch.setattr(investigation_service, "_enqueue", lambda *_args, **_kwargs: None)
+
+    async def no_pcap_request(*_args, **_kwargs):
+        return 0
+
+    monkeypatch.setattr(investigation_service, "request_pcap_evidence_for_alert", no_pcap_request)
+    monkeypatch.setattr(alert_service, "request_pcap_evidence_for_alert", no_pcap_request)
     try:
         async with AsyncClient(
             transport=ASGITransport(app=app),
@@ -432,3 +443,133 @@ async def test_investigations_lifecycle(client: AsyncClient, existing_node: Moni
     # 6. Non-existent investigation ID -> 404
     resp = await client.get("/api/v1/investigations/999999")
     assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_investigation_pcap_evidence_list_and_download(
+    client: AsyncClient,
+    existing_node: MonitoredNode,
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(settings, "PCAP_STORAGE_DIR", tmp_path)
+    created = await client.post(
+        "/api/v1/investigations",
+        json={"node_id": existing_node.id, "trigger_type": "manual"},
+    )
+    assert created.status_code == 202
+    investigation_id = created.json()["id"]
+    stored = tmp_path / "node" / "capture.pcap.zst"
+    stored.parent.mkdir(parents=True)
+    stored.write_bytes(b"pcap evidence fixture")
+
+    async with AsyncSessionLocal() as session:
+        complete = InvestigationEvidence(
+            investigation_id=investigation_id,
+            node_id=existing_node.id,
+            evidence_type="pcap_collection",
+            collector_file_id="capture_20261112T120000Z_0123456789ab.pcap",
+            file_name="capture.pcap.zst",
+            storage_key="node/capture.pcap.zst",
+            size_bytes=stored.stat().st_size,
+            duration_seconds=300,
+            status="complete",
+        )
+        pending = InvestigationEvidence(
+            investigation_id=investigation_id,
+            node_id=existing_node.id,
+            evidence_type="pcap_collection",
+            status="queued",
+        )
+        session.add_all([complete, pending])
+        await session.commit()
+        await session.refresh(complete)
+        await session.refresh(pending)
+        complete_id, pending_id = complete.id, pending.id
+
+    listed = await client.get(f"/api/v1/investigations/{investigation_id}/evidence")
+    assert listed.status_code == 200
+    entries = listed.json()["items"]
+    assert {entry["file_id"] for entry in entries} == {complete_id, pending_id}
+    assert next(entry for entry in entries if entry["file_id"] == complete_id)["duration_seconds"] == 300
+
+    downloaded = await client.get(
+        f"/api/v1/investigations/{investigation_id}/evidence/{complete_id}/download"
+    )
+    assert downloaded.status_code == 200
+    assert downloaded.content == b"pcap evidence fixture"
+
+    not_ready = await client.get(
+        f"/api/v1/investigations/{investigation_id}/evidence/{pending_id}/download"
+    )
+    assert not_ready.status_code == 409
+    deleted = await client.delete(f"/api/v1/investigations/{investigation_id}")
+    assert deleted.status_code == 204
+    assert not stored.exists()
+
+
+@pytest.mark.asyncio
+async def test_warning_alert_snapshot_is_recorded_and_transfer_is_queued(
+    existing_node: MonitoredNode,
+    monkeypatch,
+):
+    monkeypatch.setattr(settings, "PCAP_ALERT_COOLDOWN_SECONDS", 0)
+    timestamp = datetime.now(timezone.utc)
+    async with AsyncSessionLocal() as session:
+        event = AlertEvent(
+            node_id=existing_node.id,
+            alert_name="pcap-integration-test",
+            chart="pcap.integration",
+            status="WARNING",
+        )
+        session.add(event)
+        await session.flush()
+        investigation = AgentInvestigation(
+            node_id=existing_node.id,
+            job_id=str(uuid4()),
+            queued_at=timestamp,
+            trigger_type="alert",
+            trigger_id=event.id,
+            status="queued",
+            progress=0,
+        )
+        session.add(investigation)
+        await session.flush()
+        event_id, investigation_id = event.id, investigation.id
+        await session.commit()
+
+        async def fake_snapshot(_self):
+            return {
+                "snapshot_id": "a" * 32,
+                "files": [{
+                    "file_id": "capture_20261112T120000Z_0123456789ab.pcap",
+                    "filename": "capture_20261112T120000Z_0123456789ab.pcap.zst",
+                    "size_bytes": 1024,
+                    "original_size_bytes": 4096,
+                    "capture_started_at": timestamp.isoformat(),
+                    "capture_finished_at": timestamp.isoformat(),
+                    "duration_seconds": 300,
+                    "compression": "zst",
+                }],
+            }
+
+        async def queued_transfer(_evidence_id):
+            return True
+
+        monkeypatch.setattr(investigation_service.AgentCollectorClient, "create_pcap_snapshot", fake_snapshot)
+        monkeypatch.setattr(investigation_service, "_enqueue_pcap_transfer", queued_transfer)
+        queued = await investigation_service.request_pcap_evidence_for_alert(
+            session,
+            event_id=event_id,
+            node_id=existing_node.id,
+            investigation_id=investigation_id,
+        )
+        assert queued == 1
+        evidence = (await session.execute(
+            select(InvestigationEvidence).where(
+                InvestigationEvidence.investigation_id == investigation_id
+            )
+        )).scalar_one()
+        assert evidence.status == "queued"
+        assert evidence.alert_event_id == event_id
+        assert evidence.capture_snapshot_id == "a" * 32

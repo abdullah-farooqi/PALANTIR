@@ -169,6 +169,7 @@ CREATE TABLE IF NOT EXISTS alert_events (
     triggered_agent     BOOLEAN     NOT NULL DEFAULT FALSE,
     investigation_id    INT
 );
+ALTER TABLE alert_events ADD COLUMN IF NOT EXISTS event_at TIMESTAMPTZ;
 
 -- Previous backend code set these flags before any agent task was dispatched.
 -- Apply the correction once so later real dispatch outcomes are not overwritten.
@@ -236,6 +237,41 @@ WHERE status = 'queued' AND completed_at IS NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS uq_investigations_job_id
     ON agent_investigations (job_id)
     WHERE job_id IS NOT NULL;
+
+-- Individual network-capture artifacts are stored on the shared evidence volume.
+CREATE TABLE IF NOT EXISTS investigation_evidence (
+    id                      SERIAL PRIMARY KEY,
+    investigation_id        INT NOT NULL REFERENCES agent_investigations(id) ON DELETE CASCADE,
+    alert_event_id           BIGINT REFERENCES alert_events(id) ON DELETE SET NULL,
+    node_id                  INT NOT NULL REFERENCES monitored_nodes(id) ON DELETE CASCADE,
+    evidence_type            VARCHAR(50) NOT NULL DEFAULT 'pcap_collection',
+    capture_snapshot_id      VARCHAR(32),
+    collector_file_id        VARCHAR(255),
+    file_name                VARCHAR(512),
+    storage_key              VARCHAR(1024),
+    size_bytes               BIGINT,
+    original_size_bytes      BIGINT,
+    capture_started_at       TIMESTAMPTZ,
+    capture_finished_at      TIMESTAMPTZ,
+    duration_seconds         INT,
+    captured_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    uploaded_at              TIMESTAMPTZ,
+    upload_started_at        TIMESTAMPTZ,
+    sha256                   VARCHAR(64),
+    compression              VARCHAR(16),
+    status                   VARCHAR(16) NOT NULL DEFAULT 'queued'
+        CHECK (status IN ('queued', 'uploading', 'complete', 'failed', 'unavailable')),
+    error_message            TEXT,
+    CONSTRAINT uq_inv_evidence_collector_file UNIQUE (investigation_id, collector_file_id),
+    CONSTRAINT ck_investigation_evidence_size_nonnegative CHECK (size_bytes IS NULL OR size_bytes >= 0)
+);
+ALTER TABLE investigation_evidence ADD COLUMN IF NOT EXISTS duration_seconds INT;
+CREATE INDEX IF NOT EXISTS idx_investigation_evidence_inv
+    ON investigation_evidence (investigation_id);
+CREATE INDEX IF NOT EXISTS idx_investigation_evidence_node
+    ON investigation_evidence (node_id);
+CREATE INDEX IF NOT EXISTS idx_investigation_evidence_status
+    ON investigation_evidence (status) WHERE status IN ('queued', 'uploading');
 
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_snapshots_node_time

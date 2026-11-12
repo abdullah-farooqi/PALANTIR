@@ -2,10 +2,10 @@ name: PALANTIR CI Pipeline
 
 on:
   push:
-    branches: [ "main", "initial_project", "telemetry_pipeline", "telemetry_pipeline_with_frontend" ]
+    branches: [ "main", "initial_project", "telemetry_pipeline", "telemetry_pipeline_with_frontend", "telemetery_immproved_ui" ]
     tags: [ "v*" ]
   pull_request:
-    branches: [ "main", "initial_project", "telemetry_pipeline", "telemetry_pipeline_with_frontend" ]
+    branches: [ "main", "initial_project", "telemetry_pipeline", "telemetry_pipeline_with_frontend", "telemetery_immproved_ui" ]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

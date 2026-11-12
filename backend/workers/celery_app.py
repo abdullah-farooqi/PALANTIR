@@ -16,6 +16,7 @@ celery_app.conf.update(
         "workers.maintenance_tasks",
         "workers.health_tasks",
         "workers.investigation_tasks",
+        "workers.pcap_tasks",
     ),
 )
 

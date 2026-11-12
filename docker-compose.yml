@@ -51,6 +51,7 @@ services:
         condition: service_healthy
     volumes:
       - ./backend:/app
+      - evidence_data:/var/lib/palantir-evidence
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-palantir}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-palantir}
       SYNC_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-palantir}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-palantir}
@@ -67,6 +68,12 @@ services:
       NODE_STALE_SECONDS: ${NODE_STALE_SECONDS:-900}
       METRIC_STALE_SECONDS: ${METRIC_STALE_SECONDS:-180}
       WORKER_HEARTBEAT_STALE_SECONDS: ${WORKER_HEARTBEAT_STALE_SECONDS:-180}
+      PCAP_STORAGE_DIR: ${PCAP_STORAGE_DIR:-/var/lib/palantir-evidence}
+      PCAP_MAX_UPLOAD_MB: ${PCAP_MAX_UPLOAD_MB:-200}
+      PCAP_TRANSFER_TIMEOUT_SECONDS: ${PCAP_TRANSFER_TIMEOUT_SECONDS:-180}
+      PCAP_ALERT_COOLDOWN_SECONDS: ${PCAP_ALERT_COOLDOWN_SECONDS:-900}
+      PCAP_EVIDENCE_RETENTION_DAYS: ${PCAP_EVIDENCE_RETENTION_DAYS:-30}
+      PCAP_EVIDENCE_STORAGE_LIMIT_GB: ${PCAP_EVIDENCE_STORAGE_LIMIT_GB:-50}
     ports:
       - "127.0.0.1:8000:8000"
 
@@ -168,6 +175,7 @@ services:
         condition: service_healthy
     volumes:
       - ./backend:/app
+      - evidence_data:/var/lib/palantir-evidence
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-palantir}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-palantir}
       SYNC_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-palantir}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-palantir}
@@ -176,6 +184,12 @@ services:
       AGENT_AUTH_TOKEN: ${AGENT_AUTH_TOKEN:?Set AGENT_AUTH_TOKEN in .env; it must match PALANTIR_AGENT_TOKEN on each remote host}
       METRICS_RETENTION_HOURS: ${METRICS_RETENTION_HOURS:-24}
       LOG_RETENTION_DAYS: ${LOG_RETENTION_DAYS:-7}
+      PCAP_STORAGE_DIR: ${PCAP_STORAGE_DIR:-/var/lib/palantir-evidence}
+      PCAP_MAX_UPLOAD_MB: ${PCAP_MAX_UPLOAD_MB:-200}
+      PCAP_TRANSFER_TIMEOUT_SECONDS: ${PCAP_TRANSFER_TIMEOUT_SECONDS:-180}
+      PCAP_ALERT_COOLDOWN_SECONDS: ${PCAP_ALERT_COOLDOWN_SECONDS:-900}
+      PCAP_EVIDENCE_RETENTION_DAYS: ${PCAP_EVIDENCE_RETENTION_DAYS:-30}
+      PCAP_EVIDENCE_STORAGE_LIMIT_GB: ${PCAP_EVIDENCE_STORAGE_LIMIT_GB:-50}
 
   celery_beat:
     build:
@@ -202,6 +216,7 @@ services:
 
 volumes:
   postgres_data:
+  evidence_data:
   redis_data:
   authentik_postgres_data:
   authentik_media:

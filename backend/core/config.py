@@ -1,6 +1,7 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field, field_validator, model_validator
 from urllib.parse import urlsplit
+from pathlib import Path
 
 
 class Settings(BaseSettings):
@@ -130,6 +131,12 @@ class Settings(BaseSettings):
     )
     METRICS_RETENTION_HOURS: int = Field(default=24, ge=1)
     LOG_RETENTION_DAYS: int = Field(default=7, ge=1)
+    PCAP_STORAGE_DIR: Path = Field(default=Path("/var/lib/palantir-evidence"))
+    PCAP_MAX_UPLOAD_MB: int = Field(default=200, ge=1, le=4096)
+    PCAP_TRANSFER_TIMEOUT_SECONDS: int = Field(default=180, ge=10, le=3600)
+    PCAP_ALERT_COOLDOWN_SECONDS: int = Field(default=900, ge=0, le=86400)
+    PCAP_EVIDENCE_RETENTION_DAYS: int = Field(default=30, ge=1, le=3650)
+    PCAP_EVIDENCE_STORAGE_LIMIT_GB: int = Field(default=50, ge=1, le=4096)
     NODE_REACHABLE_SECONDS: int = Field(default=180, ge=30)
     NODE_STALE_SECONDS: int = Field(default=900, ge=60)
     METRIC_STALE_SECONDS: int = Field(default=180, ge=60)

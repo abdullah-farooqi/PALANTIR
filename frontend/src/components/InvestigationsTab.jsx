@@ -3,6 +3,7 @@ import { api } from '../api';
 import { usePolling } from '../hooks/usePolling';
 import { Badge, Box, Chips, DataTable, Empty, ErrorLine, Spinner } from './ui';
 import NodeHeaderNav from './NodeHeaderNav';
+import NetworkEvidence from './NetworkEvidence';
 import { CAN_WRITE } from '../lib/role';
 import { describeTrigger, severityTone, statusTone } from '../lib/events';
 import { formatDateTime, formatDuration, formatRelative, formatNumber, formatBytes, scoreToPercent } from '../lib/format';
@@ -494,6 +495,7 @@ export default function InvestigationsTab({ node, scope, setScope, refreshMs, fo
                 </div>
               )}
               <Evidence inv={current} />
+              <NetworkEvidence investigation={current} />
 
               {current.raw_output && (
                 <details style={{ marginTop: 14 }}>

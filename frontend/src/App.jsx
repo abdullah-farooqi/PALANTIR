@@ -304,7 +304,7 @@ function Dashboard() {
       />
     );
   } else if (view === 'pcap') {
-    body = <PcapTab onToast={notify} />;
+    body = <PcapTab onOpenInvestigations={() => changeView('investigations')} />;
   } else if (view === 'agent') {
     body = <AgentChatbotTab onToast={notify} />;
   } else if (view === 'fleet') {

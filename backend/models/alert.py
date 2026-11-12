@@ -14,6 +14,7 @@ class AlertEvent(Base):
         nullable=False,
         default=lambda: datetime.now(timezone.utc),
     )
+    event_at = Column(DateTime(timezone=True), nullable=True)
     alert_name = Column(String, nullable=False)
     chart = Column(String, nullable=False)
     status = Column(String, nullable=False)  # WARNING, CRITICAL, CLEAR

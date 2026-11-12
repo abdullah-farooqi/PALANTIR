@@ -14,6 +14,8 @@
 #   COLLECTOR_IMAGE        use another image (e.g. a locally built one)
 #   PROXMOX_API_URL / PROXMOX_API_TOKEN / PROXMOX_INSECURE_TLS=1   Proxmox API (full VM metrics)
 #   KUBERNETES_API_URL / KUBERNETES_TOKEN                          Kubernetes pod metrics
+#   PCAP_ENABLED=1                                                  Enable rolling packet capture
+#   PCAP_INTERFACE / PCAP_SNAPLEN / PCAP_*                          Packet capture settings
 #   DRY_RUN=1              only print the docker command
 # ─────────────────────────────────────────────────────────────────────────────
 set -e
@@ -26,6 +28,22 @@ NC='\033[0m'
 
 DRY_RUN="${DRY_RUN:-0}"
 AGENT_TOKEN="${PALANTIR_AGENT_TOKEN:-}"
+PCAP_ENABLED="${PCAP_ENABLED:-0}"
+PCAP_INTERFACE="${PCAP_INTERFACE:-any}"
+PCAP_SNAPLEN="${PCAP_SNAPLEN:-128}"
+PCAP_ROTATION_SECONDS="${PCAP_ROTATION_SECONDS:-300}"
+PCAP_MAX_FILES="${PCAP_MAX_FILES:-3}"
+PCAP_MAX_SIZE_MB="${PCAP_MAX_SIZE_MB:-50}"
+PCAP_FILTER_EXCLUDE="${PCAP_FILTER_EXCLUDE:-port 20000 or port 8000}"
+PCAP_STORAGE_DIR="${PCAP_AGENT_STORAGE_DIR:-${PCAP_STORAGE_DIR:-/var/lib/palantir-agent/pcap}}"
+PCAP_COMPRESSION="${PCAP_COMPRESSION:-zstd}"
+PCAP_SNAPSHOT_TTL_SECONDS="${PCAP_SNAPSHOT_TTL_SECONDS:-1800}"
+PCAP_MAX_ACTIVE_SNAPSHOTS="${PCAP_MAX_ACTIVE_SNAPSHOTS:-3}"
+
+if [[ "$PCAP_ENABLED" != "0" && "$PCAP_ENABLED" != "1" ]]; then
+  echo -e "${RED}ERROR: PCAP_ENABLED must be 0 or 1.${NC}"
+  exit 1
+fi
 
 echo -e "${CYAN}=====================================================${NC}"
 echo -e "${CYAN}     PALANTIR Automatic Target Host Setup Script     ${NC}"
@@ -257,6 +275,9 @@ fi
 
 [ -z "$AGENT_TOKEN" ] || EXTRA_ENV+=(-e "PALANTIR_AGENT_TOKEN=${AGENT_TOKEN}")
 [ "$ACCESS_MODE" != "anyone" ] || EXTRA_ENV+=(-e PALANTIR_ALLOW_ANON_KILL=1)
+for var in PCAP_ENABLED PCAP_INTERFACE PCAP_SNAPLEN PCAP_ROTATION_SECONDS PCAP_MAX_FILES PCAP_MAX_SIZE_MB PCAP_FILTER_EXCLUDE PCAP_STORAGE_DIR PCAP_COMPRESSION PCAP_SNAPSHOT_TTL_SECONDS PCAP_MAX_ACTIVE_SNAPSHOTS; do
+  EXTRA_ENV+=(-e "$var=${!var}")
+done
 for var in PROXMOX_API_URL PROXMOX_API_TOKEN PROXMOX_CA_CERT PROXMOX_INSECURE_TLS KUBERNETES_API_URL KUBERNETES_TOKEN KUBERNETES_CA_CERT; do
   if [ -n "${!var:-}" ]; then
     EXTRA_ENV+=(-e "$var=${!var}")
@@ -279,7 +300,7 @@ build_run_args() {
     --name palantir-collector
     --restart unless-stopped
     --net=host --pid=host
-    --cap-add SYS_PTRACE --cap-add NET_ADMIN
+    --cap-add SYS_PTRACE --cap-add NET_ADMIN --cap-add NET_RAW
     "${SECURITY_OPTS[@]}"
     -v "/:/host:ro${1}"
     -v palantir-collector-state:/var/lib/palantir-agent

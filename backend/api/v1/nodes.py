@@ -372,6 +372,75 @@ async def kill_node_process(
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Failed to terminate process: {exc}")
 
 
+@router.get("/{node_id}/capture/status")
+async def get_node_capture_status(
+    node_id: int = Path(..., ge=1),
+    session: AsyncSession = Depends(get_session),
+    _role: None = Depends(require_read),
+):
+    node = await NodeService.get_node(node_id, session)
+    if not node:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Node not found")
+    if not node.collector_url:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Node does not have an active collector")
+    try:
+        return await AgentCollectorClient(node.collector_url).get_pcap_status()
+    except Exception as exc:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Failed to read capture status: {exc}") from exc
+
+
+@router.get("/{node_id}/capture/files")
+async def get_node_capture_files(
+    node_id: int = Path(..., ge=1),
+    snapshot_id: str | None = Query(default=None, pattern=r"^[0-9a-f]{32}$"),
+    session: AsyncSession = Depends(get_session),
+    _role: None = Depends(require_read),
+):
+    node = await NodeService.get_node(node_id, session)
+    if not node:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Node not found")
+    if not node.collector_url:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Node does not have an active collector")
+    try:
+        return await AgentCollectorClient(node.collector_url).get_pcap_files(snapshot_id)
+    except Exception as exc:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Failed to list capture files: {exc}") from exc
+
+
+@router.post("/{node_id}/capture/start")
+async def start_node_capture(
+    node_id: int = Path(..., ge=1),
+    session: AsyncSession = Depends(get_session),
+    _role: None = Depends(require_admin),
+):
+    node = await NodeService.get_node(node_id, session)
+    if not node:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Node not found")
+    if not node.collector_url:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Node does not have an active collector")
+    try:
+        return await AgentCollectorClient(node.collector_url).start_pcap_capture()
+    except Exception as exc:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Failed to start packet capture: {exc}") from exc
+
+
+@router.post("/{node_id}/capture/stop")
+async def stop_node_capture(
+    node_id: int = Path(..., ge=1),
+    session: AsyncSession = Depends(get_session),
+    _role: None = Depends(require_admin),
+):
+    node = await NodeService.get_node(node_id, session)
+    if not node:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Node not found")
+    if not node.collector_url:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Node does not have an active collector")
+    try:
+        return await AgentCollectorClient(node.collector_url).stop_pcap_capture()
+    except Exception as exc:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Failed to stop packet capture: {exc}") from exc
+
+
 @router.post("/{node_id}/containers/{container_id}/stop")
 async def stop_node_container(
     node_id: int = Path(..., ge=1, description="Monitored node ID"),

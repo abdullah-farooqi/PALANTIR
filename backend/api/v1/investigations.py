@@ -1,22 +1,28 @@
+import logging
 from datetime import datetime, timezone
+from pathlib import Path as FilePath
 from typing import List, Dict, Any, Optional
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, status
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 from core.database import get_session
-from core.api_auth import require_admin
+from core.config import settings
+from core.api_auth import require_admin, require_read
 from core.cursors import decode_cursor, encode_cursor
 from urllib.parse import urlparse
 from models.alert import AlertEvent
 from models.anomaly import AnomalyEvent
 from models.investigation import AgentInvestigation
+from models.investigation_evidence import InvestigationEvidence
 from models.node import MonitoredNode
 from services.nodes import NodeService
 from services.investigations import enqueue_investigation_async
 
 router = APIRouter(prefix="/investigations", tags=["Investigations"])
+logger = logging.getLogger(__name__)
 
 
 class InvestigationCreateRequest(BaseModel):
@@ -95,6 +101,16 @@ def _serialize(row: AgentInvestigation) -> dict[str, Any]:
         "summary": summary,
         "raw_output": row.raw_output,
     }
+
+
+def _resolve_evidence_path(storage_key: str) -> tuple[FilePath, FilePath]:
+    root = settings.PCAP_STORAGE_DIR.resolve()
+    file_path = (root / storage_key).resolve()
+    try:
+        file_path.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("Evidence storage reference is outside the configured storage directory") from exc
+    return root, file_path
 
 
 @router.get("", response_model=List[InvestigationResponse])
@@ -192,6 +208,80 @@ async def get_investigation(
     return _serialize(inv)
 
 
+@router.get("/{investigation_id}/evidence")
+async def list_investigation_evidence(
+    investigation_id: int = Path(..., ge=1),
+    session: AsyncSession = Depends(get_session),
+    _role: None = Depends(require_read),
+) -> dict[str, Any]:
+    investigation = (await session.execute(
+        select(AgentInvestigation.id).where(AgentInvestigation.id == investigation_id)
+    )).scalar_one_or_none()
+    if investigation is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Investigation not found")
+    rows = (await session.execute(
+        select(InvestigationEvidence)
+        .where(InvestigationEvidence.investigation_id == investigation_id)
+        .order_by(InvestigationEvidence.captured_at.desc(), InvestigationEvidence.id.desc())
+    )).scalars().all()
+    items = []
+    for row in rows:
+        items.append({
+            "file_id": row.id,
+            "evidence_type": row.evidence_type,
+            "filename": row.file_name,
+            "size_bytes": row.size_bytes,
+            "original_size_bytes": row.original_size_bytes,
+            "duration_seconds": row.duration_seconds,
+            "capture_started_at": row.capture_started_at.isoformat() if row.capture_started_at else None,
+            "capture_finished_at": row.capture_finished_at.isoformat() if row.capture_finished_at else None,
+            "captured_at": row.captured_at.isoformat() if row.captured_at else None,
+            "uploaded_at": row.uploaded_at.isoformat() if row.uploaded_at else None,
+            "compression": row.compression,
+            "sha256": row.sha256,
+            "status": row.status,
+            "error_message": row.error_message,
+        })
+    return {"schema_version": 1, "investigation_id": investigation_id, "items": items}
+
+
+@router.get("/{investigation_id}/evidence/{file_id}/download")
+async def download_pcap_evidence(
+    investigation_id: int = Path(..., ge=1),
+    file_id: int = Path(..., ge=1),
+    session: AsyncSession = Depends(get_session),
+    _role: None = Depends(require_read),
+) -> FileResponse:
+    row = (await session.execute(
+        select(InvestigationEvidence).where(
+            InvestigationEvidence.id == file_id,
+            InvestigationEvidence.investigation_id == investigation_id,
+        )
+    )).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Evidence file not found")
+    if row.status != "complete" or not row.storage_key:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Evidence file is not ready for download")
+
+    try:
+        _root, file_path = _resolve_evidence_path(row.storage_key)
+    except ValueError as exc:
+        logger.error("Evidence %s has an invalid storage key", row.id)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Evidence storage reference is invalid") from exc
+    if not file_path.is_file():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Stored evidence file is missing")
+    download_name = FilePath(row.file_name or file_path.name).name
+    media_type = "application/zstd" if file_path.suffix == ".zst" else (
+        "application/gzip" if file_path.suffix == ".gz" else "application/vnd.tcpdump.pcap"
+    )
+    return FileResponse(
+        file_path,
+        media_type=media_type,
+        filename=download_name,
+        headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
+    )
+
+
 @router.post(
     "",
     status_code=status.HTTP_202_ACCEPTED,
@@ -247,5 +337,21 @@ async def delete_investigation(
     row = (await session.execute(stmt)).scalar_one_or_none()
     if not row:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Investigation not found")
+    storage_keys = (await session.execute(
+        select(InvestigationEvidence.storage_key).where(
+            InvestigationEvidence.investigation_id == investigation_id,
+            InvestigationEvidence.storage_key.is_not(None),
+        )
+    )).scalars().all()
     await session.delete(row)
     await session.commit()
+    for storage_key in storage_keys:
+        try:
+            _root, file_path = _resolve_evidence_path(storage_key)
+            file_path.unlink(missing_ok=True)
+            try:
+                file_path.parent.rmdir()
+            except OSError:
+                pass
+        except (OSError, ValueError):
+            logger.warning("Could not remove stored evidence %s for deleted investigation %s", storage_key, investigation_id, exc_info=True)

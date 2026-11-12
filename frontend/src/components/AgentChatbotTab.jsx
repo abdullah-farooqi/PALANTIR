@@ -103,14 +103,17 @@ export default function AgentChatbotTab({ onToast }) {
             RAG Knowledge Plane & Multi-Modal Engine
           </span>
           <h1 className="font-mono font-bold text-sm text-[#E8EAED] mt-0.5">
-            Suricata IDS Logs + Captured PCAP Buffer #104 + Host Process Tree
+            Demo Forensic Agent · Illustrative PCAP, IDS, and host-process examples
           </h1>
+          <p className="text-xs text-[#8B93A0] mt-2 mb-0">
+            Demo content only. This panel does not inspect live captures or execute network actions.
+          </p>
         </div>
         <div className="flex items-center gap-2">
           {/* LOUD LIME: Streaming status indicator */}
           <span className="font-mono text-xs text-[#C6FF00] flex items-center gap-1.5 font-bold">
             <span className="w-2 h-2 rounded-full bg-[#C6FF00] animate-pulse" aria-hidden="true" />
-            Agent Engine Calibrated
+            Demo Mode
           </span>
         </div>
       </section>
@@ -141,7 +144,7 @@ export default function AgentChatbotTab({ onToast }) {
               {msg.citations && (
                 <div className="flex flex-col gap-1.5 mt-2 pt-2 border-t border-[#1D2126]">
                   <span className="font-mono text-[11px] text-[#656C77] uppercase font-semibold">
-                    Verified Grounded Sources:
+                    Illustrative Sample References:
                   </span>
                   <div className="flex flex-wrap gap-2">
                     {msg.citations.map((c) => (

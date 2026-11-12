@@ -24,6 +24,8 @@ from typing import Any
 import psutil
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi.responses import FileResponse
+from pcap import PCapError, PCapFileNotReady, PCapManager
 
 APP_VERSION = "0.1.0"
 HOST_PROC = Path(os.getenv("HOST_PROC", "/host/proc" if Path("/host/proc").exists() else "/proc"))
@@ -82,6 +84,17 @@ except (OSError, json.JSONDecodeError):
 
 app = FastAPI(title="PALANTIR Linux Host Collector", version=APP_VERSION)
 
+
+@app.on_event("startup")
+def _start_pcap_manager() -> None:
+    if PCAP_ENABLED and not _PCAP_MANAGER.start():
+        print(f"[palantir-collector] PCAP capture did not start: {_PCAP_MANAGER.status()['last_error']}", flush=True)
+
+
+@app.on_event("shutdown")
+def _stop_pcap_manager() -> None:
+    _PCAP_MANAGER.stop()
+
 CATEGORIES = ("system", "storage", "network", "services", "processes", "connections", "containers", "vms")
 
 # --------------------------------------------------------------------------------------
@@ -97,6 +110,19 @@ CPU_SAMPLE_BUFFER = max(60, int(os.getenv("CPU_SAMPLE_BUFFER", "900")))        #
 CPU_CURRENT_WINDOW = max(1, int(os.getenv("CPU_CURRENT_WINDOW", "5")))         # samples averaged for "current" CPU
 RATE_SAMPLE_SECONDS = max(2.0, float(os.getenv("RATE_SAMPLE_SECONDS", "5")))   # process / network / disk rates
 PID_REUSE_TOLERANCE_SECONDS = 5.0                                              # create_time jitter vs. PID reuse
+
+# Packet capture is opt-in because it records network metadata and may include payload bytes.
+PCAP_ENABLED = os.getenv("PCAP_ENABLED", "0") == "1"
+PCAP_INTERFACE = os.getenv("PCAP_INTERFACE", "any")
+PCAP_SNAPLEN = int(os.getenv("PCAP_SNAPLEN", "128"))
+PCAP_ROTATION_SECONDS = int(os.getenv("PCAP_ROTATION_SECONDS", "300"))
+PCAP_MAX_FILES = int(os.getenv("PCAP_MAX_FILES", "3"))
+PCAP_MAX_SIZE_MB = int(os.getenv("PCAP_MAX_SIZE_MB", "50"))
+PCAP_FILTER_EXCLUDE = os.getenv("PCAP_FILTER_EXCLUDE", "port 20000 or port 8000")
+PCAP_STORAGE_DIR = Path(os.getenv("PCAP_STORAGE_DIR", "/var/lib/palantir-agent/pcap"))
+PCAP_COMPRESSION = os.getenv("PCAP_COMPRESSION", "zstd").strip().lower()
+PCAP_SNAPSHOT_TTL_SECONDS = int(os.getenv("PCAP_SNAPSHOT_TTL_SECONDS", "1800"))
+PCAP_MAX_ACTIVE_SNAPSHOTS = int(os.getenv("PCAP_MAX_ACTIVE_SNAPSHOTS", "3"))
 
 _CPU_FIELDS = ("user", "nice", "system", "idle", "iowait", "irq", "softirq", "steal")
 
@@ -399,6 +425,19 @@ class _RateSampler:
 
 _CPU_SAMPLER = _CpuSampler()
 _RATE_SAMPLER = _RateSampler()
+_PCAP_MANAGER = PCapManager(
+    enabled=PCAP_ENABLED,
+    interface=PCAP_INTERFACE,
+    snaplen=PCAP_SNAPLEN,
+    rotation_seconds=PCAP_ROTATION_SECONDS,
+    max_files=PCAP_MAX_FILES,
+    max_size_mb=PCAP_MAX_SIZE_MB,
+    filter_exclude=PCAP_FILTER_EXCLUDE,
+    storage_dir=PCAP_STORAGE_DIR,
+    compression=PCAP_COMPRESSION,
+    snapshot_ttl_seconds=PCAP_SNAPSHOT_TTL_SECONDS,
+    max_active_snapshots=PCAP_MAX_ACTIVE_SNAPSHOTS,
+)
 
 
 def _start_samplers() -> None:
@@ -433,6 +472,15 @@ def _safe_fields(fields: dict[str, Any]) -> dict[str, Any]:
 
 def _guard(token: str | None) -> None:
     if AGENT_TOKEN and not (token and hmac.compare_digest(token.encode(), AGENT_TOKEN.encode())):
+        raise HTTPException(status_code=403, detail="Invalid agent token")
+
+
+def _guard_pcap(token: str | None) -> None:
+    # PCAPs are sensitive and capture control changes what is recorded. Unlike
+    # legacy read endpoints, these routes always fail closed without a token.
+    if not AGENT_TOKEN:
+        raise HTTPException(status_code=503, detail="Packet capture requires PALANTIR_AGENT_TOKEN")
+    if not token or not hmac.compare_digest(token.encode(), AGENT_TOKEN.encode()):
         raise HTTPException(status_code=403, detail="Invalid agent token")
 
 
@@ -1956,6 +2004,16 @@ def discover_capabilities() -> dict[str, Any]:
         "buffer_seconds": round(CPU_SAMPLE_BUFFER * CPU_SAMPLE_INTERVAL),
         "reason": None if cpu_now else "CPU counters could not be sampled (/proc/stat unreadable or sampler not yet warmed up)",
     }
+    pcap_state = _PCAP_MANAGER.status()
+    capabilities["packet_capture"] = {
+        "status": "available" if pcap_state["running"] else "not_configured" if not pcap_state["enabled"] else "unavailable",
+        "enabled": pcap_state["enabled"],
+        "running": pcap_state["running"],
+        "interface": pcap_state["interface"],
+        "snaplen": pcap_state["snaplen"],
+        "coverage_seconds": pcap_state["coverage_seconds"],
+        "last_error": pcap_state["last_error"],
+    }
     return capabilities
 
 
@@ -2206,10 +2264,81 @@ def diagnostics(x_palantir_agent_token: str | None = Header(default=None)) -> di
             "libvirt": str(LIBVIRT_SOCKET) if LIBVIRT_SOCKET.exists() else None,
             "dbus": next((str(path) for path in (Path("/host/run/dbus/system_bus_socket"), Path("/run/dbus/system_bus_socket")) if path.exists()), None),
         },
-        "tools": {name: bool(shutil.which(name)) for name in ("busctl", "systemctl", "journalctl", "virsh", "nft")},
+        "tools": {name: bool(shutil.which(name)) for name in ("busctl", "systemctl", "journalctl", "virsh", "nft", "tcpdump", "zstd")},
+        "packet_capture": _PCAP_MANAGER.status(),
         "journal_dirs": [str(path) for path in (HOST_LOG / "journal", Path("/host/run/log/journal")) if path.is_dir()],
         "virtualization": _virtualization(),
     }
+
+
+@app.get("/api/v1/capture/status")
+def capture_status(x_palantir_agent_token: str | None = Header(default=None)) -> dict[str, Any]:
+    _guard_pcap(x_palantir_agent_token)
+    return {"schema_version": 1, **_PCAP_MANAGER.status()}
+
+
+@app.post("/api/v1/capture/start")
+def capture_start(x_palantir_agent_token: str | None = Header(default=None)) -> dict[str, Any]:
+    _guard_pcap(x_palantir_agent_token)
+    if not _PCAP_MANAGER.start():
+        raise HTTPException(status_code=503, detail=_PCAP_MANAGER.status()["last_error"] or "Packet capture could not start")
+    return {"schema_version": 1, **_PCAP_MANAGER.status()}
+
+
+@app.post("/api/v1/capture/stop")
+def capture_stop(x_palantir_agent_token: str | None = Header(default=None)) -> dict[str, Any]:
+    _guard_pcap(x_palantir_agent_token)
+    _PCAP_MANAGER.stop()
+    return {"schema_version": 1, **_PCAP_MANAGER.status()}
+
+
+@app.post("/api/v1/capture/snapshot")
+def capture_snapshot(x_palantir_agent_token: str | None = Header(default=None)) -> dict[str, Any]:
+    _guard_pcap(x_palantir_agent_token)
+    try:
+        return {"schema_version": 1, **_PCAP_MANAGER.snapshot()}
+    except PCapError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.get("/api/v1/capture/files")
+def capture_files(
+    snapshot_id: str | None = Query(default=None, pattern=r"^[0-9a-f]{32}$"),
+    x_palantir_agent_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    _guard_pcap(x_palantir_agent_token)
+    return {"schema_version": 1, "files": _PCAP_MANAGER.files(snapshot_id)}
+
+
+@app.get("/api/v1/capture/files/{file_id}/content")
+def capture_file_content(
+    file_id: str,
+    x_palantir_agent_token: str | None = Header(default=None),
+) -> FileResponse:
+    _guard_pcap(x_palantir_agent_token)
+    try:
+        path, media_type = _PCAP_MANAGER.file_path(file_id)
+    except PCapFileNotReady as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="PCAP file not found") from exc
+    return FileResponse(
+        path,
+        media_type=media_type,
+        filename=path.name,
+        headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
+    )
+
+
+@app.post("/api/v1/capture/snapshots/{snapshot_id}/release")
+def capture_snapshot_release(
+    snapshot_id: str,
+    x_palantir_agent_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    _guard_pcap(x_palantir_agent_token)
+    if not _PCAP_MANAGER.release_snapshot(snapshot_id):
+        raise HTTPException(status_code=404, detail="PCAP snapshot not found")
+    return {"released": True, "snapshot_id": snapshot_id}
 
 
 @app.get("/api/v1/samples/cpu")

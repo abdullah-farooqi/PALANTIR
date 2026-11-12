@@ -1,8 +1,9 @@
 import logging
+from datetime import datetime, timezone
 from sqlalchemy import select
 from models.node import MonitoredNode
 from models.alert import AlertEvent
-from services.investigations import enqueue_investigation_async
+from services.investigations import enqueue_investigation_async, request_pcap_evidence_for_alert
 
 logger = logging.getLogger(__name__)
 
@@ -62,9 +63,17 @@ class AlertService:
         else:
             alert_status = raw_status
 
+        event_at = None
+        try:
+            if data.get("timestamp") is not None:
+                event_at = datetime.fromtimestamp(float(data["timestamp"]), timezone.utc)
+        except (OverflowError, OSError, TypeError, ValueError):
+            logger.warning("Ignoring invalid source timestamp for alert on %s", safe_hostname)
+
         try:
             event = AlertEvent(
                 node_id=node.id,
+                event_at=event_at,
                 alert_name=str(data.get("alert", "unknown"))[:255],
                 chart=str(data.get("chart", "unknown"))[:255],
                 status=alert_status,
@@ -78,14 +87,20 @@ class AlertService:
             await session.commit()
             if alert_status in {"WARNING", "CRITICAL"}:
                 try:
-                    await enqueue_investigation_async(
+                    investigation, _dispatched = await enqueue_investigation_async(
                         session,
                         node_id=node.id,
                         trigger_type="alert",
                         trigger_id=event.id,
                     )
+                    await request_pcap_evidence_for_alert(
+                        session,
+                        event_id=event.id,
+                        node_id=node.id,
+                        investigation_id=investigation.id,
+                    )
                 except Exception:
-                    logger.exception("Could not enqueue an investigation for alert event %s", event.id)
+                    logger.exception("Could not enqueue investigation or PCAP evidence for alert event %s", event.id)
             return event
         except Exception as exc:
             await session.rollback()

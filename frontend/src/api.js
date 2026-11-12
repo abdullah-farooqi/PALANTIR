@@ -123,6 +123,9 @@ export const api = {
       body: JSON.stringify({ node_id: nodeId, trigger_type: triggerType, trigger_id: triggerId }),
     }),
   deleteInvestigation: (id) => request(`/investigations/${id}`, { method: 'DELETE' }),
+  getInvestigationEvidence: (id) => request(`/investigations/${id}/evidence`),
+  investigationEvidenceDownloadUrl: (id, fileId) =>
+    `${BASE}/investigations/${id}/evidence/${encodeURIComponent(fileId)}/download`,
 
   // ---- fleet / health --------------------------------------------------------
   getFleetSummary: () => request('/fleet/summary'),

@@ -194,6 +194,18 @@ All `/api/v1/*` routes require a Bearer token (`Authorization: Bearer <TOKEN>`).
 - `POST /api/v1/investigations`: Enqueues an automated security investigation. Automatically dispatched on `WARNING` or `CRITICAL` alerts or qualifying anomaly events.
 - `GET /api/v1/investigations/search`: Query and filter investigations by node, status (`queued`, `running`, `completed`, `failed`), and trigger type.
 - `GET /api/v1/health/operations`: Operational health check returning database ping, Redis connectivity, Celery worker status, beat scheduler heartbeat, and task failure rates.
+- `GET /api/v1/investigations/{id}/evidence`: Lists PCAP artifacts and transfer status for an investigation.
+- `GET /api/v1/investigations/{id}/evidence/{file_id}/download`: Downloads a completed artifact from master storage.
+- `GET /api/v1/nodes/{node_id}/capture/status` and `/capture/files`: Read capture state and available collector files.
+- `POST /api/v1/nodes/{node_id}/capture/start` and `/capture/stop`: Admin-only capture controls.
+
+### Network Capture Evidence
+
+Packet capture is opt-in. To enable it on a monitored Linux host, set `PCAP_ENABLED=1` in the setup environment and rerun `scripts/Automatic-Host-Setup.sh`. The installer grants the collector `CAP_NET_RAW`, mounts its state volume, and passes the capture settings through to the container. Capture starts automatically after collector startup; WARNING and CRITICAL alerts ask it to pin the current ring-buffer files and queue a transfer to the master.
+
+The defaults retain up to three closed files, rotate the collector process every five minutes, cap each tcpdump file at about 50 MB, and compress closed files with zstd. tcpdump also uses a three-file size ring inside the active interval, so a high-volume attack overwrites the oldest active segment instead of growing the capture without bound. Up to three snapshots can be pinned while transfers finish; a new snapshot is marked unavailable if that limit is reached. High traffic can fill the size cap before a time interval ends, so the 15-minute history is best effort. The 128-byte snap length truncates each packet but can still include application data; it does not guarantee a headers-only capture or preserve full file/payload contents. Set `PCAP_FILTER_EXCLUDE` to a libpcap filter expression containing the traffic to exclude.
+
+The master stores transferred artifacts on the shared `evidence_data` volume. `PCAP_EVIDENCE_RETENTION_DAYS` and `PCAP_EVIDENCE_STORAGE_LIMIT_GB` control scheduled cleanup; `PCAP_MAX_UPLOAD_MB` caps each transfer. The investigation detail and Network Evidence views show capture timestamps, available duration, size, transfer status, and download action. Collector files are removed after successful transfer or when their snapshot pin expires.
 
 ### Data Retention
 - Metric snapshots are retained for 24 hours by default (`METRICS_RETENTION_HOURS=24`).
