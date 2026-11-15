@@ -546,4 +546,53 @@ CREATE INDEX IF NOT EXISTS idx_pcap_artifacts_sha256 ON pcap_artifacts(sha256) W
 CREATE INDEX IF NOT EXISTS idx_pcap_artifacts_storage_prefix ON pcap_artifacts(storage_prefix) WHERE storage_prefix IS NOT NULL;
 
 
+-- PCAP IOC Allowlist
+CREATE TABLE IF NOT EXISTS pcap_ioc_allowlist (
+    id                  SERIAL PRIMARY KEY,
+    ioc_type            VARCHAR(32) NOT NULL,
+    pattern             VARCHAR(512) NOT NULL,
+    description         TEXT,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pcap_ioc_allowlist_uniq ON pcap_ioc_allowlist(ioc_type, pattern);
+
+-- PCAP Extracted IOCs
+CREATE TABLE IF NOT EXISTS pcap_iocs (
+    id                  SERIAL PRIMARY KEY,
+    run_id              VARCHAR(64) NOT NULL REFERENCES pcap_analysis_runs(run_id) ON DELETE CASCADE,
+    evidence_id         INTEGER NOT NULL REFERENCES investigation_evidence(id) ON DELETE CASCADE,
+    ioc_type            VARCHAR(32) NOT NULL,
+    ioc_value           VARCHAR(512) NOT NULL,
+    context             JSONB NOT NULL DEFAULT '{}',
+    is_allowlisted      BOOLEAN NOT NULL DEFAULT FALSE,
+    threat_intel_match  JSONB,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_pcap_iocs_run ON pcap_iocs(run_id);
+CREATE INDEX IF NOT EXISTS idx_pcap_iocs_evidence ON pcap_iocs(evidence_id);
+CREATE INDEX IF NOT EXISTS idx_pcap_iocs_type_val ON pcap_iocs(ioc_type, ioc_value);
+CREATE INDEX IF NOT EXISTS idx_pcap_iocs_allowlisted ON pcap_iocs(is_allowlisted);
+
+-- Seed default allowlist patterns
+INSERT INTO pcap_ioc_allowlist (ioc_type, pattern, description) VALUES
+    ('ipv4', '10.0.0.0/8', 'RFC 1918 Private Network'),
+    ('ipv4', '172.16.0.0/12', 'RFC 1918 Private Network'),
+    ('ipv4', '192.168.0.0/16', 'RFC 1918 Private Network'),
+    ('ipv4', '127.0.0.0/8', 'Loopback'),
+    ('ipv4', '100.64.0.0/10', 'Carrier-Grade NAT (RFC 6598)'),
+    ('ipv4', '169.254.0.0/16', 'Link-Local (RFC 3927)'),
+    ('ipv4', '224.0.0.0/4', 'Multicast (RFC 5771)'),
+    ('ipv4', '240.0.0.0/4', 'Reserved (RFC 1112)'),
+    ('ipv6', '::1/128', 'IPv6 Loopback'),
+    ('ipv6', 'fc00::/7', 'IPv6 Unique Local Addresses (ULA)'),
+    ('ipv6', 'fe80::/10', 'IPv6 Link-Local'),
+    ('domain', '*.local', 'mDNS / Local network'),
+    ('domain', '*.internal', 'Internal network domain'),
+    ('domain', '*.localhost', 'Localhost domain'),
+    ('domain', '*.home.arpa', 'Home network special-use domain')
+ON CONFLICT (ioc_type, pattern) DO NOTHING;
+
+
 

@@ -79,6 +79,7 @@ class PcapAnalysisRuns(Base):
     flows = relationship("PcapFlows", back_populates="run", cascade="all, delete-orphan")
     sessions = relationship("TcpSessions", back_populates="run", cascade="all, delete-orphan")
     artifacts = relationship("PcapArtifacts", back_populates="run", cascade="all, delete-orphan")
+    iocs = relationship("PcapIocs", back_populates="run", cascade="all, delete-orphan")
 
 
 class PcapFlows(Base):
@@ -315,7 +316,7 @@ class PcapArtifacts(Base):
             name="ck_pcap_artifacts_size_bytes",
         ),
         CheckConstraint(
-            "(storage_key IS NULL AND sha256 IS NULL) OR (storage_key IS NOT NULL AND sha256 IS NOT NULL)",
+            "storage_key IS NULL OR sha256 IS NOT NULL",
             name="ck_pcap_artifacts_storage",
         ),
     )
@@ -324,3 +325,62 @@ class PcapArtifacts(Base):
     evidence = relationship("InvestigationEvidence", foreign_keys=[evidence_id])
     session = relationship("TcpSessions", back_populates="artifacts")
     flow = relationship("PcapFlows", back_populates="artifacts")
+
+
+class PcapIocAllowlist(Base):
+    """Allowlist patterns for suppressing benign IOCs during PCAP analysis."""
+
+    __tablename__ = "pcap_ioc_allowlist"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    ioc_type = Column(String(32), nullable=False)
+    pattern = Column(String(512), nullable=False)
+    description = Column(Text, nullable=True)
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+    __table_args__ = (
+        Index("idx_pcap_ioc_allowlist_uniq", "ioc_type", "pattern", unique=True),
+    )
+
+
+class PcapIocs(Base):
+    """Indicators of Compromise extracted from network flows and forensic artifacts."""
+
+    __tablename__ = "pcap_iocs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    run_id = Column(
+        String(64),
+        ForeignKey("pcap_analysis_runs.run_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    evidence_id = Column(
+        Integer,
+        ForeignKey("investigation_evidence.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    ioc_type = Column(String(32), nullable=False)  # ipv4, ipv6, domain, url, sha256, ja3, port
+    ioc_value = Column(String(512), nullable=False)
+    context = Column(JSONB, nullable=False, default=dict)
+    is_allowlisted = Column(Boolean, nullable=False, default=False, index=True)
+    threat_intel_match = Column(JSONB, nullable=True)
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+    __table_args__ = (
+        Index("idx_pcap_iocs_type_val", "ioc_type", "ioc_value"),
+    )
+
+    run = relationship("PcapAnalysisRuns", back_populates="iocs")
+    evidence = relationship("InvestigationEvidence", foreign_keys=[evidence_id])
+

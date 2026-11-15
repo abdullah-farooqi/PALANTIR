@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import fnmatch
 import gzip
 import ipaddress
 import logging
@@ -39,7 +40,14 @@ from core.config import settings
 from core.database import get_sync_session
 from core.storage import get_storage_backend
 from models.investigation_evidence import InvestigationEvidence
-from models.pcap_analysis import PcapAnalysisRuns, PcapArtifacts, PcapFlows, TcpSessions
+from models.pcap_analysis import (
+    PcapAnalysisRuns,
+    PcapArtifacts,
+    PcapFlows,
+    PcapIocAllowlist,
+    PcapIocs,
+    TcpSessions,
+)
 from workers.celery_app import celery_app
 
 logger = logging.getLogger(__name__)
@@ -1364,7 +1372,7 @@ def pcap_analysis_extract_artifacts(
                             )
                         )
 
-        # Persist artifacts and complete analysis run
+        # Persist artifacts and proceed to next step
         with get_sync_session() as session:
             for i in range(0, len(artifacts_to_insert), 500):
                 session.add_all(artifacts_to_insert[i:i + 500])
@@ -1373,8 +1381,7 @@ def pcap_analysis_extract_artifacts(
             run = session.execute(
                 select(PcapAnalysisRuns).where(PcapAnalysisRuns.run_id == run_id)
             ).scalar_one()
-            run.status = "complete"
-            run.completed_at = datetime.now(timezone.utc)
+            run.current_step = "extract_artifacts"
             session.commit()
 
         return {
@@ -1393,6 +1400,235 @@ def pcap_analysis_extract_artifacts(
             if run:
                 run.status = "failed"
                 run.error_step = "extract_artifacts"
+                run.error_message = str(exc)[:1000]
+                session.commit()
+        raise
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 6: IOC Extraction & Threat Surface Mapping (Milestone 3)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def is_ioc_allowlisted(
+    ioc_type: str,
+    ioc_value: str,
+    allowlist_entries: list[tuple[str, str, str]],
+) -> tuple[bool, str | None]:
+    """Evaluate an IOC against RFC standards and configured allowlist rules."""
+    if ioc_type in ("ipv4", "ipv6"):
+        try:
+            ip = ipaddress.ip_address(ioc_value)
+            if ip.is_private:
+                return True, "RFC 1918 Private Network"
+            if ip.is_loopback:
+                return True, "Loopback Address"
+            if ip.is_link_local:
+                return True, "Link-Local Address"
+            if ip.is_multicast:
+                return True, "Multicast Address"
+            if ip.is_reserved:
+                return True, "IETF Reserved Address"
+
+            for a_type, pattern, desc in allowlist_entries:
+                if a_type in (ioc_type, "ip"):
+                    try:
+                        net = ipaddress.ip_network(pattern, strict=False)
+                        if ip in net:
+                            return True, desc or f"Matched allowlist CIDR {pattern}"
+                    except ValueError:
+                        if ioc_value == pattern:
+                            return True, desc or f"Matched allowlist {pattern}"
+        except ValueError:
+            pass
+
+    elif ioc_type == "domain":
+        clean_domain = ioc_value.lower().strip(".")
+        for a_type, pattern, desc in allowlist_entries:
+            if a_type == "domain":
+                clean_pat = pattern.lower().strip(".")
+                if fnmatch.fnmatch(clean_domain, clean_pat):
+                    return True, desc or f"Matched domain pattern {pattern}"
+                if clean_pat.startswith("*.") and clean_domain.endswith(clean_pat[1:]):
+                    return True, desc or f"Matched domain suffix {pattern}"
+
+    elif ioc_type == "port":
+        try:
+            p = int(ioc_value)
+            if p in (80, 443, 53, 22, 123, 8080):
+                return True, "Standard well-known port"
+            for a_type, pattern, desc in allowlist_entries:
+                if a_type == "port" and str(p) == pattern:
+                    return True, desc or f"Matched port allowlist {pattern}"
+        except ValueError:
+            pass
+
+    return False, None
+
+
+@celery_app.task(bind=True, name="workers.pcap_pipeline.pcap_analysis_extract_iocs")
+def pcap_analysis_extract_iocs(
+    self,
+    prev_result_or_evidence_id: Any,
+    run_id: str | None = None,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Extract public/private IPs, domains, URLs, JA3, ports, and match against allowlists."""
+    if isinstance(prev_result_or_evidence_id, dict):
+        evidence_id = prev_result_or_evidence_id.get("evidence_id")
+        run_id = prev_result_or_evidence_id.get("run_id", run_id)
+    else:
+        evidence_id = int(prev_result_or_evidence_id)
+
+    if not run_id:
+        raise ValueError("Missing run_id in pcap_analysis_extract_iocs")
+
+    logger.info("Extracting IOCs for evidence %s (run %s)", evidence_id, run_id)
+
+    with get_sync_session() as session:
+        run = session.execute(
+            select(PcapAnalysisRuns).where(PcapAnalysisRuns.run_id == run_id)
+        ).scalar_one_or_none()
+        if run is None:
+            raise ValueError(f"Run {run_id} not found in database")
+        run.current_step = "extract_iocs"
+        session.commit()
+
+        # Load allowlist
+        allowlist_rows = session.execute(select(PcapIocAllowlist)).scalars().all()
+        allowlist = [(row.ioc_type, row.pattern, row.description or "") for row in allowlist_rows]
+
+        # Fetch flows and artifacts for this run
+        flows = session.execute(
+            select(PcapFlows).where(PcapFlows.run_id == run_id)
+        ).scalars().all()
+
+        artifacts = session.execute(
+            select(PcapArtifacts).where(PcapArtifacts.run_id == run_id)
+        ).scalars().all()
+
+    candidates: dict[tuple[str, str], dict[str, Any]] = {}
+
+    def add_ioc(ioc_type: str, ioc_val: str, ctx: dict[str, Any]) -> None:
+        ioc_val = ioc_val.strip()
+        if not ioc_val:
+            return
+        key = (ioc_type, ioc_val)
+        if key not in candidates:
+            is_allow, match_desc = is_ioc_allowlisted(ioc_type, ioc_val, allowlist)
+            candidates[key] = {
+                "ioc_type": ioc_type,
+                "ioc_value": ioc_val,
+                "context": ctx,
+                "is_allowlisted": is_allow,
+                "threat_intel_match": {"allowlist_match": match_desc} if match_desc else None,
+            }
+        else:
+            for k, v in ctx.items():
+                if k not in candidates[key]["context"]:
+                    candidates[key]["context"][k] = v
+
+    SUSPICIOUS_PORTS = {
+        4444, 1337, 31337, 6667, 8888, 5555, 9001, 7777, 2222, 6666, 9999, 12345
+    }
+
+    # 1. Flow IPs & Ports
+    for fl in flows:
+        if fl.src_ip:
+            ip_str = str(fl.src_ip)
+            itype = "ipv6" if ":" in ip_str else "ipv4"
+            add_ioc(itype, ip_str, {"source": "flow", "protocol": fl.protocol, "role": "src"})
+        if fl.dst_ip:
+            ip_str = str(fl.dst_ip)
+            itype = "ipv6" if ":" in ip_str else "ipv4"
+            add_ioc(itype, ip_str, {"source": "flow", "protocol": fl.protocol, "role": "dst"})
+        for p in (fl.src_port, fl.dst_port):
+            if p and p in SUSPICIOUS_PORTS:
+                add_ioc("port", str(p), {"source": "flow", "protocol": fl.protocol, "flow_key": fl.flow_key})
+
+    # 2. Artifact domains, URLs, JA3, Hashes
+    for art in artifacts:
+        meta = art.metadata_json or {}
+        if art.artifact_type in ("dns_query", "dns_response"):
+            qname = meta.get("query_name")
+            if qname:
+                add_ioc("domain", qname, {"source": "dns", "type": art.artifact_type})
+            for ans in meta.get("answers") or []:
+                if ans.get("type") == 1 and ans.get("rdata"):
+                    add_ioc("ipv4", ans["rdata"], {"source": "dns_answer", "domain": qname})
+
+        elif art.artifact_type == "tls_client_hello":
+            sni = meta.get("sni")
+            if sni:
+                add_ioc("domain", sni, {"source": "tls_sni"})
+            ja3 = meta.get("ja3_hash")
+            if ja3:
+                add_ioc("ja3", ja3, {"source": "tls_ja3", "sni": sni})
+
+        elif art.artifact_type == "tls_ja3":
+            ja3 = meta.get("ja3_hash")
+            if ja3:
+                add_ioc("ja3", ja3, {"source": "tls_ja3"})
+
+        elif art.artifact_type == "http_request":
+            headers = meta.get("headers") or {}
+            host = headers.get("host")
+            if host:
+                host_domain = host.split(":")[0].strip()
+                add_ioc("domain", host_domain, {"source": "http_host"})
+            uri = meta.get("uri")
+            if host and uri:
+                add_ioc("url", f"http://{host}{uri}", {"source": "http_request", "method": meta.get("method")})
+
+        if art.sha256:
+            add_ioc("sha256", art.sha256, {"source": "artifact", "artifact_type": art.artifact_type})
+
+    iocs_to_insert = [
+        PcapIocs(
+            run_id=run_id,
+            evidence_id=evidence_id,
+            ioc_type=c["ioc_type"],
+            ioc_value=c["ioc_value"],
+            context=c["context"],
+            is_allowlisted=c["is_allowlisted"],
+            threat_intel_match=c["threat_intel_match"],
+        )
+        for c in candidates.values()
+    ]
+
+    allowlisted_count = sum(1 for c in candidates.values() if c["is_allowlisted"])
+    public_ips = sum(1 for c in candidates.values() if c["ioc_type"] in ("ipv4", "ipv6") and not c["is_allowlisted"])
+
+    try:
+        with get_sync_session() as session:
+            for i in range(0, len(iocs_to_insert), 500):
+                session.add_all(iocs_to_insert[i:i + 500])
+                session.flush()
+
+            run = session.execute(
+                select(PcapAnalysisRuns).where(PcapAnalysisRuns.run_id == run_id)
+            ).scalar_one()
+            run.status = "complete"
+            run.completed_at = datetime.now(timezone.utc)
+            session.commit()
+
+        return {
+            "run_id": run_id,
+            "evidence_id": evidence_id,
+            "ioc_count": len(iocs_to_insert),
+            "public_ip_count": public_ips,
+            "allowlisted_count": allowlisted_count,
+            "status": "complete",
+        }
+
+    except Exception as exc:
+        logger.warning("IOC extraction failed for run %s: %s", run_id, exc)
+        with get_sync_session() as session:
+            run = session.execute(
+                select(PcapAnalysisRuns).where(PcapAnalysisRuns.run_id == run_id)
+            ).scalar_one_or_none()
+            if run:
+                run.status = "failed"
+                run.error_step = "extract_iocs"
                 run.error_message = str(exc)[:1000]
                 session.commit()
         raise
@@ -1431,6 +1667,7 @@ def start_pcap_analysis(evidence_id: int, run_id: str | None = None) -> str:
         pcap_analysis_extract_flows.s(run_id=run_id),
         pcap_analysis_reconstruct_sessions.s(run_id=run_id),
         pcap_analysis_extract_artifacts.s(run_id=run_id),
+        pcap_analysis_extract_iocs.s(run_id=run_id),
     )
     pipeline_chain.apply_async()
     logger.info("Enqueued PCAP analysis pipeline for evidence %s with run_id %s", evidence_id, run_id)

@@ -17,13 +17,21 @@ from core.storage import get_storage_backend
 from models.investigation import AgentInvestigation
 from models.investigation_evidence import InvestigationEvidence
 from models.node import MonitoredNode
-from models.pcap_analysis import PcapAnalysisRuns, PcapArtifacts, PcapFlows, TcpSessions
+from models.pcap_analysis import (
+    PcapAnalysisRuns,
+    PcapArtifacts,
+    PcapFlows,
+    PcapIocAllowlist,
+    PcapIocs,
+    TcpSessions,
+)
 from workers.pcap_pipeline import (
     _read_pure_python_packets,
     normalize_flow_key,
     open_decompressed_pcap,
     pcap_analysis_extract_artifacts,
     pcap_analysis_extract_flows,
+    pcap_analysis_extract_iocs,
     pcap_analysis_reconstruct_sessions,
     pcap_analysis_validate,
     start_pcap_analysis,
@@ -675,4 +683,185 @@ def test_snaplen_truncation_confidence(tmp_path, monkeypatch):
         assert sess.snaplen == 128
         assert sess.payload_truncated is True
         assert sess.confidence == "low"
+
+
+def test_ioc_extraction_flows_and_artifacts(tmp_path, monkeypatch):
+    """Verify IOC extraction correctly identifies public IPs, private IPs, suspicious ports, and domains."""
+    monkeypatch.setattr(settings, "PCAP_STORAGE_DIR", tmp_path)
+
+    with get_sync_session() as session:
+        node = MonitoredNode(hostname="test-node-iocs", collector_url="http://127.0.0.1:20000", active=True)
+        session.add(node)
+        session.flush()
+        inv = AgentInvestigation(node_id=node.id, trigger_type="manual", status="complete")
+        session.add(inv)
+        session.flush()
+        ev = InvestigationEvidence(
+            investigation_id=inv.id,
+            node_id=node.id,
+            evidence_type="pcap_collection",
+            file_name="iocs.pcap",
+            storage_key="iocs.pcap",
+            status="complete",
+        )
+        session.add(ev)
+        session.flush()
+        run_id = uuid4().hex
+        run = PcapAnalysisRuns(
+            run_id=run_id,
+            evidence_id=ev.id,
+            investigation_id=inv.id,
+            node_id=node.id,
+            status="running",
+            current_step="extract_artifacts",
+        )
+        session.add(run)
+        session.flush()
+
+        # Add flows: 1 RFC1918 IP, 1 Public IP, 1 Suspicious Port (4444)
+        fl1 = PcapFlows(
+            run_id=run_id,
+            evidence_id=ev.id,
+            src_ip="192.168.1.100",
+            dst_ip="93.184.216.34",  # example.com public IP
+            src_port=54321,
+            dst_port=4444,  # Suspicious Metasploit/reverse shell port
+            protocol="tcp",
+            flow_key="tcp:192.168.1.100:54321-93.184.216.34:4444",
+            packet_count=10,
+            byte_count=1200,
+            first_seen=datetime.now(timezone.utc),
+            last_seen=datetime.now(timezone.utc),
+            bidirectional=True,
+        )
+        session.add(fl1)
+
+        # Add artifacts: DNS query for malicious domain, TLS SNI for *.internal domain
+        art_dns = PcapArtifacts(
+            run_id=run_id,
+            evidence_id=ev.id,
+            artifact_type="dns_query",
+            metadata_json={"query_name": "malicious-c2.cc", "is_response": False},
+            size_bytes=40,
+        )
+        art_tls = PcapArtifacts(
+            run_id=run_id,
+            evidence_id=ev.id,
+            artifact_type="tls_client_hello",
+            metadata_json={"sni": "gateway.internal", "ja3_hash": "b32309a26ce516158d71234bcabcde12"},
+            size_bytes=100,
+        )
+        art_http = PcapArtifacts(
+            run_id=run_id,
+            evidence_id=ev.id,
+            artifact_type="http_request",
+            metadata_json={"headers": {"host": "bad-actor.net"}, "uri": "/payload.sh", "method": "GET"},
+            size_bytes=80,
+        )
+        session.add_all([art_dns, art_tls, art_http])
+        session.commit()
+        ev_id = ev.id
+
+    res = pcap_analysis_extract_iocs(ev_id, run_id=run_id)
+    assert res["status"] == "complete"
+    assert res["ioc_count"] >= 6
+    assert res["public_ip_count"] >= 1
+
+    with get_sync_session() as session:
+        iocs = session.execute(
+            select(PcapIocs).where(PcapIocs.run_id == run_id)
+        ).scalars().all()
+
+        ioc_dict = {(i.ioc_type, i.ioc_value): i for i in iocs}
+
+        # 1. 192.168.1.100 is allowlisted RFC 1918
+        assert ("ipv4", "192.168.1.100") in ioc_dict
+        assert ioc_dict[("ipv4", "192.168.1.100")].is_allowlisted is True
+
+        # 2. 93.184.216.34 is public IP (not allowlisted)
+        assert ("ipv4", "93.184.216.34") in ioc_dict
+        assert ioc_dict[("ipv4", "93.184.216.34")].is_allowlisted is False
+
+        # 3. Port 4444 is flagged as suspicious port IOC
+        assert ("port", "4444") in ioc_dict
+        assert ioc_dict[("port", "4444")].is_allowlisted is False
+
+        # 4. gateway.internal matches *.internal allowlist
+        assert ("domain", "gateway.internal") in ioc_dict
+        assert ioc_dict[("domain", "gateway.internal")].is_allowlisted is True
+
+        # 5. malicious-c2.cc is domain IOC (not allowlisted)
+        assert ("domain", "malicious-c2.cc") in ioc_dict
+        assert ioc_dict[("domain", "malicious-c2.cc")].is_allowlisted is False
+
+        # 6. bad-actor.net is domain IOC from HTTP host header
+        assert ("domain", "bad-actor.net") in ioc_dict
+        assert ioc_dict[("domain", "bad-actor.net")].is_allowlisted is False
+
+
+def test_ioc_allowlist_custom_entry(tmp_path, monkeypatch):
+    """Custom allowlist entry suppresses matching partner domain IOC."""
+    monkeypatch.setattr(settings, "PCAP_STORAGE_DIR", tmp_path)
+
+    with get_sync_session() as session:
+        # Add custom allowlist pattern
+        custom_rule = PcapIocAllowlist(
+            ioc_type="domain",
+            pattern="*.trusted-partner.com",
+            description="Verified partner organization",
+        )
+        session.add(custom_rule)
+
+        node = MonitoredNode(hostname="test-node-custom-allow", collector_url="http://127.0.0.1:20000", active=True)
+        session.add(node)
+        session.flush()
+        inv = AgentInvestigation(node_id=node.id, trigger_type="manual", status="complete")
+        session.add(inv)
+        session.flush()
+        ev = InvestigationEvidence(
+            investigation_id=inv.id,
+            node_id=node.id,
+            evidence_type="pcap_collection",
+            file_name="custom_allow.pcap",
+            storage_key="custom_allow.pcap",
+            status="complete",
+        )
+        session.add(ev)
+        session.flush()
+        run_id = uuid4().hex
+        run = PcapAnalysisRuns(
+            run_id=run_id,
+            evidence_id=ev.id,
+            investigation_id=inv.id,
+            node_id=node.id,
+            status="running",
+            current_step="extract_artifacts",
+        )
+        session.add(run)
+        session.flush()
+
+        art = PcapArtifacts(
+            run_id=run_id,
+            evidence_id=ev.id,
+            artifact_type="tls_client_hello",
+            metadata_json={"sni": "api.trusted-partner.com"},
+            size_bytes=80,
+        )
+        session.add(art)
+        session.commit()
+        ev_id = ev.id
+
+    res = pcap_analysis_extract_iocs(ev_id, run_id=run_id)
+    assert res["status"] == "complete"
+
+    with get_sync_session() as session:
+        ioc = session.execute(
+            select(PcapIocs).where(
+                PcapIocs.run_id == run_id,
+                PcapIocs.ioc_value == "api.trusted-partner.com",
+            )
+        ).scalar_one()
+        assert ioc.is_allowlisted is True
+        assert "Verified partner organization" in str(ioc.threat_intel_match)
+
 
