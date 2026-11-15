@@ -11,6 +11,15 @@ from models.node import MonitoredNode
 from models.alert import AlertEvent
 from models.investigation_evidence import InvestigationEvidence
 from models.investigation import AgentInvestigation
+from models.pcap_analysis import (
+    PcapAnalysisRuns,
+    PcapArtifacts,
+    PcapCveMatches,
+    PcapFlows,
+    PcapIocs,
+    PcapSeverityScores,
+    TcpSessions,
+)
 from core.database import AsyncSessionLocal
 from services import investigations as investigation_service
 from services import alerts as alert_service
@@ -573,3 +582,146 @@ async def test_warning_alert_snapshot_is_recorded_and_transfer_is_queued(
         assert evidence.status == "queued"
         assert evidence.alert_event_id == event_id
         assert evidence.capture_snapshot_id == "a" * 32
+
+
+@pytest.mark.asyncio
+async def test_investigation_pcap_analysis_api(
+    client: AsyncClient,
+    existing_node: MonitoredNode,
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(settings, "PCAP_STORAGE_DIR", tmp_path)
+    created = await client.post(
+        "/api/v1/investigations",
+        json={"node_id": existing_node.id, "trigger_type": "manual"},
+    )
+    assert created.status_code == 202
+    investigation_id = created.json()["id"]
+
+    run_id = uuid4().hex
+    async with AsyncSessionLocal() as session:
+        ev = InvestigationEvidence(
+            investigation_id=investigation_id,
+            node_id=existing_node.id,
+            evidence_type="pcap_collection",
+            file_name="analysis.pcap",
+            storage_key="analysis.pcap",
+            status="complete",
+        )
+        session.add(ev)
+        await session.flush()
+        ev_id = ev.id
+
+        run = PcapAnalysisRuns(
+            run_id=run_id,
+            evidence_id=ev_id,
+            investigation_id=investigation_id,
+            node_id=existing_node.id,
+            status="complete",
+            current_step="score_severity",
+        )
+        session.add(run)
+        await session.flush()
+
+        score = PcapSeverityScores(
+            run_id=run_id,
+            evidence_id=ev_id,
+            investigation_id=investigation_id,
+            overall_score=8.5,
+            overall_severity="high",
+            cvss_base_max=10.0,
+            ioc_risk_score=6.0,
+            anomaly_score=4.0,
+            factors={"cvss_base_max": 10.0},
+        )
+        session.add(score)
+
+        flow = PcapFlows(
+            run_id=run_id,
+            evidence_id=ev_id,
+            src_ip="192.168.1.100",
+            dst_ip="93.184.216.34",
+            src_port=54321,
+            dst_port=443,
+            protocol="tcp",
+            flow_key="tcp:192.168.1.100:54321-93.184.216.34:443",
+            packet_count=20,
+            byte_count=2500,
+            first_seen=datetime.now(timezone.utc),
+            last_seen=datetime.now(timezone.utc),
+        )
+        session.add(flow)
+
+        cve = PcapCveMatches(
+            run_id=run_id,
+            evidence_id=ev_id,
+            cve_id="CVE-2021-44228",
+            cvss_score=10.0,
+            severity="critical",
+            match_type="payload_signature",
+            confidence="high",
+            description="Log4Shell attempt",
+        )
+        session.add(cve)
+
+        ioc = PcapIocs(
+            run_id=run_id,
+            evidence_id=ev_id,
+            ioc_type="ipv4",
+            ioc_value="93.184.216.34",
+            is_allowlisted=False,
+        )
+        session.add(ioc)
+
+        from core.storage import get_storage_backend
+        storage = get_storage_backend()
+        storage_key, _sha = storage.save_artifact(f"analysis-{run_id}", b"<h1>Artifact Body</h1>", "html")
+
+        art = PcapArtifacts(
+            run_id=run_id,
+            evidence_id=ev_id,
+            artifact_type="http_response",
+            content_type="text/html",
+            size_bytes=22,
+            sha256=_sha,
+            storage_key=storage_key,
+            metadata_json={"status_code": 200},
+        )
+        session.add(art)
+        await session.commit()
+        art_id = art.id
+
+    # 1. Trigger endpoint
+    monkeypatch.setattr("api.v1.investigations.start_pcap_analysis", lambda _ev_id: "new-test-run-id")
+    trigger_resp = await client.post(f"/api/v1/investigations/{investigation_id}/analysis/trigger")
+    assert trigger_resp.status_code == 202
+    assert trigger_resp.json()["run_id"] == "new-test-run-id"
+
+    # 2. List runs endpoint
+    list_resp = await client.get(f"/api/v1/investigations/{investigation_id}/analysis")
+    assert list_resp.status_code == 200
+    list_json = list_resp.json()
+    assert list_json["total_runs"] >= 1
+    run_item = next(r for r in list_json["items"] if r["run_id"] == run_id)
+    assert run_item["status"] == "complete"
+    assert run_item["severity_score"]["overall_score"] == 8.5
+    assert run_item["flow_count"] == 1
+    assert run_item["cve_match_count"] == 1
+
+    # 3. Detail run endpoint
+    detail_resp = await client.get(f"/api/v1/investigations/{investigation_id}/analysis/{run_id}")
+    assert detail_resp.status_code == 200
+    detail_json = detail_resp.json()
+    assert detail_json["severity"]["overall_severity"] == "high"
+    assert len(detail_json["flows"]) == 1
+    assert len(detail_json["cve_matches"]) == 1
+    assert detail_json["cve_matches"][0]["cve_id"] == "CVE-2021-44228"
+    assert len(detail_json["iocs"]) == 1
+
+    # 4. Artifact download endpoint
+    dl_resp = await client.get(f"/api/v1/investigations/{investigation_id}/analysis/{run_id}/artifacts/{art_id}/download")
+    assert dl_resp.status_code == 200
+    assert dl_resp.content == b"<h1>Artifact Body</h1>"
+    assert dl_resp.headers["content-type"].startswith("text/html")
+

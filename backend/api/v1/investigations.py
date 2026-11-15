@@ -18,6 +18,17 @@ from models.anomaly import AnomalyEvent
 from models.investigation import AgentInvestigation
 from models.investigation_evidence import InvestigationEvidence
 from models.node import MonitoredNode
+from models.pcap_analysis import (
+    PcapAnalysisRuns,
+    PcapArtifacts,
+    PcapCveMatches,
+    PcapFlows,
+    PcapIocs,
+    PcapSeverityScores,
+    TcpSessions,
+)
+from core.storage import get_storage_backend
+from workers.pcap_pipeline import start_pcap_analysis
 from services.nodes import NodeService
 from services.investigations import enqueue_investigation_async
 
@@ -278,6 +289,293 @@ async def download_pcap_evidence(
         file_path,
         media_type=media_type,
         filename=download_name,
+        headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
+    )
+
+
+@router.get("/{investigation_id}/analysis")
+async def list_investigation_analysis_runs(
+    investigation_id: int = Path(..., ge=1),
+    session: AsyncSession = Depends(get_session),
+    _role: None = Depends(require_read),
+) -> dict[str, Any]:
+    inv = (await session.execute(
+        select(AgentInvestigation.id).where(AgentInvestigation.id == investigation_id)
+    )).scalar_one_or_none()
+    if inv is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Investigation not found")
+
+    runs = (await session.execute(
+        select(PcapAnalysisRuns)
+        .where(PcapAnalysisRuns.investigation_id == investigation_id)
+        .order_by(PcapAnalysisRuns.started_at.desc(), PcapAnalysisRuns.id.desc())
+    )).scalars().all()
+
+    items = []
+    for r in runs:
+        score_row = (await session.execute(
+            select(PcapSeverityScores).where(PcapSeverityScores.run_id == r.run_id)
+        )).scalar_one_or_none()
+
+        flow_count = (await session.execute(
+            select(func.count(PcapFlows.id)).where(PcapFlows.run_id == r.run_id)
+        )).scalar() or 0
+        session_count = (await session.execute(
+            select(func.count(TcpSessions.id)).where(TcpSessions.run_id == r.run_id)
+        )).scalar() or 0
+        artifact_count = (await session.execute(
+            select(func.count(PcapArtifacts.id)).where(PcapArtifacts.run_id == r.run_id)
+        )).scalar() or 0
+        ioc_count = (await session.execute(
+            select(func.count(PcapIocs.id)).where(PcapIocs.run_id == r.run_id)
+        )).scalar() or 0
+        cve_count = (await session.execute(
+            select(func.count(PcapCveMatches.id)).where(PcapCveMatches.run_id == r.run_id)
+        )).scalar() or 0
+
+        items.append({
+            "run_id": r.run_id,
+            "evidence_id": r.evidence_id,
+            "status": r.status,
+            "current_step": r.current_step,
+            "started_at": r.started_at.isoformat() if r.started_at else None,
+            "completed_at": r.completed_at.isoformat() if r.completed_at else None,
+            "error_step": r.error_step,
+            "error_message": r.error_message,
+            "rollback_started_at": r.rollback_started_at.isoformat() if r.rollback_started_at else None,
+            "rollback_completed_at": r.rollback_completed_at.isoformat() if r.rollback_completed_at else None,
+            "flow_count": flow_count,
+            "session_count": session_count,
+            "artifact_count": artifact_count,
+            "ioc_count": ioc_count,
+            "cve_match_count": cve_count,
+            "severity_score": {
+                "overall_score": float(score_row.overall_score),
+                "overall_severity": score_row.overall_severity,
+                "cvss_base_max": float(score_row.cvss_base_max or 0.0),
+                "ioc_risk_score": float(score_row.ioc_risk_score or 0.0),
+                "anomaly_score": float(score_row.anomaly_score or 0.0),
+            } if score_row else None,
+        })
+
+    return {
+        "schema_version": 1,
+        "investigation_id": investigation_id,
+        "total_runs": len(items),
+        "items": items,
+    }
+
+
+@router.get("/{investigation_id}/analysis/{run_id}")
+async def get_investigation_analysis_detail(
+    investigation_id: int = Path(..., ge=1),
+    run_id: str = Path(..., min_length=1),
+    session: AsyncSession = Depends(get_session),
+    _role: None = Depends(require_read),
+) -> dict[str, Any]:
+    run = (await session.execute(
+        select(PcapAnalysisRuns).where(
+            PcapAnalysisRuns.run_id == run_id,
+            PcapAnalysisRuns.investigation_id == investigation_id,
+        )
+    )).scalar_one_or_none()
+    if run is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Analysis run not found")
+
+    score_row = (await session.execute(
+        select(PcapSeverityScores).where(PcapSeverityScores.run_id == run_id)
+    )).scalar_one_or_none()
+
+    flows = (await session.execute(
+        select(PcapFlows).where(PcapFlows.run_id == run_id).limit(100)
+    )).scalars().all()
+
+    tcp_sessions = (await session.execute(
+        select(TcpSessions).where(TcpSessions.run_id == run_id).limit(100)
+    )).scalars().all()
+
+    artifacts = (await session.execute(
+        select(PcapArtifacts).where(PcapArtifacts.run_id == run_id).limit(100)
+    )).scalars().all()
+
+    iocs = (await session.execute(
+        select(PcapIocs).where(PcapIocs.run_id == run_id).limit(100)
+    )).scalars().all()
+
+    cves = (await session.execute(
+        select(PcapCveMatches).where(PcapCveMatches.run_id == run_id).limit(100)
+    )).scalars().all()
+
+    return {
+        "schema_version": 1,
+        "run_id": run.run_id,
+        "evidence_id": run.evidence_id,
+        "investigation_id": run.investigation_id,
+        "status": run.status,
+        "current_step": run.current_step,
+        "started_at": run.started_at.isoformat() if run.started_at else None,
+        "completed_at": run.completed_at.isoformat() if run.completed_at else None,
+        "error_message": run.error_message,
+        "severity": {
+            "overall_score": float(score_row.overall_score),
+            "overall_severity": score_row.overall_severity,
+            "cvss_base_max": float(score_row.cvss_base_max or 0.0),
+            "ioc_risk_score": float(score_row.ioc_risk_score or 0.0),
+            "anomaly_score": float(score_row.anomaly_score or 0.0),
+            "factors": score_row.factors,
+            "calculated_at": score_row.calculated_at.isoformat() if score_row.calculated_at else None,
+        } if score_row else None,
+        "flows": [
+            {
+                "id": f.id,
+                "src_ip": str(f.src_ip),
+                "dst_ip": str(f.dst_ip),
+                "src_port": f.src_port,
+                "dst_port": f.dst_port,
+                "protocol": f.protocol,
+                "packet_count": f.packet_count,
+                "byte_count": f.byte_count,
+                "bidirectional": f.bidirectional,
+                "duration_seconds": f.duration_seconds,
+                "flags": f.flags,
+            }
+            for f in flows
+        ],
+        "sessions": [
+            {
+                "id": s.id,
+                "src_ip": str(s.src_ip),
+                "dst_ip": str(s.dst_ip),
+                "src_port": s.src_port,
+                "dst_port": s.dst_port,
+                "state": s.state,
+                "client_isn": s.client_isn,
+                "server_isn": s.server_isn,
+                "reassembled_bytes": s.reassembled_bytes,
+                "confidence": s.confidence,
+                "payload_truncated": s.payload_truncated,
+            }
+            for s in tcp_sessions
+        ],
+        "artifacts": [
+            {
+                "id": a.id,
+                "artifact_type": a.artifact_type,
+                "content_type": a.content_type,
+                "size_bytes": a.size_bytes,
+                "sha256": a.sha256,
+                "has_file": bool(a.storage_key),
+                "metadata": a.metadata_json,
+            }
+            for a in artifacts
+        ],
+        "iocs": [
+            {
+                "id": i.id,
+                "ioc_type": i.ioc_type,
+                "ioc_value": i.ioc_value,
+                "is_allowlisted": i.is_allowlisted,
+                "threat_intel_match": i.threat_intel_match,
+                "context": i.context,
+            }
+            for i in iocs
+        ],
+        "cve_matches": [
+            {
+                "id": c.id,
+                "cve_id": c.cve_id,
+                "cvss_score": float(c.cvss_score) if c.cvss_score is not None else None,
+                "severity": c.severity,
+                "match_type": c.match_type,
+                "confidence": c.confidence,
+                "description": c.description,
+                "matched_data": c.matched_data,
+            }
+            for c in cves
+        ],
+    }
+
+
+@router.post("/{investigation_id}/analysis/trigger", status_code=status.HTTP_202_ACCEPTED)
+async def trigger_pcap_analysis_endpoint(
+    investigation_id: int = Path(..., ge=1),
+    evidence_id: Optional[int] = Query(None, ge=1),
+    session: AsyncSession = Depends(get_session),
+    _role: None = Depends(require_admin),
+) -> dict[str, Any]:
+    inv = (await session.execute(
+        select(AgentInvestigation.id).where(AgentInvestigation.id == investigation_id)
+    )).scalar_one_or_none()
+    if inv is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Investigation not found")
+
+    if evidence_id:
+        ev = (await session.execute(
+            select(InvestigationEvidence).where(
+                InvestigationEvidence.id == evidence_id,
+                InvestigationEvidence.investigation_id == investigation_id,
+            )
+        )).scalar_one_or_none()
+        if ev is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Evidence not found")
+    else:
+        ev = (await session.execute(
+            select(InvestigationEvidence)
+            .where(
+                InvestigationEvidence.investigation_id == investigation_id,
+                InvestigationEvidence.status == "complete",
+            )
+            .order_by(InvestigationEvidence.captured_at.desc(), InvestigationEvidence.id.desc())
+            .limit(1)
+        )).scalar_one_or_none()
+        if ev is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No complete PCAP evidence available for this investigation",
+            )
+
+    run_id = start_pcap_analysis(ev.id)
+    return {
+        "status": "pending",
+        "run_id": run_id,
+        "evidence_id": ev.id,
+        "investigation_id": investigation_id,
+    }
+
+
+@router.get("/{investigation_id}/analysis/{run_id}/artifacts/{artifact_id}/download")
+async def download_pcap_artifact(
+    investigation_id: int = Path(..., ge=1),
+    run_id: str = Path(..., min_length=1),
+    artifact_id: int = Path(..., ge=1),
+    session: AsyncSession = Depends(get_session),
+    _role: None = Depends(require_read),
+) -> FileResponse:
+    art = (await session.execute(
+        select(PcapArtifacts).where(
+            PcapArtifacts.id == artifact_id,
+            PcapArtifacts.run_id == run_id,
+        )
+    )).scalar_one_or_none()
+    if art is None or not art.storage_key:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Artifact file not found")
+
+    storage = get_storage_backend()
+    file_path = (storage.root / art.storage_key).resolve()
+    try:
+        file_path.relative_to(storage.root)
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid artifact storage path")
+
+    if not file_path.is_file():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Artifact file missing from disk")
+
+    filename = file_path.name
+    media_type = art.content_type or "application/octet-stream"
+    return FileResponse(
+        file_path,
+        media_type=media_type,
+        filename=filename,
         headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
     )
 
