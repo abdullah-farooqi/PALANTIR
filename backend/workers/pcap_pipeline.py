@@ -8,6 +8,7 @@ import gzip
 import ipaddress
 import logging
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -43,9 +44,11 @@ from models.investigation_evidence import InvestigationEvidence
 from models.pcap_analysis import (
     PcapAnalysisRuns,
     PcapArtifacts,
+    PcapCveMatches,
     PcapFlows,
     PcapIocAllowlist,
     PcapIocs,
+    PcapSeverityScores,
     TcpSessions,
 )
 from workers.celery_app import celery_app
@@ -1607,8 +1610,7 @@ def pcap_analysis_extract_iocs(
             run = session.execute(
                 select(PcapAnalysisRuns).where(PcapAnalysisRuns.run_id == run_id)
             ).scalar_one()
-            run.status = "complete"
-            run.completed_at = datetime.now(timezone.utc)
+            run.current_step = "extract_iocs"
             session.commit()
 
         return {
@@ -1632,6 +1634,390 @@ def pcap_analysis_extract_iocs(
                 run.error_message = str(exc)[:1000]
                 session.commit()
         raise
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 8: Passive CVE Matching & Signature Detection (Milestone 4)
+# ─────────────────────────────────────────────────────────────────────────────
+
+CVE_SIGNATURES = [
+    {
+        "cve_id": "CVE-2021-44228",
+        "title": "Apache Log4j Remote Code Execution (Log4Shell)",
+        "cvss": 10.0,
+        "severity": "critical",
+        "pattern": re.compile(r"(\$\{jndi:(?:ldap[s]?|rmi|dns|nis|iiop|corba)://|\$\{lower:|\$\{upper:)", re.IGNORECASE),
+        "match_type": "payload_signature",
+        "confidence": "high",
+        "description": "Log4j JNDI lookup payload injection attempt detected in HTTP request.",
+    },
+    {
+        "cve_id": "CVE-2021-41773",
+        "title": "Apache HTTP Server Path Traversal & RCE",
+        "cvss": 7.5,
+        "severity": "high",
+        "pattern": re.compile(r"(\.%2e/|\.%2e%2e/|/cgi-bin/\.%2e/)", re.IGNORECASE),
+        "match_type": "payload_signature",
+        "confidence": "high",
+        "description": "Apache 2.4.49 path traversal sequence detected in URI path.",
+    },
+    {
+        "cve_id": "CVE-2014-6271",
+        "title": "GNU Bash Remote Code Execution (Shellshock)",
+        "cvss": 9.8,
+        "severity": "critical",
+        "pattern": re.compile(r"\(\)\s*\{\s*[:;]\s*\};", re.IGNORECASE),
+        "match_type": "payload_signature",
+        "confidence": "high",
+        "description": "Shellshock trailing function definition detected in request headers/body.",
+    },
+    {
+        "cve_id": "CVE-2022-22965",
+        "title": "Spring Framework RCE (Spring4Shell)",
+        "cvss": 9.8,
+        "severity": "critical",
+        "pattern": re.compile(r"class\.module\.classLoader", re.IGNORECASE),
+        "match_type": "payload_signature",
+        "confidence": "high",
+        "description": "Spring4Shell classLoader manipulation parameter detected.",
+    },
+    {
+        "cve_id": "CVE-2014-0160",
+        "title": "OpenSSL TLS Heartbeat Information Disclosure (Heartbleed)",
+        "cvss": 7.5,
+        "severity": "high",
+        "pattern": re.compile(r"OpenSSL/1\.0\.1[a-f]?", re.IGNORECASE),
+        "match_type": "banner",
+        "confidence": "medium",
+        "description": "Vulnerable OpenSSL 1.0.1 branch version observed in server banner.",
+    },
+]
+
+
+@celery_app.task(bind=True, name="workers.pcap_pipeline.pcap_analysis_match_cve")
+def pcap_analysis_match_cve(
+    self,
+    prev_result_or_evidence_id: Any,
+    run_id: str | None = None,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Scan HTTP artifacts, banners, and flows for known CVE vulnerability signatures."""
+    if isinstance(prev_result_or_evidence_id, dict):
+        evidence_id = prev_result_or_evidence_id.get("evidence_id")
+        run_id = prev_result_or_evidence_id.get("run_id", run_id)
+    else:
+        evidence_id = int(prev_result_or_evidence_id)
+
+    if not run_id:
+        raise ValueError("Missing run_id in pcap_analysis_match_cve")
+
+    logger.info("Scanning for CVE matches for evidence %s (run %s)", evidence_id, run_id)
+
+    with get_sync_session() as session:
+        run = session.execute(
+            select(PcapAnalysisRuns).where(PcapAnalysisRuns.run_id == run_id)
+        ).scalar_one_or_none()
+        if run is None:
+            raise ValueError(f"Run {run_id} not found in database")
+        run.current_step = "match_cve"
+        session.commit()
+
+        artifacts = session.execute(
+            select(PcapArtifacts).where(PcapArtifacts.run_id == run_id)
+        ).scalars().all()
+
+        flows = session.execute(
+            select(PcapFlows).where(PcapFlows.run_id == run_id)
+        ).scalars().all()
+
+    matches_to_insert: list[PcapCveMatches] = []
+    seen_cves: set[str] = set()
+
+    for art in artifacts:
+        meta = art.metadata_json or {}
+        scan_strings: list[str] = []
+        if art.artifact_type == "http_request":
+            if meta.get("uri"):
+                scan_strings.append(str(meta["uri"]))
+            for hk, hv in (meta.get("headers") or {}).items():
+                scan_strings.append(f"{hk}: {hv}")
+
+        elif art.artifact_type == "http_response":
+            for hk, hv in (meta.get("headers") or {}).items():
+                scan_strings.append(f"{hk}: {hv}")
+
+        for text in scan_strings:
+            for sig in CVE_SIGNATURES:
+                if sig["pattern"].search(text):
+                    cve_key = f"{sig['cve_id']}:{art.id}"
+                    if cve_key not in seen_cves:
+                        seen_cves.add(cve_key)
+                        matches_to_insert.append(
+                            PcapCveMatches(
+                                run_id=run_id,
+                                evidence_id=evidence_id,
+                                flow_id=art.flow_id,
+                                artifact_id=art.id,
+                                cve_id=sig["cve_id"],
+                                cvss_score=sig["cvss"],
+                                severity=sig["severity"],
+                                match_type=sig["match_type"],
+                                confidence=sig["confidence"],
+                                description=sig["description"],
+                                matched_data={"matched_sample": text[:300], "title": sig["title"]},
+                            )
+                        )
+
+    for fl in flows:
+        if fl.dst_port == 4444 or fl.src_port == 4444:
+            cve_key = f"HEUR-REVERSE-SHELL:{fl.id}"
+            if cve_key not in seen_cves:
+                seen_cves.add(cve_key)
+                matches_to_insert.append(
+                    PcapCveMatches(
+                        run_id=run_id,
+                        evidence_id=evidence_id,
+                        flow_id=fl.id,
+                        cve_id="HEUR-REVERSE-SHELL",
+                        cvss_score=8.5,
+                        severity="high",
+                        match_type="port_heuristic",
+                        confidence="medium",
+                        description="Known Metasploit/reverse shell listener port 4444 detected.",
+                        matched_data={"port": 4444, "flow_key": fl.flow_key},
+                    )
+                )
+
+    try:
+        with get_sync_session() as session:
+            for i in range(0, len(matches_to_insert), 500):
+                session.add_all(matches_to_insert[i:i + 500])
+                session.flush()
+
+            session.commit()
+
+        return {
+            "run_id": run_id,
+            "evidence_id": evidence_id,
+            "cve_match_count": len(matches_to_insert),
+            "status": "complete",
+        }
+
+    except Exception as exc:
+        logger.warning("CVE matching failed for run %s: %s", run_id, exc)
+        with get_sync_session() as session:
+            run = session.execute(
+                select(PcapAnalysisRuns).where(PcapAnalysisRuns.run_id == run_id)
+            ).scalar_one_or_none()
+            if run:
+                run.status = "failed"
+                run.error_step = "match_cve"
+                run.error_message = str(exc)[:1000]
+                session.commit()
+        raise
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 9: Severity Scoring & Final Reporting (Milestone 4)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@celery_app.task(bind=True, name="workers.pcap_pipeline.pcap_analysis_score_severity")
+def pcap_analysis_score_severity(
+    self,
+    prev_result_or_evidence_id: Any,
+    run_id: str | None = None,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Compute multidimensional risk score combining CVSS, IOCs, and network anomalies."""
+    if isinstance(prev_result_or_evidence_id, dict):
+        evidence_id = prev_result_or_evidence_id.get("evidence_id")
+        run_id = prev_result_or_evidence_id.get("run_id", run_id)
+    else:
+        evidence_id = int(prev_result_or_evidence_id)
+
+    if not run_id:
+        raise ValueError("Missing run_id in pcap_analysis_score_severity")
+
+    logger.info("Computing severity score for evidence %s (run %s)", evidence_id, run_id)
+
+    with get_sync_session() as session:
+        run = session.execute(
+            select(PcapAnalysisRuns).where(PcapAnalysisRuns.run_id == run_id)
+        ).scalar_one_or_none()
+        if run is None:
+            raise ValueError(f"Run {run_id} not found in database")
+        run.current_step = "score_severity"
+        inv_id = run.investigation_id
+        session.commit()
+
+        cve_matches = session.execute(
+            select(PcapCveMatches).where(PcapCveMatches.run_id == run_id)
+        ).scalars().all()
+
+        iocs = session.execute(
+            select(PcapIocs).where(PcapIocs.run_id == run_id)
+        ).scalars().all()
+
+        sessions = session.execute(
+            select(TcpSessions).where(TcpSessions.run_id == run_id)
+        ).scalars().all()
+
+        flows = session.execute(
+            select(PcapFlows).where(PcapFlows.run_id == run_id)
+        ).scalars().all()
+
+    # 1. CVSS Base Max
+    cvss_scores = [float(c.cvss_score) for c in cve_matches if c.cvss_score is not None]
+    cvss_base_max = max(cvss_scores) if cvss_scores else 0.0
+
+    # 2. IOC Risk Score
+    public_ips = [i for i in iocs if i.ioc_type in ("ipv4", "ipv6") and not i.is_allowlisted]
+    susp_ports = [i for i in iocs if i.ioc_type == "port" and not i.is_allowlisted]
+    susp_domains = [i for i in iocs if i.ioc_type == "domain" and not i.is_allowlisted]
+
+    raw_ioc_score = len(public_ips) * 2.0 + len(susp_ports) * 3.0 + len(susp_domains) * 2.5
+    ioc_risk_score = min(10.0, round(raw_ioc_score, 1))
+
+    # 3. Anomaly Score
+    anomaly_sum = 0.0
+    half_open_count = sum(1 for s in sessions if s.state in ("half_open", "incomplete"))
+    retrans_total = sum(s.retransmit_bytes for s in sessions)
+    bytes_total = sum(s.total_bytes for s in sessions)
+
+    if sessions and (half_open_count / len(sessions)) > 0.3:
+        anomaly_sum += 3.0
+    if bytes_total > 0 and (retrans_total / bytes_total) > 0.15:
+        anomaly_sum += 3.0
+    if any(s.payload_truncated for s in sessions):
+        anomaly_sum += 1.5
+    if any(f.fragment_count > 0 for f in flows):
+        anomaly_sum += 1.5
+
+    anomaly_score = min(10.0, round(anomaly_sum, 1))
+
+    # 4. Overall Weighted Score
+    overall_score = round(
+        min(10.0, max(0.0, 0.45 * cvss_base_max + 0.35 * ioc_risk_score + 0.20 * anomaly_score)),
+        1,
+    )
+
+    if overall_score >= 9.0:
+        overall_severity = "critical"
+    elif overall_score >= 7.0:
+        overall_severity = "high"
+    elif overall_score >= 4.0:
+        overall_severity = "medium"
+    else:
+        overall_severity = "low"
+
+    factors = {
+        "cvss_base_max": cvss_base_max,
+        "cve_match_count": len(cve_matches),
+        "ioc_risk_score": ioc_risk_score,
+        "public_ip_count": len(public_ips),
+        "suspicious_port_count": len(susp_ports),
+        "suspicious_domain_count": len(susp_domains),
+        "anomaly_score": anomaly_score,
+        "retransmit_bytes": retrans_total,
+        "half_open_sessions": half_open_count,
+        "truncation_observed": any(s.payload_truncated for s in sessions),
+    }
+
+    try:
+        with get_sync_session() as session:
+            score_row = PcapSeverityScores(
+                run_id=run_id,
+                evidence_id=evidence_id,
+                investigation_id=inv_id,
+                overall_score=overall_score,
+                overall_severity=overall_severity,
+                cvss_base_max=cvss_base_max,
+                ioc_risk_score=ioc_risk_score,
+                anomaly_score=anomaly_score,
+                factors=factors,
+            )
+            session.add(score_row)
+
+            # Mark run as completely finished!
+            run = session.execute(
+                select(PcapAnalysisRuns).where(PcapAnalysisRuns.run_id == run_id)
+            ).scalar_one()
+            run.status = "complete"
+            run.completed_at = datetime.now(timezone.utc)
+            session.commit()
+
+        return {
+            "run_id": run_id,
+            "evidence_id": evidence_id,
+            "overall_score": float(overall_score),
+            "overall_severity": overall_severity,
+            "cvss_base_max": float(cvss_base_max),
+            "status": "complete",
+        }
+
+    except Exception as exc:
+        logger.warning("Severity scoring failed for run %s: %s", run_id, exc)
+        with get_sync_session() as session:
+            run = session.execute(
+                select(PcapAnalysisRuns).where(PcapAnalysisRuns.run_id == run_id)
+            ).scalar_one_or_none()
+            if run:
+                run.status = "failed"
+                run.error_step = "score_severity"
+                run.error_message = str(exc)[:1000]
+                session.commit()
+        raise
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Resiliency & Rollback Handler (Milestone 5)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@celery_app.task(bind=True, name="workers.pcap_pipeline.handle_chain_failure")
+def handle_chain_failure(
+    self,
+    *args: Any,
+    run_id: str | None = None,
+    evidence_id: int | None = None,
+    **kwargs: Any,
+) -> None:
+    """Purge staged artifacts and update database state upon pipeline failure."""
+    exc = None
+    if len(args) >= 2:
+        exc = args[1]
+    elif args:
+        exc = args[0]
+    elif "exc" in kwargs:
+        exc = kwargs["exc"]
+
+    if not run_id and "run_id" in kwargs:
+        run_id = kwargs["run_id"]
+    if not evidence_id and "evidence_id" in kwargs:
+        evidence_id = kwargs["evidence_id"]
+
+    logger.error("PCAP pipeline execution failed for run %s: %s", run_id, exc)
+    if not run_id:
+        return
+
+    storage = get_storage_backend()
+    staging_prefix = f"analysis-{run_id}"
+
+    # 1. Purge disk staging files
+    deleted = storage.purge_prefix(staging_prefix)
+    logger.info("Purged %d staged files under %s", deleted, staging_prefix)
+
+    # 2. Update run status and rollback timestamps
+    with get_sync_session() as session:
+        run = session.execute(
+            select(PcapAnalysisRuns).where(PcapAnalysisRuns.run_id == run_id)
+        ).scalar_one_or_none()
+        if run:
+            now = datetime.now(timezone.utc)
+            run.status = "rolled_back"
+            run.rollback_started_at = now
+            run.rollback_completed_at = now
+            run.error_message = str(exc)[:1000] if exc else "Pipeline task error"
+            session.commit()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1668,7 +2054,10 @@ def start_pcap_analysis(evidence_id: int, run_id: str | None = None) -> str:
         pcap_analysis_reconstruct_sessions.s(run_id=run_id),
         pcap_analysis_extract_artifacts.s(run_id=run_id),
         pcap_analysis_extract_iocs.s(run_id=run_id),
+        pcap_analysis_match_cve.s(run_id=run_id),
+        pcap_analysis_score_severity.s(run_id=run_id),
     )
+    pipeline_chain.link_error(handle_chain_failure.s(run_id=run_id, evidence_id=evidence_id))
     pipeline_chain.apply_async()
-    logger.info("Enqueued PCAP analysis pipeline for evidence %s with run_id %s", evidence_id, run_id)
+    logger.info("Enqueued full PCAP analysis pipeline for evidence %s with run_id %s", evidence_id, run_id)
     return run_id

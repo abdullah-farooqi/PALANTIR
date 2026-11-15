@@ -9,6 +9,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    Numeric,
     String,
     Text,
     UniqueConstraint,
@@ -80,6 +81,8 @@ class PcapAnalysisRuns(Base):
     sessions = relationship("TcpSessions", back_populates="run", cascade="all, delete-orphan")
     artifacts = relationship("PcapArtifacts", back_populates="run", cascade="all, delete-orphan")
     iocs = relationship("PcapIocs", back_populates="run", cascade="all, delete-orphan")
+    cve_matches = relationship("PcapCveMatches", back_populates="run", cascade="all, delete-orphan")
+    severity_score = relationship("PcapSeverityScores", back_populates="run", uselist=False, cascade="all, delete-orphan")
 
 
 class PcapFlows(Base):
@@ -383,4 +386,118 @@ class PcapIocs(Base):
 
     run = relationship("PcapAnalysisRuns", back_populates="iocs")
     evidence = relationship("InvestigationEvidence", foreign_keys=[evidence_id])
+
+
+class PcapCveMatches(Base):
+    """CVE vulnerabilities matched via passive banners, payload signatures, or heuristic indicators."""
+
+    __tablename__ = "pcap_cve_matches"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    run_id = Column(
+        String(64),
+        ForeignKey("pcap_analysis_runs.run_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    evidence_id = Column(
+        Integer,
+        ForeignKey("investigation_evidence.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    flow_id = Column(
+        BigInteger,
+        ForeignKey("pcap_flows.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    artifact_id = Column(
+        BigInteger,
+        ForeignKey("pcap_artifacts.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
+    cve_id = Column(String(32), nullable=False, index=True)
+    cvss_score = Column(Numeric(3, 1), nullable=True)
+    severity = Column(String(16), nullable=False, index=True)  # none, low, medium, high, critical
+    match_type = Column(String(32), nullable=False)  # banner, payload_signature, ja3_threat, port_heuristic
+    confidence = Column(String(16), nullable=False, default="medium")  # low, medium, high
+    description = Column(Text, nullable=True)
+    matched_data = Column(JSONB, nullable=False, default=dict)
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "cvss_score IS NULL OR (cvss_score >= 0.0 AND cvss_score <= 10.0)",
+            name="ck_pcap_cve_score",
+        ),
+        CheckConstraint(
+            "severity IN ('none', 'low', 'medium', 'high', 'critical')",
+            name="ck_pcap_cve_severity",
+        ),
+    )
+
+    run = relationship("PcapAnalysisRuns", back_populates="cve_matches")
+    evidence = relationship("InvestigationEvidence", foreign_keys=[evidence_id])
+    flow = relationship("PcapFlows", foreign_keys=[flow_id])
+    artifact = relationship("PcapArtifacts", foreign_keys=[artifact_id])
+
+
+class PcapSeverityScores(Base):
+    """Composite security severity assessment for a PCAP analysis run."""
+
+    __tablename__ = "pcap_severity_scores"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    run_id = Column(
+        String(64),
+        ForeignKey("pcap_analysis_runs.run_id", ondelete="CASCADE"),
+        unique=True,
+        nullable=False,
+        index=True,
+    )
+    evidence_id = Column(
+        Integer,
+        ForeignKey("investigation_evidence.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    investigation_id = Column(
+        Integer,
+        ForeignKey("agent_investigations.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    overall_score = Column(Numeric(3, 1), nullable=False)
+    overall_severity = Column(String(16), nullable=False, index=True)  # low, medium, high, critical
+    cvss_base_max = Column(Numeric(3, 1), default=0.0)
+    ioc_risk_score = Column(Numeric(3, 1), default=0.0)
+    anomaly_score = Column(Numeric(3, 1), default=0.0)
+    factors = Column(JSONB, nullable=False, default=dict)
+    calculated_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "overall_score >= 0.0 AND overall_score <= 10.0",
+            name="ck_pcap_severity_overall",
+        ),
+        CheckConstraint(
+            "overall_severity IN ('low', 'medium', 'high', 'critical')",
+            name="ck_pcap_severity_level",
+        ),
+    )
+
+    run = relationship("PcapAnalysisRuns", back_populates="severity_score")
+    evidence = relationship("InvestigationEvidence", foreign_keys=[evidence_id])
+    investigation = relationship("AgentInvestigation", foreign_keys=[investigation_id])
+
 

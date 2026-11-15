@@ -595,4 +595,52 @@ INSERT INTO pcap_ioc_allowlist (ioc_type, pattern, description) VALUES
 ON CONFLICT (ioc_type, pattern) DO NOTHING;
 
 
+-- PCAP CVE Matches
+CREATE TABLE IF NOT EXISTS pcap_cve_matches (
+    id                  SERIAL PRIMARY KEY,
+    run_id              VARCHAR(64) NOT NULL REFERENCES pcap_analysis_runs(run_id) ON DELETE CASCADE,
+    evidence_id         INTEGER NOT NULL REFERENCES investigation_evidence(id) ON DELETE CASCADE,
+    flow_id             BIGINT REFERENCES pcap_flows(id) ON DELETE SET NULL,
+    artifact_id         BIGINT REFERENCES pcap_artifacts(id) ON DELETE SET NULL,
+    cve_id              VARCHAR(32) NOT NULL,
+    cvss_score          NUMERIC(3, 1),
+    severity            VARCHAR(16) NOT NULL,
+    match_type          VARCHAR(32) NOT NULL,
+    confidence          VARCHAR(16) NOT NULL DEFAULT 'medium',
+    description         TEXT,
+    matched_data        JSONB NOT NULL DEFAULT '{}',
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT ck_pcap_cve_score CHECK (cvss_score IS NULL OR (cvss_score >= 0.0 AND cvss_score <= 10.0)),
+    CONSTRAINT ck_pcap_cve_severity CHECK (severity IN ('none', 'low', 'medium', 'high', 'critical'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_pcap_cve_run ON pcap_cve_matches(run_id);
+CREATE INDEX IF NOT EXISTS idx_pcap_cve_evidence ON pcap_cve_matches(evidence_id);
+CREATE INDEX IF NOT EXISTS idx_pcap_cve_id ON pcap_cve_matches(cve_id);
+CREATE INDEX IF NOT EXISTS idx_pcap_cve_severity ON pcap_cve_matches(severity);
+
+-- PCAP Severity Scores
+CREATE TABLE IF NOT EXISTS pcap_severity_scores (
+    id                  SERIAL PRIMARY KEY,
+    run_id              VARCHAR(64) NOT NULL UNIQUE REFERENCES pcap_analysis_runs(run_id) ON DELETE CASCADE,
+    evidence_id         INTEGER NOT NULL REFERENCES investigation_evidence(id) ON DELETE CASCADE,
+    investigation_id    INTEGER NOT NULL REFERENCES agent_investigations(id) ON DELETE CASCADE,
+    overall_score       NUMERIC(3, 1) NOT NULL,
+    overall_severity    VARCHAR(16) NOT NULL,
+    cvss_base_max       NUMERIC(3, 1) DEFAULT 0.0,
+    ioc_risk_score      NUMERIC(3, 1) DEFAULT 0.0,
+    anomaly_score       NUMERIC(3, 1) DEFAULT 0.0,
+    factors             JSONB NOT NULL DEFAULT '{}',
+    calculated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT ck_pcap_severity_overall CHECK (overall_score >= 0.0 AND overall_score <= 10.0),
+    CONSTRAINT ck_pcap_severity_level CHECK (overall_severity IN ('low', 'medium', 'high', 'critical'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_pcap_severity_run ON pcap_severity_scores(run_id);
+CREATE INDEX IF NOT EXISTS idx_pcap_severity_evidence ON pcap_severity_scores(evidence_id);
+CREATE INDEX IF NOT EXISTS idx_pcap_severity_inv ON pcap_severity_scores(investigation_id);
+CREATE INDEX IF NOT EXISTS idx_pcap_severity_level ON pcap_severity_scores(overall_severity);
+
+
+
 
