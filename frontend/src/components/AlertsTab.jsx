@@ -47,7 +47,11 @@ function InvestigateBtn({ onInvestigate, type, id, existing }) {
 
 // ------------------------------------------------------------------ [1] active alerts (per node)
 function ActiveAlerts({ state, onInvestigate }) {
-  const list = (state.data && state.data.active) || [];
+  const list = Array.isArray(state.data?.active)
+    ? state.data.active
+    : Array.isArray(state.data)
+      ? state.data
+      : [];
   const err = state.data && state.data.errors && state.data.errors.active;
 
   return (
@@ -210,10 +214,7 @@ function EventFeed({ node, scope, setScope, onInvestigate, refreshMs }) {
           <Chips
             value={scope}
             onChange={setScope}
-            options={[
-              { value: 'node', label: 'THIS NODE' },
-              { value: 'fleet', label: 'FLEET' },
-            ]}
+            options={[...(node ? [{ value: 'node', label: 'THIS NODE' }] : []), { value: 'fleet', label: 'FLEET' }]}
           />
         </div>
       }
@@ -359,15 +360,10 @@ function EventFeed({ node, scope, setScope, onInvestigate, refreshMs }) {
 export default function AlertsTab({ node, state, scope, setScope, onInvestigate, refreshMs, onBack, onChangeView }) {
   return (
     <>
-      <NodeHeaderNav
-        node={node}
-        currentView="events"
-        onViewChange={onChangeView}
-        onBack={onBack}
-      />
+      {scope === 'node' && node && <NodeHeaderNav node={node} currentView="events" onViewChange={onChangeView} onBack={onBack} />}
 
       <div style={{ display: 'grid', gap: 14 }}>
-        <ActiveAlerts state={state} onInvestigate={onInvestigate} />
+        {scope === 'node' && node && <ActiveAlerts state={state} onInvestigate={onInvestigate} />}
         <EventFeed node={node} scope={scope} setScope={setScope} onInvestigate={onInvestigate} refreshMs={refreshMs} />
       </div>
     </>

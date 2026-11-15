@@ -1,203 +1,162 @@
-import React, { useEffect, useState, memo, useCallback } from 'react';
-import { Dot, Spinner } from './ui';
-import { CAN_WRITE, UI_ROLE } from '../lib/role';
+import { useEffect, useState } from 'react';
+import {
+  Activity, AlertTriangle, ChevronDown, Clock3, Gauge, LayoutDashboard,
+  Logs, Menu, PanelLeftClose, PanelLeftOpen, RefreshCw, Search, Server,
+  Settings2, ShieldCheck, Sparkles, X,
+} from 'lucide-react';
+import { UI_ROLE } from '../lib/role';
 import { formatClock, formatRelative } from '../lib/format';
-import { statusTone } from '../lib/events';
 
 export const VIEWS = [
-  { key: 'observability', label: '1. OBSERVABILITY', hotkey: '1' },
-  { key: 'pcap', label: '2. PCAP FORENSICS', hotkey: '2' },
-  { key: 'agent', label: '3. AGENT COPILOT', hotkey: '3' },
-  { key: 'fleet', label: 'HOSTS GRID', hotkey: '4' },
-  { key: 'overview', label: 'OVERVIEW', sub: true },
-  { key: 'inventory', label: 'INVENTORY', sub: true },
-  { key: 'events', label: 'EVENTS', sub: true },
-  { key: 'logs', label: 'LOGS', sub: true },
-  { key: 'investigations', label: 'INVESTIGATIONS', sub: true },
+  { key: 'fleet-overview', label: 'Fleet Overview' },
+  { key: 'fleet', label: 'Hosts' },
+  { key: 'events', label: 'Alerts & Events' },
+  { key: 'logs', label: 'Logs' },
+  { key: 'investigations', label: 'Investigations' },
+  { key: 'agent', label: 'Copilot Preview' },
+  { key: 'settings', label: 'Settings' },
+  { key: 'overview', label: 'Host Overview', sub: true },
+  { key: 'inventory', label: 'Host Inventory', sub: true },
+  { key: 'pcap', label: 'Network Evidence', sub: true },
 ];
 
 export const REFRESH_OPTIONS = [
-  { value: 5000, label: '5s' },
-  { value: 10000, label: '10s' },
-  { value: 30000, label: '30s' },
-  { value: 0, label: 'off' },
+  { value: 5000, label: '5 sec' },
+  { value: 10000, label: '10 sec' },
+  { value: 30000, label: '30 sec' },
+  { value: 0, label: 'Paused' },
 ];
 
-function Clock() {
+const MAIN_NAV = [
+  { key: 'fleet-overview', label: 'Fleet Overview', icon: LayoutDashboard },
+  { key: 'fleet', label: 'Hosts', icon: Server },
+  { key: 'events', label: 'Alerts & Events', icon: AlertTriangle },
+  { key: 'logs', label: 'Logs', icon: Logs },
+  { key: 'investigations', label: 'Investigations', icon: ShieldCheck },
+  { key: 'pcap', label: 'Network Evidence', icon: Activity },
+  { key: 'agent', label: 'Copilot Preview', icon: Sparkles, preview: true },
+];
+
+function getPage(view) {
+  if (view === 'overview') return 'Host Overview';
+  if (view === 'inventory') return 'Host Inventory';
+  if (view === 'pcap') return 'Network Evidence';
+  return VIEWS.find((item) => item.key === view)?.label || 'Fleet Overview';
+}
+
+function StatusDot({ tone = 'ok' }) {
+  return <span className={`shell-status-dot ${tone}`} aria-hidden="true" />;
+}
+
+export function TopBar({
+  view, setView, fleet, refreshMs, setRefreshMs, refreshing, onRefresh,
+  query, setQuery, node, children,
+}) {
+  const [collapsed, setCollapsed] = useState(false);
+  const [mobileOpen, setMobileOpen] = useState(false);
   const [now, setNow] = useState(Date.now());
+  const summary = fleet?.data?.summary;
+  const opsHealth = fleet?.data?.ops;
+  const summaryComponents = [summary?.health?.api, summary?.health?.database, ...Object.values(summary?.health?.workers || {})].filter(Boolean);
+  const operationsComponents = [opsHealth?.api, opsHealth?.database, opsHealth?.redis, opsHealth?.celery?.workers, opsHealth?.celery?.beat_dispatch, ...Object.values(opsHealth?.tasks || {})].filter(Boolean);
+  const healthComponents = operationsComponents.length ? operationsComponents : summaryComponents;
+  const unhealthyComponents = healthComponents.filter((component) => !['running', 'healthy'].includes(component.status)).length;
+  const healthTone = !healthComponents.length ? 'unknown' : opsHealth?.status === 'degraded' || unhealthyComponents ? 'warn' : 'ok';
+  const healthDetail = healthTone === 'unknown' ? 'health state unavailable' : healthTone === 'ok' ? 'dependency checks healthy' : `${unhealthyComponents || 1} health check(s) need attention`;
+  const fleetCount = summary?.nodes?.enabled ?? fleet?.data?.nodes?.length ?? 0;
+  const hostViews = ['overview', 'inventory'];
+  const selectedHostView = hostViews.includes(view);
+  const navActive = (key) => key === 'fleet'
+    ? view === 'fleet' || selectedHostView
+    : key === 'events'
+      ? view === 'events'
+      : view === key;
+
   useEffect(() => {
     const id = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(id);
   }, []);
-  return <span className="font-mono text-xs text-[#E8EAED]">{formatClock(now)}</span>;
-}
 
-const IconPulse = memo(() => (
-  <svg width="10" height="10" viewBox="0 0 12 12" fill="none" aria-hidden="true">
-    <circle cx="6" cy="6" r="4" fill="#C6FF00" />
-    <circle cx="6" cy="6" r="5.5" stroke="#C6FF00" strokeOpacity="0.5" className="animate-ping" />
-  </svg>
-));
-
-export function TopBar({
-  view,
-  setView,
-  onToggleSettings,
-  fleet,
-  refreshMs,
-  setRefreshMs,
-  refreshing,
-  onRefresh,
-  query,
-  setQuery,
-}) {
-  const isSettings = view === 'settings';
-
-  const modes = [
-    { id: 'observability', label: '1. OBSERVABILITY', hotkey: '1' },
-    { id: 'pcap', label: '2. PCAP FORENSICS', hotkey: '2' },
-    { id: 'agent', label: '3. AGENT COPILOT', hotkey: '3' },
-    { id: 'fleet', label: 'HOSTS GRID', hotkey: '4' },
-  ];
+  function navigate(nextView) {
+    setView(nextView);
+    setMobileOpen(false);
+  }
 
   return (
-    <header className="bg-[#14171B] border border-[#262B32] rounded-[6px] px-4 py-2.5 shadow-[0_4px_16px_rgba(0,0,0,0.5)] flex flex-wrap items-center justify-between gap-3 sticky top-0 z-40">
-      {/* Left: Brand Identity & Live Ingest Beacon */}
-      <div className="flex items-center gap-3">
-        <div
-          className="flex items-center gap-2 px-2.5 py-1 bg-[#1B1F24] border border-[#262B32] rounded-[4px] cursor-pointer"
-          onClick={() => setView('observability')}
-          title="Live Telemetry Pipeline Active"
-        >
-          <IconPulse />
-          <span className="font-mono text-[11px] font-bold text-[#E8EAED] uppercase tracking-wider">
-            Live Ingest
-          </span>
+    <div className={`app-shell ${collapsed ? 'is-collapsed' : ''}`}>
+      {mobileOpen && <button className="shell-mobile-scrim" aria-label="Close navigation" onClick={() => setMobileOpen(false)} />}
+      <aside className={`shell-sidebar ${mobileOpen ? 'mobile-open' : ''}`} aria-label="Primary navigation">
+        <div className="shell-brand-row">
+          <button className="shell-brand" onClick={() => navigate('fleet-overview')} aria-label="PALANTIR fleet overview">
+            <span className="shell-brand-mark">P</span>
+            <span className="shell-brand-copy"><strong>PALANTIR</strong><small>FLEET OPERATIONS</small></span>
+          </button>
+          <button className="shell-icon-button shell-collapse-button" onClick={() => setCollapsed((value) => !value)} aria-label={collapsed ? 'Expand sidebar' : 'Collapse sidebar'} title={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}>
+            {collapsed ? <PanelLeftOpen size={16} /> : <PanelLeftClose size={16} />}
+          </button>
+          <button className="shell-icon-button shell-close-mobile" onClick={() => setMobileOpen(false)} aria-label="Close navigation"><X size={17} /></button>
         </div>
 
-        <div
-          className="flex items-center cursor-pointer border-l border-[#262B32] pl-3"
-          onClick={() => setView('observability')}
-        >
-          <span className="font-mono text-sm font-extrabold tracking-widest text-[#E8EAED]">
-            PALANTIR
-          </span>
-          <span className="hidden sm:inline-block font-mono text-xs text-[#8B93A0] ml-2">
-            // FORENSIC INSTRUMENT
-          </span>
-        </div>
-      </div>
-
-      {/* Center: Mode Switcher Tabs */}
-      <nav className="flex items-center gap-1.5" role="tablist" aria-label="Forensic Instrument Modes">
-        {modes.map((m) => {
-          const isActive = view === m.id || (m.id === 'fleet' && ['overview', 'inventory', 'events', 'logs', 'investigations'].includes(view));
-          return (
-            <button
-              key={m.id}
-              role="tab"
-              aria-selected={isActive}
-              onClick={() => setView(m.id)}
-              className={`px-3 py-1.5 text-xs font-mono font-bold uppercase rounded-[4px] transition-colors flex items-center gap-1.5 focus:outline-none ${
-                isActive
-                  ? 'bg-[#C6FF00] text-[#0A0B0D] font-extrabold shadow-[0_0_10px_rgba(198,255,0,0.3)]'
-                  : 'text-[#8B93A0] hover:text-[#E8EAED] hover:bg-[#1B1F24]'
-              }`}
-            >
-              <span>{m.label}</span>
-              <span className={`text-[10px] px-1 rounded ${isActive ? 'bg-[#0A0B0D]/20 text-[#0A0B0D]' : 'bg-[#21262D] text-[#656C77]'}`}>
-                {m.hotkey}
-              </span>
+        <div className="shell-nav-label">WORKSPACE</div>
+        <nav className="shell-nav">
+          {MAIN_NAV.map(({ key, label, icon: Icon, preview }) => (
+            <button key={key} className={`shell-nav-item ${navActive(key) ? 'active' : ''}`} onClick={() => navigate(key)} aria-current={navActive(key) ? 'page' : undefined} title={collapsed ? label : undefined}>
+              <Icon size={17} strokeWidth={1.8} />
+              <span className="shell-nav-text">{label}</span>
+              {preview && <span className="shell-preview-label">PREVIEW</span>}
             </button>
-          );
-        })}
-      </nav>
+          ))}
+        </nav>
 
-      {/* Right: Chronometer, Fast Search, Settings */}
-      <div className="flex items-center gap-2.5">
-        <div className="font-mono text-xs text-[#8B93A0] px-2.5 py-1 bg-[#0A0B0D] border border-[#262B32] rounded-[4px]">
-          <Clock />
+        <div className="shell-sidebar-spacer" />
+        <div className="shell-sidebar-status">
+          <div className="shell-sidebar-status-head"><Activity size={14} /><span className="shell-nav-text">PIPELINE STATUS</span><StatusDot tone={healthTone} /></div>
+          <div className="shell-nav-text shell-sidebar-status-copy">{fleetCount} registered {fleetCount === 1 ? 'host' : 'hosts'} · {healthDetail}</div>
         </div>
-
-        <button
-          className={`flex items-center gap-1.5 px-3 py-1.5 rounded-[4px] text-xs font-mono font-bold transition-all border ${
-            isSettings
-              ? 'bg-[#F5A524] text-[#0A0B0D] border-[#F5A524]'
-              : 'bg-[#1B1F24] border-[#262B32] text-[#8B93A0] hover:text-[#E8EAED] hover:border-[#3D444F]'
-          }`}
-          onClick={onToggleSettings}
-          title={isSettings ? 'Close Settings' : 'Open System Thresholds & Ops Diagnostics'}
-        >
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-            <circle cx="12" cy="12" r="3" />
-            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z" />
-          </svg>
-          <span>Settings</span>
+        <button className={`shell-nav-item shell-settings-item ${view === 'settings' ? 'active' : ''}`} onClick={() => navigate('settings')} aria-current={view === 'settings' ? 'page' : undefined} title={collapsed ? 'Settings' : undefined}>
+          <Settings2 size={17} strokeWidth={1.8} /><span className="shell-nav-text">Settings</span>
         </button>
-      </div>
-    </header>
-  );
-}
-
-export function NodeBar({ nodes, selectedId, onSelect, onAdd, onRemove, onViewGrid, currentView }) {
-  return (
-    <div className="flex items-center gap-2 overflow-x-auto py-1 font-mono text-xs">
-      <button
-        className={`px-2.5 py-1 rounded-[4px] border transition-colors ${
-          currentView === 'fleet'
-            ? 'bg-[#C6FF00] text-[#0A0B0D] border-[#C6FF00] font-bold'
-            : 'bg-[#1B1F24] border-[#262B32] text-[#8B93A0] hover:text-[#E8EAED]'
-        }`}
-        onClick={onViewGrid}
-        title="View All Monitored Target Hosts"
-      >
-        ⊞ Hosts Grid
-      </button>
-
-      <span className="text-[#656C77]">│</span>
-      <span className="text-[#8B93A0]">Active Target:</span>
-
-      {nodes.length === 0 && <span className="text-[#656C77]">none registered yet</span>}
-
-      {nodes.map((n) => {
-        const isSel = n.id === selectedId && currentView !== 'fleet';
-        return (
-          <button
-            key={n.id}
-            className={`px-2.5 py-1 rounded-[4px] border flex items-center gap-1.5 transition-colors ${
-              isSel
-                ? 'bg-[#1B1F24] border-[#C6FF00] text-[#C6FF00] font-bold'
-                : 'bg-[#14171B] border-[#262B32] text-[#8B93A0] hover:text-[#E8EAED]'
-            }`}
-            onClick={() => onSelect(n.id)}
-            title={`${n.collector_url || ''}\nLast contact ${formatRelative(n.last_seen_at)}`}
-          >
-            <Dot tone={statusTone(n.reachability)} />
-            <span>{n.hostname}</span>
-          </button>
-        );
-      })}
-
-      <div className="flex-1" />
-
-      {CAN_WRITE && (
-        <div className="flex items-center gap-2">
-          <button
-            className="px-2.5 py-1 bg-[#1B1F24] border border-[#262B32] text-[#8B93A0] hover:text-[#E8EAED] rounded-[4px]"
-            onClick={onAdd}
-          >
-            + Add Host
-          </button>
-          {selectedId && currentView !== 'fleet' && (
-            <button
-              className="px-2.5 py-1 bg-[rgba(229,72,77,0.12)] border border-[rgba(229,72,77,0.40)] text-[#FFA4A7] hover:bg-[rgba(229,72,77,0.25)] rounded-[4px]"
-              onClick={onRemove}
-            >
-              Deactivate
-            </button>
-          )}
+        <div className="shell-user-row">
+          <span className="shell-user-avatar">{UI_ROLE === 'admin' ? 'A' : 'R'}</span>
+          <span className="shell-user-copy"><strong>{UI_ROLE === 'admin' ? 'Administrator' : 'Read only'}</strong><small>{UI_ROLE.toUpperCase()} ACCESS</small></span>
         </div>
-      )}
+      </aside>
+
+      <div className="shell-main-column">
+        <header className="shell-topbar">
+          <button className="shell-icon-button shell-mobile-menu" onClick={() => setMobileOpen(true)} aria-label="Open navigation"><Menu size={18} /></button>
+          <div className="shell-breadcrumbs">
+            <span>Operations</span><span className="shell-crumb-sep">/</span>
+            {selectedHostView && node && <><button onClick={() => navigate('fleet')}>Hosts</button><span className="shell-crumb-sep">/</span><strong>{node.hostname}</strong><span className="shell-crumb-sep">/</span></>}
+            <strong>{getPage(view)}</strong>
+          </div>
+          <label className="shell-global-search">
+            <Search size={15} aria-hidden="true" />
+            <input className="app-search-input" value={query || ''} onChange={(event) => setQuery(event.target.value)} placeholder="Search hosts" aria-label="Search hosts by name, address, or operating system" />
+            <kbd>/</kbd>
+          </label>
+          <div className="shell-topbar-right">
+            <span className="shell-freshness" title={summary?.latest_metric_at ? `Latest metric collected ${summary.latest_metric_at}` : 'No metric has been collected yet'}>
+              <StatusDot tone="unknown" />
+              <span>{summary?.latest_metric_at ? `LATEST DATA ${formatRelative(summary.latest_metric_at)}` : 'NO DATA YET'}</span>
+            </span>
+            <span className={`shell-health-pill ${healthTone}`} title={healthDetail}>
+              <StatusDot tone={healthTone} /><span>{healthTone === 'ok' ? 'SYSTEMS NORMAL' : healthTone === 'warn' ? 'CHECK PIPELINE' : 'HEALTH UNKNOWN'}</span>
+            </span>
+            <span className="shell-clock"><Clock3 size={14} /><span>{formatClock(now)}</span></span>
+          </div>
+        </header>
+        <div className="shell-toolbar">
+          <div className="shell-toolbar-context">
+            {node && selectedHostView ? <><span className="shell-host-indicator"><Server size={14} />{node.hostname}</span><span className="shell-crumb-sep">·</span><span>{node.reachability || 'unknown'}</span></> : <><Gauge size={14} /><span>Fleet operations workspace</span></>}
+          </div>
+          <div className="shell-toolbar-actions">
+            <label className="shell-refresh-select"><span>Refresh</span><select value={refreshMs} onChange={(event) => setRefreshMs(Number(event.target.value))} aria-label="Telemetry refresh interval">{REFRESH_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select><ChevronDown size={13} /></label>
+            <button className="shell-refresh-button" onClick={onRefresh} disabled={refreshing} title="Refresh fleet and current host data"><RefreshCw size={14} className={refreshing ? 'is-spinning' : ''} /><span>Refresh</span></button>
+          </div>
+        </div>
+        <main className="term-main shell-content">{children}</main>
+      </div>
     </div>
   );
 }

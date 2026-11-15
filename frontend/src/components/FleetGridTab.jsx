@@ -1,10 +1,11 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { Grid2X2, List } from 'lucide-react';
 import { api } from '../api';
 import { usePolling } from '../hooks/usePolling';
 import { Dot, Meter, MeterRow, Box, Empty, ErrorLine } from './ui';
 import { formatBytes, formatPercent, formatRelative, formatCount, formatNetworkSpeed } from '../lib/format';
 import { statusTone } from '../lib/events';
-import { systemSummary, storageSummary, networkNow } from '../lib/metrics';
+import { systemSummary, storageSummary, networkFromSeries } from '../lib/metrics';
 
 import { fetchNodeSummary } from '../hooks/useNodeData';
 
@@ -44,13 +45,27 @@ function getOsIconAndLabel(node, sysData) {
   return { label: 'Linux OS', img: '/img/linux.png', fallbackImg: '/img/linux.png', badgeClass: 'linux' };
 }
 
-function NodeCard({ node, onSelect, onRemove, CAN_WRITE }) {
-  // Poll telemetry metrics via fetchNodeSummary helper
+function NodeCard({ node, onSelect, onRemove, CAN_WRITE, refreshMs }) {
+  const cardRef = useRef(null);
+  const [inView, setInView] = useState(false);
+
+  useEffect(() => {
+    const element = cardRef.current;
+    if (!element || typeof IntersectionObserver === 'undefined') {
+      setInView(true);
+      return undefined;
+    }
+    const observer = new IntersectionObserver(([entry]) => setInView(entry.isIntersecting), { rootMargin: '320px 0px' });
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+
+  // Only nearby cards poll; cards outside the viewport pause their telemetry requests.
   const telemetry = usePolling(
     () => fetchNodeSummary(node.id),
     [node.id],
-    10000,
-    true
+    refreshMs,
+    inView
   );
 
   const summary = telemetry.data;
@@ -58,7 +73,10 @@ function NodeCard({ node, onSelect, onRemove, CAN_WRITE }) {
   const history = summary ? summary.history || [] : [];
   const sys = useMemo(() => (latest ? systemSummary(latest) : null), [latest]);
   const st = useMemo(() => (latest ? storageSummary(latest) : null), [latest]);
-  const net = useMemo(() => (latest ? networkNow(latest) : null), [latest]);
+  const net = useMemo(() => {
+    const points = networkFromSeries(summary?.networkHistory || []).points;
+    return points.length ? points[points.length - 1] : null;
+  }, [summary?.networkHistory]);
 
   // Primary Storage Partition Usage
   const rootFs = useMemo(() => {
@@ -121,9 +139,10 @@ function NodeCard({ node, onSelect, onRemove, CAN_WRITE }) {
 
   return (
     <div
+      ref={cardRef}
       role="button"
       tabIndex={0}
-      aria-label={`Host ${node.hostname}, IP ${ipAddress}, status ${statusLabel}, CPU ${sys?.cpuPct != null ? Math.round(sys.cpuPct) : 0} percent`}
+      aria-label={`Host ${node.hostname}, IP ${ipAddress}, status ${statusLabel}, CPU ${sys?.cpuPct != null ? `${Math.round(sys.cpuPct)} percent` : 'unavailable'}`}
       className={`cyber-node-card ${!isOnline ? 'offline-card' : ''}`}
       style={!isOnline ? { opacity: 0.75 } : {}}
       onClick={() => onSelect(node.id)}
@@ -295,9 +314,10 @@ function NodeCard({ node, onSelect, onRemove, CAN_WRITE }) {
   );
 }
 
-export default function FleetGridTab({ nodes, query, setQuery, onSelectNode, onAddNode, onRemoveNode, CAN_WRITE }) {
-  const [filterState, setFilterState] = useState('all'); // 'all', 'online', 'offline', 'alerts'
-  const [sortBy, setSortBy] = useState('name-asc'); // 'name-asc', 'cpu-desc', 'ram-desc', 'offline-first', 'online-first'
+export default function FleetGridTab({ nodes, query, setQuery, onSelectNode, onAddNode, onRemoveNode, CAN_WRITE, refreshMs, initialFilter = 'all' }) {
+  const [filterState, setFilterState] = useState(initialFilter);
+  const [sortBy, setSortBy] = useState('name-asc');
+  const [displayMode, setDisplayMode] = useState('grid');
 
   // Dynamic filter pill counts
   const counts = useMemo(() => {
@@ -305,7 +325,8 @@ export default function FleetGridTab({ nodes, query, setQuery, onSelectNode, onA
     const online = nodes.filter((n) => n.reachability === 'reachable').length;
     const offline = total - online;
     const alerts = nodes.filter((n) => (n.active_alerts_count || 0) > 0).length;
-    return { total, online, offline, alerts };
+    const attention = nodes.filter((n) => n.reachability !== 'reachable' || Number(n.active_alerts_count || 0) > 0).length;
+    return { total, online, offline, alerts, attention };
   }, [nodes]);
 
   const processedNodes = useMemo(() => {
@@ -329,6 +350,8 @@ export default function FleetGridTab({ nodes, query, setQuery, onSelectNode, onA
       result = result.filter((n) => n.reachability !== 'reachable');
     } else if (filterState === 'alerts') {
       result = result.filter((n) => (n.active_alerts_count || 0) > 0);
+    } else if (filterState === 'attention') {
+      result = result.filter((n) => n.reachability !== 'reachable' || Number(n.active_alerts_count || 0) > 0);
     }
 
     // 3. Quick Sorting
@@ -347,22 +370,6 @@ export default function FleetGridTab({ nodes, query, setQuery, onSelectNode, onA
         if (aOnline !== bOnline) return aOnline ? 1 : -1;
         return a.hostname.localeCompare(b.hostname);
       }
-      if (sortBy === 'cpu-desc') {
-        if (!aOnline && !bOnline) return a.hostname.localeCompare(b.hostname);
-        if (!aOnline) return 1;
-        if (!bOnline) return -1;
-        const aCpu = a.current_cpu_pct ?? a.cpu_pct ?? 0;
-        const bCpu = b.current_cpu_pct ?? b.cpu_pct ?? 0;
-        return bCpu - aCpu;
-      }
-      if (sortBy === 'ram-desc') {
-        if (!aOnline && !bOnline) return a.hostname.localeCompare(b.hostname);
-        if (!aOnline) return 1;
-        if (!bOnline) return -1;
-        const aRam = a.current_ram_pct ?? a.ram_pct ?? 0;
-        const bRam = b.current_ram_pct ?? b.ram_pct ?? 0;
-        return bRam - aRam;
-      }
       return 0;
     });
 
@@ -371,7 +378,15 @@ export default function FleetGridTab({ nodes, query, setQuery, onSelectNode, onA
 
   return (
     <div className="fleet-grid-wrapper">
-      {/* Unified Search, Filter Pills & Quick Sort Toolbar */}
+      <section className="fleet-page-heading">
+        <div>
+          <div className="fleet-eyebrow"><span>INVENTORY</span><span className="fleet-heading-divider" /><span>{counts.total} ACTIVE HOSTS</span></div>
+          <h1>Hosts</h1>
+          <p>Browse enabled machines, inspect current collector health, and open host telemetry.</p>
+        </div>
+        {CAN_WRITE && <button className="fleet-primary-button" onClick={onAddNode}><span aria-hidden="true">+</span>Register host</button>}
+      </section>
+      {/* Host status filters, sorting, and view density */}
       <div
         className="fleet-controls-bar"
         style={{
@@ -386,25 +401,6 @@ export default function FleetGridTab({ nodes, query, setQuery, onSelectNode, onA
           padding: '8px 12px',
         }}
       >
-        <input
-          className="in fleet-search-input"
-          style={{
-            flex: '1 1 240px',
-            padding: '8px 14px',
-            fontSize: '13px',
-            borderRadius: '4px',
-            background: '#0A0B0D',
-            border: '1px solid #262B32',
-            outline: 'none',
-            color: '#E8EAED',
-            fontFamily: 'JetBrains Mono, monospace',
-          }}
-          aria-label="Filter target hosts by hostname, OS, or IP address"
-          placeholder="Filter host by name, OS, or IP..."
-          value={query || ''}
-          onChange={(e) => setQuery(e.target.value)}
-        />
-
         {/* Filter Pills */}
         <div className="filter-pills-group" style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
           <button
@@ -423,7 +419,13 @@ export default function FleetGridTab({ nodes, query, setQuery, onSelectNode, onA
             className={`filter-pill-btn ${filterState === 'offline' ? 'active' : ''}`}
             onClick={() => setFilterState('offline')}
           >
-            Offline ({counts.offline})
+            Stale / offline ({counts.offline})
+          </button>
+          <button
+            className={`filter-pill-btn ${filterState === 'attention' ? 'active' : ''}`}
+            onClick={() => setFilterState('attention')}
+          >
+            Needs attention ({counts.attention})
           </button>
           <button
             className={`filter-pill-btn ${filterState === 'alerts' ? 'active' : ''}`}
@@ -443,18 +445,20 @@ export default function FleetGridTab({ nodes, query, setQuery, onSelectNode, onA
             style={{ padding: '8px 12px', fontSize: '12px', borderRadius: '4px', background: '#1B1F24', borderColor: '#262B32', color: '#E8EAED', fontWeight: '700', cursor: 'pointer', fontFamily: 'JetBrains Mono, monospace' }}
           >
             <option value="name-asc">Name (A-Z)</option>
-            <option value="cpu-desc">CPU Usage (High to Low)</option>
-            <option value="ram-desc">RAM Usage (High to Low)</option>
             <option value="online-first">Status (Online First)</option>
             <option value="offline-first">Status (Offline First)</option>
           </select>
+        </div>
+        <div className="host-view-toggle" role="group" aria-label="Host display density">
+          <button type="button" className={displayMode === 'grid' ? 'active' : ''} onClick={() => setDisplayMode('grid')} aria-pressed={displayMode === 'grid'} aria-label="Grid view"><Grid2X2 size={15} /></button>
+          <button type="button" className={displayMode === 'list' ? 'active' : ''} onClick={() => setDisplayMode('list')} aria-pressed={displayMode === 'list'} aria-label="List view"><List size={16} /></button>
         </div>
       </div>
 
       {processedNodes.length === 0 ? (
         <div style={{ textAlign: 'center', padding: '36px 16px', background: '#14171B', border: '1px dashed #262B32', borderRadius: '6px' }}>
           <div style={{ color: '#8B93A0', fontSize: '13.5px', marginBottom: '14px' }}>
-            No hosts found matching your search or active filter.
+            {nodes.length === 0 ? 'No hosts are registered in this fleet.' : 'No hosts match your search or active filter.'}
           </div>
           <div style={{ display: 'flex', gap: '10px', justifyContent: 'center' }}>
             {(query || filterState !== 'all') && (
@@ -480,17 +484,22 @@ export default function FleetGridTab({ nodes, query, setQuery, onSelectNode, onA
           </div>
         </div>
       ) : (
-        <div className="fleet-cards-grid">
+        <div className={displayMode === 'grid' ? 'fleet-cards-grid' : 'fleet-host-table-wrap'}>
+          {displayMode === 'list' && <div className="fleet-host-table-head"><span>HOST</span><span>STATUS</span><span>LAST CONTACT</span><span>ALERTS</span><span /></div>}
           {processedNodes.map((n) => (
-            <NodeCard
-              key={n.id}
-              node={n}
-              onSelect={onSelectNode}
-              onRemove={() => onRemoveNode(n)}
-              CAN_WRITE={CAN_WRITE}
-            />
+            displayMode === 'grid' ? (
+              <NodeCard key={n.id} node={n} onSelect={onSelectNode} onRemove={() => onRemoveNode(n)} CAN_WRITE={CAN_WRITE} refreshMs={refreshMs} />
+            ) : (
+              <div className="fleet-host-table-row" key={n.id} role="button" tabIndex={0} onClick={() => onSelectNode(n.id)} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); onSelectNode(n.id); } }}>
+                <span className="fleet-host-table-name"><strong>{n.hostname}</strong><small>{n.collector_url || n.os_type || '—'}</small></span>
+                <span className={`fleet-host-table-status ${n.reachability || 'unknown'}`}><span className="shell-status-dot" />{n.reachability || 'unknown'}</span>
+                <span className="fleet-host-table-time">{n.last_seen_at ? formatRelative(n.last_seen_at) : '—'}</span>
+                <span className={n.active_alerts_count ? 'fleet-host-table-alerts has-alerts' : 'fleet-host-table-alerts'}>{n.active_alerts_count || '—'}</span>
+                <span className="fleet-host-table-actions">{CAN_WRITE && <button type="button" className="fleet-host-deactivate" aria-label={`Deactivate ${n.hostname}`} onClick={(event) => { event.stopPropagation(); onRemoveNode(n); }}>Deactivate</button>}</span>
+              </div>
+            )
           ))}
-          {CAN_WRITE && filterState === 'all' && !query && (
+          {displayMode === 'grid' && CAN_WRITE && filterState === 'all' && !query && (
             <div
               role="button"
               tabIndex={0}

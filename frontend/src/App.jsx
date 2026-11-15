@@ -5,7 +5,7 @@ import { useNodeData } from './hooks/useNodeData';
 import { RANGES } from './lib/metrics';
 import { CAN_WRITE } from './lib/role';
 import ErrorBoundary from './components/ErrorBoundary';
-import { NodeBar, REFRESH_OPTIONS, TopBar, VIEWS } from './components/Layout';
+import { REFRESH_OPTIONS, TopBar, VIEWS } from './components/Layout';
 import OverviewTab from './components/OverviewTab';
 import InventoryTab, { INVENTORY_SECTIONS } from './components/InventoryTab';
 import AlertsTab from './components/AlertsTab';
@@ -14,10 +14,10 @@ import InvestigationsTab from './components/InvestigationsTab';
 import SettingsTab from './components/SettingsTab';
 import AddNodeModal from './components/AddNodeModal';
 import { Empty, ErrorLine, Toast } from './components/ui';
-import ObservabilityTab from './components/ObservabilityTab';
 import PcapTab from './components/PcapTab';
 import AgentChatbotTab from './components/AgentChatbotTab';
 import FleetGridTab from './components/FleetGridTab';
+import FleetOverviewTab from './components/FleetOverviewTab';
 
 const read = (k, d) => {
   try {
@@ -36,7 +36,7 @@ const write = (k, v) => {
 };
 
 function Dashboard() {
-  const [view, setView] = useState(() => (VIEWS.some((v) => v.key === read('palantir.view')) ? read('palantir.view') : 'observability'));
+  const [view, setView] = useState(() => (VIEWS.some((v) => v.key === read('palantir.view')) ? read('palantir.view') : 'fleet-overview'));
   const [selectedId, setSelectedId] = useState(() => Number(read('palantir.node', 0)) || null);
   const [range, setRangeState] = useState(() => RANGES.find((r) => r.key === read('palantir.range')) || RANGES[0]);
   const [refreshMs, setRefreshMsState] = useState(() => {
@@ -44,14 +44,15 @@ function Dashboard() {
     return REFRESH_OPTIONS.some((o) => o.value === v) ? v : 10000;
   });
   const [query, setQuery] = useState('');
+  const [hostFilter, setHostFilter] = useState('all');
   const [section, setSection] = useState('services');
-  const [scope, setScope] = useState('node'); // events / logs / investigations: this node or whole fleet
+  const [scope, setScope] = useState(() => ['overview', 'inventory'].includes(read('palantir.view')) ? 'node' : 'fleet');
   const [focusInv, setFocusInv] = useState(null);
   const [showAdd, setShowAdd] = useState(false);
   const [pendingRemoveNode, setPendingRemoveNode] = useState(null);
   const [toast, setToast] = useState(null);
   const toastTimer = useRef(null);
-  const [prevView, setPrevView] = useState('observability');
+  const [prevView, setPrevView] = useState('fleet-overview');
   const [killedPids, setKilledPids] = useState(() => new Set());
   const handleKilledPids = useCallback((pids) => {
     if (!pids) return;
@@ -74,18 +75,27 @@ function Dashboard() {
     write('palantir.view', v);
   }, []);
   const goBack = useCallback(() => {
+    setScope('fleet');
     changeView('fleet');
   }, [changeView]);
   const goBackFromSettings = useCallback(() => {
     changeView(prevView || 'fleet');
   }, [changeView, prevView]);
-  const toggleSettings = useCallback(() => {
-    if (view === 'settings') {
-      changeView(prevView || 'fleet');
-    } else {
-      changeView('settings');
-    }
-  }, [view, changeView, prevView]);
+  const navigateShell = useCallback((nextView) => {
+    if (['events', 'logs', 'investigations', 'pcap'].includes(nextView)) setScope('fleet');
+    if (nextView === 'fleet') setHostFilter('all');
+    setFocusInv(null);
+    changeView(nextView);
+  }, [changeView]);
+  const showHosts = useCallback((filter = 'all') => {
+    setHostFilter(filter);
+    changeView('fleet');
+  }, [changeView]);
+  const openInvestigation = useCallback((id) => {
+    setScope('fleet');
+    setFocusInv(id);
+    changeView('investigations');
+  }, [changeView]);
   const notify = useCallback((text, error = false) => {
     setToast({ text, error });
     clearTimeout(toastTimer.current);
@@ -93,7 +103,7 @@ function Dashboard() {
   }, []);
 
   // ---- data -----------------------------------------------------------------
-  const fleet = useFleet(refreshMs || 15000);
+  const fleet = useFleet(refreshMs);
   const nodes = useMemo(() => (fleet.data ? fleet.data.nodes : []), [fleet.data]);
 
   // Keep the selection valid: stored node if it still exists, otherwise the first node.
@@ -104,12 +114,17 @@ function Dashboard() {
   useEffect(() => { if (selectedId) write('palantir.node', selectedId); }, [selectedId]);
 
   const node = nodes.find((n) => n.id === selectedId) || null;
-  const nodeData = useNodeData(node ? node.id : null, range, refreshMs, view, section);
+  const nodeDataEnabled = ['overview', 'inventory', 'settings'].includes(view) || (view === 'events' && scope === 'node');
+  const nodeData = useNodeData(nodeDataEnabled && node ? node.id : null, range, refreshMs, view, section);
 
-  const refreshAll = useCallback(() => { fleet.refresh(); nodeData.refresh(); }, [fleet, nodeData]);
+  const refreshAll = useCallback(() => {
+    fleet.refresh();
+    if (nodeDataEnabled && node) nodeData.refresh();
+  }, [fleet, nodeData, nodeDataEnabled, node]);
 
   const selectNodeDetail = useCallback((nodeId) => {
     setSelectedId(nodeId);
+    setScope('node');
     changeView('overview');
   }, [changeView]);
 
@@ -148,10 +163,10 @@ function Dashboard() {
         return;
       }
       if (showAdd || pendingRemoveNode) return;
-      if (e.key === '1') changeView('observability');
-      else if (e.key === '2') changeView('pcap');
-      else if (e.key === '3') changeView('agent');
-      else if (e.key === '4') changeView('fleet');
+      if (e.key === '1') navigateShell('fleet-overview');
+      else if (e.key === '2') navigateShell('fleet');
+      else if (e.key === '3') navigateShell('events');
+      else if (e.key === '4') navigateShell('logs');
       else if (e.key === '[' && nodes.length) {
         const idx = nodes.findIndex((n) => n.id === selectedId);
         setSelectedId(nodes[(idx - 1 + nodes.length) % nodes.length].id);
@@ -164,7 +179,7 @@ function Dashboard() {
       else if (e.key === 't') setRange(RANGES[(RANGES.findIndex((r) => r.key === range.key) + 1) % RANGES.length]);
       else if (e.key === 'a' && CAN_WRITE) { e.preventDefault(); setShowAdd(true); }
       else if (e.key === '/') {
-        const el = document.querySelector('input.in') || document.getElementById('global-instrument-search');
+        const el = document.querySelector('input.app-search-input');
         if (el) { e.preventDefault(); el.focus(); }
       } else if (view === 'inventory') {
         const s = INVENTORY_SECTIONS.find((x) => x.hotkey === e.key);
@@ -173,7 +188,7 @@ function Dashboard() {
     }
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [nodes, selectedId, range, view, showAdd, pendingRemoveNode, refreshAll, changeView, setRange]);
+  }, [nodes, selectedId, range, view, showAdd, pendingRemoveNode, refreshAll, navigateShell, setRange]);
 
   // ---- render -------------------------------------------------------------------
   let body;
@@ -205,106 +220,10 @@ function Dashboard() {
         onToast={notify}
       />
     );
-  } else if (nodes.length === 0) {
-    body = (
-      <div style={{ maxWidth: 860, margin: '30px auto', padding: '0 16px' }}>
-        <div
-          className="box hot"
-          style={{
-            background: '#070c08',
-            borderColor: '#193822',
-            borderRadius: '14px',
-            padding: '28px 24px',
-            boxShadow: '0 0 35px rgba(20, 60, 30, 0.35)',
-            marginBottom: '24px'
-          }}
-        >
-          <div className="box-title" style={{ fontSize: '14px', marginBottom: '16px' }}>
-            <span className="t-edge">┐</span>
-            <span className="t-chip">
-              <span className="t-name" style={{ fontSize: '15px', color: '#39e569' }}>
-                Welcome to PALANTIR — No Hosts Enrolled
-              </span>
-            </span>
-            <span className="t-edge">┌</span>
-            <span className="t-line" />
-          </div>
-
-          <div style={{ color: '#a3c4aa', fontSize: '14px', lineHeight: '1.6', marginBottom: '18px' }}>
-            There are currently no machines registered in your cluster. You can register this master host or any remote server, VM, or cloud instance.
-          </div>
-
-          <div
-            style={{
-              background: '#040705',
-              border: '1px solid #16301d',
-              borderRadius: '8px',
-              padding: '14px 18px',
-              fontFamily: 'JetBrains Mono, monospace',
-              fontSize: '13px',
-              color: '#728c78',
-              lineHeight: '1.7'
-            }}
-          >
-            <div style={{ color: '#39e569', fontWeight: 600, marginBottom: '6px' }}>
-              How to setup and enroll target hosts:
-            </div>
-            <div>
-              1. On any physical host, VM, or local system, run:
-            </div>
-            <div style={{ color: '#22d3ee', margin: '4px 0 8px 12px' }}>
-              sudo bash scripts/Automatic-Host-Setup.sh
-            </div>
-            <div>
-              2. For VirtualBox / VMware / NAT VMs, configure port forwarding with:
-            </div>
-            <div style={{ color: '#22d3ee', margin: '4px 0 8px 12px' }}>
-              sudo bash scripts/Automatic-VM-Setup-For-NAT.sh
-            </div>
-            <div>
-              3. Once the collector is active on port 20000, add the node below.
-            </div>
-          </div>
-        </div>
-
-        {CAN_WRITE && (
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 320px))', gap: '20px' }}>
-            <div
-              className="cyber-node-card add-node-card"
-              onClick={() => setShowAdd(true)}
-              style={{
-                cursor: 'pointer',
-                borderRadius: '14px',
-                minHeight: '220px',
-                border: '1.5px dashed #275635',
-                background: 'rgba(8, 15, 10, 0.6)'
-              }}
-            >
-              <div className="add-node-content">
-                <div className="add-node-icon" style={{ fontSize: '32px', color: '#39e569', fontWeight: 700 }}>+</div>
-                <div className="add-node-title" style={{ fontSize: '16px', fontWeight: 700, color: '#39e569' }}>
-                  Register First Host
-                </div>
-                <div style={{ fontSize: '12px', color: '#728c78', maxWidth: '200px', marginTop: '4px' }}>
-                  Click to add a host IP or press hotkey “a”
-                </div>
-              </div>
-            </div>
-          </div>
-        )}
-      </div>
-    );
-  } else if (view === 'observability') {
-    body = (
-      <ObservabilityTab
-        nodes={nodes}
-        searchFilter={query}
-        onSelectNode={selectNodeDetail}
-        onChangeView={changeView}
-      />
-    );
+  } else if (view === 'fleet-overview') {
+    body = <FleetOverviewTab fleet={fleet} nodes={nodes} query={query} onSelectNode={selectNodeDetail} onChangeView={changeView} onShowHosts={showHosts} onSelectInvestigation={openInvestigation} onAddNode={() => setShowAdd(true)} canWrite={CAN_WRITE} refreshMs={refreshMs} />;
   } else if (view === 'pcap') {
-    body = <PcapTab onOpenInvestigations={() => changeView('investigations')} />;
+    body = <PcapTab onOpenInvestigations={() => navigateShell('investigations')} refreshMs={refreshMs} />;
   } else if (view === 'agent') {
     body = <AgentChatbotTab onToast={notify} />;
   } else if (view === 'fleet') {
@@ -313,12 +232,20 @@ function Dashboard() {
         nodes={nodes}
         query={query}
         setQuery={setQuery}
+        initialFilter={hostFilter}
+        refreshMs={refreshMs}
         onSelectNode={selectNodeDetail}
         onAddNode={() => setShowAdd(true)}
         onRemoveNode={removeNode}
         CAN_WRITE={CAN_WRITE}
       />
     );
+  } else if (view === 'events') {
+    body = <AlertsTab node={node} state={nodeData} scope={scope} setScope={setScope} onInvestigate={onInvestigate} refreshMs={refreshMs} onBack={goBack} onChangeView={changeView} />;
+  } else if (view === 'logs') {
+    body = <LogsTab node={node} scope={scope} setScope={setScope} refreshMs={refreshMs} onBack={goBack} onChangeView={changeView} />;
+  } else if (view === 'investigations') {
+    body = <InvestigationsTab node={node} scope={scope} setScope={setScope} refreshMs={refreshMs} focusId={focusInv} onToast={notify} onBack={goBack} onChangeView={changeView} fleet={fleet} />;
   } else if (!node) {
     body = (
       <div style={{ textAlign: 'center', padding: '48px 16px', background: '#14171B', border: '1px dashed #262B32', borderRadius: '6px', maxWidth: 640, margin: '40px auto' }}>
@@ -327,7 +254,7 @@ function Dashboard() {
         </p>
         <button
           className="btn primary"
-          onClick={() => changeView('fleet')}
+          onClick={() => navigateShell('fleet')}
           style={{ background: '#C6FF00', color: '#0A0B0D', fontWeight: 700, padding: '7px 20px', borderRadius: '4px', fontSize: '12px' }}
         >
           Select from Hosts Grid
@@ -338,33 +265,28 @@ function Dashboard() {
     body = <OverviewTab node={node} state={nodeData} range={range} setRange={setRange} onBack={goBack} onChangeView={changeView} onToast={notify} onRefresh={nodeData.refresh} killedPids={killedPids} onKilledPids={handleKilledPids} />;
   } else if (view === 'inventory') {
     body = <InventoryTab node={node} state={nodeData} section={section} setSection={setSection} onBack={goBack} onChangeView={changeView} onToast={notify} onRefresh={nodeData.refresh} onKilledPids={handleKilledPids} />;
-  } else if (view === 'events') {
-    body = <AlertsTab node={node} state={nodeData} scope={scope} setScope={setScope} onInvestigate={onInvestigate} refreshMs={refreshMs} onBack={goBack} onChangeView={changeView} />;
-  } else if (view === 'logs') {
-    body = <LogsTab node={node} scope={scope} setScope={setScope} refreshMs={refreshMs} onBack={goBack} onChangeView={changeView} />;
   } else {
-    body = <InvestigationsTab node={node} scope={scope} setScope={setScope} refreshMs={refreshMs} focusId={focusInv} onToast={notify} onBack={goBack} onChangeView={changeView} fleet={fleet} />;
+    body = <OverviewTab node={node} state={nodeData} range={range} setRange={setRange} onBack={goBack} onChangeView={changeView} onToast={notify} onRefresh={nodeData.refresh} killedPids={killedPids} onKilledPids={handleKilledPids} />;
   }
 
   return (
-    <div className="term">
+    <>
       <TopBar
         view={view}
-        setView={changeView}
-        onToggleSettings={toggleSettings}
+        setView={navigateShell}
         fleet={fleet}
         refreshMs={refreshMs}
         setRefreshMs={setRefreshMs}
         refreshing={fleet.refreshing || nodeData.refreshing}
         onRefresh={refreshAll}
+        node={node}
         query={query}
         setQuery={setQuery}
-      />
-      <main className="term-main">
-        {nodeData.error && node && nodeData.data && view !== 'logs' && view !== 'investigations' && view !== 'fleet' && view !== 'observability' && view !== 'pcap' && view !== 'agent' && <ErrorLine warn>{nodeData.error}</ErrorLine>}
-        {nodeData.error && node && !nodeData.data && view !== 'logs' && view !== 'investigations' && view !== 'fleet' && view !== 'observability' && view !== 'pcap' && view !== 'agent' && <ErrorLine>{nodeData.error}</ErrorLine>}
+      >
+        {nodeData.error && node && nodeData.data && ['overview', 'inventory', 'events'].includes(view) && <ErrorLine warn>{nodeData.error}</ErrorLine>}
+        {nodeData.error && node && !nodeData.data && ['overview', 'inventory', 'events'].includes(view) && <ErrorLine>{nodeData.error}</ErrorLine>}
         {body}
-      </main>
+      </TopBar>
       {showAdd && <AddNodeModal onClose={() => setShowAdd(false)} onCreated={(n) => { setShowAdd(false); setSelectedId(n.id); fleet.refresh(); notify(`registered ${n.hostname}`); }} />}
       
       {/* Themed Safe Deactivation Confirmation Modal */}
@@ -461,7 +383,7 @@ function Dashboard() {
       )}
 
       <Toast toast={toast} />
-    </div>
+    </>
   );
 }
 

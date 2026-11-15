@@ -634,16 +634,8 @@ function DisksBox({ data, nodeId }) {
               if ((p === null || p === undefined) && tot && usd !== null) p = Math.min(100, (usd / tot) * 100);
               const pctVal = p !== null && p !== undefined ? Math.round(p) : null;
 
-              // Color logic: bright green (<70%), amber/yellow (70-90%), red (>=90%)
-              let barColor = '#22c55e'; // Bright green (<70%)
-              let textColor = '#39e569';
-              if (pctVal !== null && pctVal >= 90) {
-                barColor = '#f0616d'; // Bright red (>=90%)
-                textColor = '#f0616d';
-              } else if (pctVal !== null && pctVal >= 70) {
-                barColor = '#f59e0b'; // Amber / Yellow (70-90%)
-                textColor = '#fbbf24';
-              }
+              const barColor = '#C6FF00';
+              const textColor = '#C6FF00';
 
               return (
                 <div key={f.mount + f.device}>

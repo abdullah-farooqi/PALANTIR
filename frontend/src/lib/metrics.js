@@ -7,7 +7,7 @@
 // GET /nodes/{id}/metrics/{category}/series?source=palantir-agent returns snapshots shaped like
 //   { collected_at, data: { observed_at, status, source, data: { ...collector fields } }, metrics:{typed} }
 
-import { toMs } from './format';
+import { toMs } from './format.js';
 
 export const AGENT = 'palantir-agent';
 export const MIB = 1024 * 1024;

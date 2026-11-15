@@ -61,6 +61,16 @@ export default function SettingsTab({ node, data, fleet, refreshMs, setRefreshMs
   };
 
   const cats = (data && data.status && data.status.categories) || [];
+  const ops = fleet?.data?.ops;
+  const healthCards = [
+    { label: 'API', health: ops?.api },
+    { label: 'PostgreSQL', health: ops?.database },
+    { label: 'Redis', health: ops?.redis },
+    { label: 'Celery workers', health: ops?.celery?.workers },
+    { label: 'Beat scheduler', health: ops?.celery?.beat_dispatch },
+    { label: 'Metrics collection', health: ops?.tasks?.metrics_collection },
+    { label: 'Anomaly evaluation', health: ops?.tasks?.anomaly_evaluation },
+  ];
   const age = (iso) => (iso ? formatRelative(iso) : '—');
 
   const cell = (c, source) => {
@@ -429,48 +439,27 @@ export default function SettingsTab({ node, data, fleet, refreshMs, setRefreshMs
           n={4}
           title="BACKGROUND PIPELINE & OPERATIONAL HEALTH"
           hot
-          right={<span className="tone-dim">STACK STATUS</span>}
+          right={<span className="tone-dim">{ops?.status?.toUpperCase() || 'HEALTH UNKNOWN'}</span>}
         >
           <div style={{ padding: '6px 4px' }}>
             <p style={{ color: '#7a9680', fontSize: '12px', marginTop: 0, marginBottom: 14 }}>
               Status of backend core services, message brokers, and background worker task dispatchers.
             </p>
 
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 10 }}>
-              {/* Database */}
-              <div style={{ background: '#0d1710', border: '1px solid #193822', borderRadius: 8, padding: '10px 14px', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                <span style={{ fontSize: 12, fontWeight: 700, color: '#e2e8f0' }}>PostgreSQL</span>
-                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 11, color: '#39e569', fontWeight: 800 }}>
-                  <Dot tone={fleet.data.ops?.database?.status === 'healthy' ? 'green' : 'red'} />
-                  {fleet.data.ops?.database?.status?.toUpperCase() || 'ONLINE'}
-                </span>
-              </div>
-
-              {/* Redis Broker */}
-              <div style={{ background: '#0d1710', border: '1px solid #193822', borderRadius: 8, padding: '10px 14px', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                <span style={{ fontSize: 12, fontWeight: 700, color: '#e2e8f0' }}>Redis Cache/Queue</span>
-                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 11, color: '#39e569', fontWeight: 800 }}>
-                  <Dot tone={fleet.data.ops?.redis?.status === 'healthy' ? 'green' : 'red'} />
-                  {fleet.data.ops?.redis?.status?.toUpperCase() || 'ONLINE'}
-                </span>
-              </div>
-
-              {/* Celery Worker Pool */}
-              <div style={{ background: '#0d1710', border: '1px solid #193822', borderRadius: 8, padding: '10px 14px', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                <span style={{ fontSize: 12, fontWeight: 700, color: '#e2e8f0' }}>Celery Workers</span>
-                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 11, color: '#39e569', fontWeight: 800 }}>
-                  <Dot tone={fleet.data.ops?.celery?.workers?.status === 'healthy' ? 'green' : 'yellow'} />
-                  {fleet.data.ops?.celery?.workers?.status?.toUpperCase() || 'RUNNING'}
-                </span>
-              </div>
-
-              {/* Celery Beat Scheduler */}
-              <div style={{ background: '#0d1710', border: '1px solid #193822', borderRadius: 8, padding: '10px 14px', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                <span style={{ fontSize: 12, fontWeight: 700, color: '#e2e8f0' }}>Beat Scheduler</span>
-                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 11, color: '#39e569', fontWeight: 800 }}>
-                  <Dot tone={fleet.data.ops?.celery?.beat_dispatch?.status === 'healthy' ? 'green' : 'yellow'} />
-                  {fleet.data.ops?.celery?.beat_dispatch?.status?.toUpperCase() || 'RUNNING'}
-                </span>
+            <div className="settings-health-grid">
+              {healthCards.map(({ label, health }) => {
+                const status = health?.status || 'unknown';
+                const tone = ['healthy', 'running'].includes(status) ? 'green' : ['stale', 'unknown'].includes(status) ? 'yellow' : 'red';
+                return (
+                  <div className="settings-health-card" key={label} title={health?.error_code || undefined}>
+                    <span>{label}</span>
+                    <span className={`settings-health-status ${tone}`}><Dot tone={tone} />{status.toUpperCase()}</span>
+                  </div>
+                );
+              })}
+              <div className="settings-health-card">
+                <span>Queue depth{ops?.celery?.default_queue ? ` · ${ops.celery.default_queue}` : ''}</span>
+                <strong>{ops?.celery?.queue_depth ?? '—'}</strong>
               </div>
             </div>
           </div>

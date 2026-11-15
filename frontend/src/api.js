@@ -16,7 +16,7 @@
 //   GET    /logs                                    fleet log search (cursor paged)
 //   GET    /investigations/search | POST /investigations
 //   GET    /fleet/summary  /health/operations       fleet + pipeline health
-const BASE = (import.meta.env.VITE_API_BASE || '') + '/api/v1';
+const BASE = (import.meta.env?.VITE_API_BASE || '') + '/api/v1';
 
 export class ApiError extends Error {
   constructor(message, status) {

@@ -9,11 +9,11 @@ function statusStyle(status) {
   return { color: '#fbbf24', borderColor: '#785215' };
 }
 
-export default function NetworkEvidence({ investigation }) {
+export default function NetworkEvidence({ investigation, refreshMs }) {
   const evidenceState = usePolling(
     () => api.getInvestigationEvidence(investigation.id),
     [investigation.id],
-    5000,
+    refreshMs,
     Boolean(investigation.id),
   );
   const items = evidenceState.data?.items || [];

@@ -60,12 +60,7 @@ export default function LogsTab({ node, scope, setScope, refreshMs, onBack, onCh
 
   return (
     <>
-      <NodeHeaderNav
-        node={node}
-        currentView="logs"
-        onViewChange={onChangeView}
-        onBack={onBack}
-      />
+      {scope === 'node' && node && <NodeHeaderNav node={node} currentView="logs" onViewChange={onChangeView} onBack={onBack} />}
 
       {/* Main Logs Panel */}
       <Box
@@ -132,10 +127,7 @@ export default function LogsTab({ node, scope, setScope, refreshMs, onBack, onCh
             <Chips
               value={scope}
               onChange={setScope}
-              options={[
-                { value: 'node', label: 'THIS NODE' },
-                { value: 'fleet', label: 'FLEET' },
-              ]}
+              options={[...(node ? [{ value: 'node', label: 'THIS NODE' }] : []), { value: 'fleet', label: 'FLEET' }]}
             />
             <Chips
               value={paused ? 'p' : 'l'}

@@ -6,8 +6,8 @@ import { formatDateTime } from '../lib/format';
 import { Badge, Box, Empty, ErrorLine, Spinner } from './ui';
 import NetworkEvidence from './NetworkEvidence';
 
-export default function PcapTab({ onOpenInvestigations }) {
-  const state = usePolling(() => api.searchInvestigations({ limit: 100 }), [], 10000, true);
+export default function PcapTab({ onOpenInvestigations, refreshMs }) {
+  const state = usePolling(() => api.searchInvestigations({ limit: 100 }), [], refreshMs, true);
   const investigations = state.data?.items || [];
   const [selectedId, setSelectedId] = useState(null);
   useEffect(() => {
@@ -62,7 +62,7 @@ export default function PcapTab({ onOpenInvestigations }) {
             </div>
           </Box>
           <Box n={8} title={selected ? `INVESTIGATION #${selected.id}` : 'NETWORK EVIDENCE'}>
-            {selected ? <NetworkEvidence investigation={selected} /> : <Empty>Select an investigation to view network evidence.</Empty>}
+            {selected ? <NetworkEvidence investigation={selected} refreshMs={refreshMs} /> : <Empty>Select an investigation to view network evidence.</Empty>}
           </Box>
         </div>
       )}

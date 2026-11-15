@@ -4,7 +4,6 @@ import { usePolling } from './usePolling';
 
 const NET_MIN_MS = 30 * 60e3;
 const NET_MAX_MS = 2 * 60 * 60e3;
-const LATEST_WINDOW_MS = 20 * 60e3; // "latest" = newest snapshot inside the last 20 minutes
 
 // Inventory sections -> collector category that feeds them.
 const SECTION_CATEGORY = { services: 'services', containers: 'containers', vms: 'vms', sockets: 'connections', storage: 'storage' };
@@ -23,7 +22,9 @@ function plan(view, section) {
 
 function newest(nodeId, category, source) {
   return api
-    .getSeries(nodeId, category, { source, kind: 'full', limit: 1, since: new Date(Date.now() - LATEST_WINDOW_MS).toISOString() })
+    // Let the API apply its configured retention window so stale hosts can still show
+    // their most recent stored snapshot with its original collection timestamp.
+    .getSeries(nodeId, category, { source, kind: 'full', limit: 1 })
     .then((r) => (r.items && r.items[0]) || null);
 }
 
@@ -55,34 +56,41 @@ export function useNodeData(nodeId, range, refreshMs, view = 'overview', section
   return usePolling(
     async () => {
       const p = plan(view, section);
-      const tasks = [
-        { name: 'status', run: () => api.getCollectionStatus(nodeId) },
-        { name: 'active', run: () => api.getActiveAlerts(nodeId) },
-        ...p.agent.map((c) => ({ name: `agent:${c}`, run: () => newest(nodeId, c, AGENT) })),
-      ];
+      const tasks = [];
+      if (['overview', 'settings'].includes(view)) {
+        tasks.push({ name: 'status', run: () => api.getCollectionStatus(nodeId) });
+      }
+      if (view === 'events') {
+        tasks.push({ name: 'active', run: () => api.getActiveAlerts(nodeId) });
+      }
+      tasks.push(...p.agent.map((c) => ({ name: `agent:${c}`, run: () => newest(nodeId, c, AGENT) })));
       if (p.cpu) {
         tasks.push({
           name: 'cpu',
-          // per-second samples + the once-a-minute snapshots, raw for short ranges, bucketed for long ones
-          run: () => api.getSeries(nodeId, 'system', seriesParams(range, { source: AGENT })),
+          // CPU history uses the collector's per-second samples, without mixing in full snapshots.
+          run: () => api.getSeries(nodeId, 'system', seriesParams(range, { source: AGENT, kind: 'samples' })),
         });
       }
       if (p.net) {
         const netMs = Math.max(NET_MIN_MS, Math.min(range.ms, NET_MAX_MS));
         tasks.push({
           name: 'net',
-          run: () => api.getSeries(nodeId, 'network', { source: AGENT, limit: 120, since: new Date(Date.now() - netMs).toISOString() }),
+          run: () => api.getSeries(nodeId, 'network', { source: AGENT, kind: 'full', limit: 120, since: new Date(Date.now() - netMs).toISOString() }),
         });
       }
       if (view === 'overview') {
         tasks.push({
           name: 'storageSeries',
-          run: () => api.getSeries(nodeId, 'storage', { source: AGENT, limit: 5 }),
+          run: () => api.getSeries(nodeId, 'storage', { source: AGENT, kind: 'full', limit: 5 }),
         });
       }
 
+      if (tasks.length === 0) {
+        return { errors: {}, view, section, latest: assemble({}) };
+      }
+
       const results = await Promise.allSettled(tasks.map((t) => t.run()));
-      if (results.every((r) => r.status === 'rejected')) throw results[0].reason;
+      if (results.length && results.every((r) => r.status === 'rejected')) throw results[0].reason;
 
       const out = { errors: {}, view, section };
       const agent = {};
@@ -106,11 +114,14 @@ export function useNodeData(nodeId, range, refreshMs, view = 'overview', section
 
 export async function fetchNodeSummary(nodeId) {
   if (!nodeId) return null;
-  const categories = ['system', 'storage', 'processes', 'network'];
+  const categories = ['system', 'storage'];
+  const since = new Date(Date.now() - 5 * 60e3).toISOString();
   const tasks = [
     ...categories.map((c) => newest(nodeId, c, AGENT)),
-    // last ~5 minutes of CPU (per-second rows) for the card sparkline
-    api.getSeries(nodeId, 'system', { source: AGENT, since: new Date(Date.now() - 5 * 60e3).toISOString(), limit: 300 }),
+    // Two full network snapshots are enough to derive current bandwidth from real counters.
+    api.getSeries(nodeId, 'network', { source: AGENT, kind: 'full', since, limit: 2 }),
+    // The sparkline uses per-second samples only, not regular snapshots.
+    api.getSeries(nodeId, 'system', { source: AGENT, kind: 'samples', since, limit: 300 }),
   ];
   const results = await Promise.allSettled(tasks);
   const agent = {};
@@ -118,7 +129,9 @@ export async function fetchNodeSummary(nodeId) {
     const res = results[idx];
     if (res.status === 'fulfilled' && res.value) agent[cat] = res.value;
   });
-  const cpuSeriesRes = results[categories.length];
+  const networkRes = results[categories.length];
+  const networkHistory = networkRes.status === 'fulfilled' ? networkRes.value?.items || [] : [];
+  const cpuSeriesRes = results[categories.length + 1];
   const cpuItems = (cpuSeriesRes && cpuSeriesRes.status === 'fulfilled' && cpuSeriesRes.value && cpuSeriesRes.value.items) ? cpuSeriesRes.value.items : [];
-  return { latest: assemble(agent), history: cpuItems };
+  return { latest: assemble(agent), history: cpuItems, networkHistory };
 }

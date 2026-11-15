@@ -329,12 +329,7 @@ export default function InvestigationsTab({ node, scope, setScope, refreshMs, fo
 
   return (
     <>
-      <NodeHeaderNav
-        node={node}
-        currentView="investigations"
-        onViewChange={onChangeView}
-        onBack={onBack}
-      />
+      {scope === 'node' && node && <NodeHeaderNav node={node} currentView="investigations" onViewChange={onChangeView} onBack={onBack} />}
 
       <div className="two-col" style={{ alignItems: 'start' }}>
         {/* Left Box: Investigations List */}
@@ -368,10 +363,7 @@ export default function InvestigationsTab({ node, scope, setScope, refreshMs, fo
               <Chips
                 value={scope}
                 onChange={setScope}
-                options={[
-                  { value: 'node', label: 'THIS NODE' },
-                  { value: 'fleet', label: 'FLEET' },
-                ]}
+                options={[...(node ? [{ value: 'node', label: 'THIS NODE' }] : []), { value: 'fleet', label: 'FLEET' }]}
               />
               {CAN_WRITE && (
                 <button
@@ -495,7 +487,7 @@ export default function InvestigationsTab({ node, scope, setScope, refreshMs, fo
                 </div>
               )}
               <Evidence inv={current} />
-              <NetworkEvidence investigation={current} />
+              <NetworkEvidence investigation={current} refreshMs={refreshMs} />
 
               {current.raw_output && (
                 <details style={{ marginTop: 14 }}>
