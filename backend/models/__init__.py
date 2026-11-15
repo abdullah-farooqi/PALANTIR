@@ -9,7 +9,7 @@ from .log_event import LogEvent
 from .category_status import CategoryCollectionStatus
 from .service_heartbeat import ServiceHeartbeat
 from .threshold import SystemAlertThreshold
-from .pcap_analysis import PcapAnalysisRuns, PcapFlows
+from .pcap_analysis import PcapAnalysisRuns, PcapFlows, TcpSessions, PcapArtifacts
 
 __all__ = [
     "Base",
@@ -25,4 +25,6 @@ __all__ = [
     "SystemAlertThreshold",
     "PcapAnalysisRuns",
     "PcapFlows",
+    "TcpSessions",
+    "PcapArtifacts",
 ]

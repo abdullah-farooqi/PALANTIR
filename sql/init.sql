@@ -473,4 +473,77 @@ CREATE INDEX IF NOT EXISTS idx_pcap_flows_protocol ON pcap_flows(protocol);
 CREATE INDEX IF NOT EXISTS idx_pcap_flows_time ON pcap_flows(first_seen, last_seen);
 CREATE INDEX IF NOT EXISTS idx_pcap_flows_flow_key ON pcap_flows(flow_key);
 
+CREATE TABLE IF NOT EXISTS tcp_sessions (
+    id                  BIGSERIAL PRIMARY KEY,
+    run_id              VARCHAR(64) NOT NULL REFERENCES pcap_analysis_runs(run_id) ON DELETE CASCADE,
+    evidence_id         INT NOT NULL REFERENCES investigation_evidence(id) ON DELETE CASCADE,
+    src_ip              INET NOT NULL,
+    dst_ip              INET NOT NULL,
+    src_port            INT NOT NULL CHECK (src_port >= 0 AND src_port <= 65535),
+    dst_port            INT NOT NULL CHECK (dst_port >= 0 AND dst_port <= 65535),
+    state               VARCHAR(16) NOT NULL DEFAULT 'open'
+                        CHECK (state IN ('open', 'established', 'closed', 'reset', 'half_open', 'incomplete')),
+    server_isn          BIGINT,
+    client_isn          BIGINT,
+    server_win_size     INT,
+    client_win_size     INT,
+    total_bytes         BIGINT NOT NULL DEFAULT 0,
+    reassembled_bytes   BIGINT NOT NULL DEFAULT 0,
+    missing_bytes       BIGINT NOT NULL DEFAULT 0,
+    retransmit_bytes    BIGINT NOT NULL DEFAULT 0,
+    ooo_bytes           BIGINT NOT NULL DEFAULT 0,
+    overlap_bytes       BIGINT NOT NULL DEFAULT 0,
+    reassembly_quality  FLOAT,
+    syn_time            TIMESTAMPTZ,
+    established_time    TIMESTAMPTZ,
+    close_time          TIMESTAMPTZ,
+    last_activity       TIMESTAMPTZ,
+    snaplen             INT NOT NULL,
+    payload_truncated   BOOLEAN NOT NULL DEFAULT FALSE,
+    confidence          VARCHAR(8) NOT NULL DEFAULT 'high'
+                        CHECK (confidence IN ('high', 'medium', 'low')),
+    first_seen          TIMESTAMPTZ NOT NULL,
+    last_seen           TIMESTAMPTZ NOT NULL,
+    duration_seconds    FLOAT,
+    captured_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_tcp_sessions_run_flow UNIQUE (run_id, src_ip, dst_ip, src_port, dst_port, first_seen)
+);
+
+CREATE INDEX IF NOT EXISTS idx_tcp_sessions_run ON tcp_sessions(run_id);
+CREATE INDEX IF NOT EXISTS idx_tcp_sessions_evidence ON tcp_sessions(evidence_id);
+CREATE INDEX IF NOT EXISTS idx_tcp_sessions_state ON tcp_sessions(state);
+CREATE INDEX IF NOT EXISTS idx_tcp_sessions_quality ON tcp_sessions(reassembly_quality);
+CREATE INDEX IF NOT EXISTS idx_tcp_sessions_truncated ON tcp_sessions(payload_truncated) WHERE payload_truncated = TRUE;
+CREATE INDEX IF NOT EXISTS idx_tcp_sessions_confidence ON tcp_sessions(confidence);
+
+CREATE TABLE IF NOT EXISTS pcap_artifacts (
+    id                  BIGSERIAL PRIMARY KEY,
+    run_id              VARCHAR(64) NOT NULL REFERENCES pcap_analysis_runs(run_id) ON DELETE CASCADE,
+    evidence_id         INT NOT NULL REFERENCES investigation_evidence(id) ON DELETE CASCADE,
+    artifact_type       VARCHAR(32) NOT NULL
+                        CHECK (artifact_type IN ('http_request', 'http_response', 'dns_query', 'dns_response', 'tls_client_hello', 'tls_server_hello', 'tls_certificate', 'tls_ja3')),
+    session_id          BIGINT REFERENCES tcp_sessions(id) ON DELETE SET NULL,
+    flow_id             BIGINT REFERENCES pcap_flows(id) ON DELETE SET NULL,
+    content_type        VARCHAR(255),
+    content_length      BIGINT CHECK (content_length IS NULL OR content_length >= 0),
+    sha256              VARCHAR(64),
+    storage_key         VARCHAR(1024),
+    storage_prefix      VARCHAR(255),
+    metadata            JSONB NOT NULL DEFAULT '{}',
+    size_bytes          BIGINT NOT NULL DEFAULT 0 CHECK (size_bytes >= 0),
+    max_size_exceeded   BOOLEAN NOT NULL DEFAULT FALSE,
+    captured_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT ck_pcap_artifacts_storage
+        CHECK (
+            storage_key IS NULL OR sha256 IS NOT NULL
+        )
+);
+
+CREATE INDEX IF NOT EXISTS idx_pcap_artifacts_run ON pcap_artifacts(run_id);
+CREATE INDEX IF NOT EXISTS idx_pcap_artifacts_evidence ON pcap_artifacts(evidence_id);
+CREATE INDEX IF NOT EXISTS idx_pcap_artifacts_type ON pcap_artifacts(artifact_type);
+CREATE INDEX IF NOT EXISTS idx_pcap_artifacts_sha256 ON pcap_artifacts(sha256) WHERE sha256 IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_pcap_artifacts_storage_prefix ON pcap_artifacts(storage_prefix) WHERE storage_prefix IS NOT NULL;
+
+
 

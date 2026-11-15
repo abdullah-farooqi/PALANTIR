@@ -77,6 +77,8 @@ class PcapAnalysisRuns(Base):
     investigation = relationship("AgentInvestigation", foreign_keys=[investigation_id])
     node = relationship("MonitoredNode", foreign_keys=[node_id])
     flows = relationship("PcapFlows", back_populates="run", cascade="all, delete-orphan")
+    sessions = relationship("TcpSessions", back_populates="run", cascade="all, delete-orphan")
+    artifacts = relationship("PcapArtifacts", back_populates="run", cascade="all, delete-orphan")
 
 
 class PcapFlows(Base):
@@ -156,3 +158,169 @@ class PcapFlows(Base):
 
     run = relationship("PcapAnalysisRuns", back_populates="flows")
     evidence = relationship("InvestigationEvidence", foreign_keys=[evidence_id])
+    artifacts = relationship("PcapArtifacts", back_populates="flow")
+
+
+class TcpSessions(Base):
+    """Reconstructed TCP session tracking sequence metrics, quality, and reassembly state."""
+
+    __tablename__ = "tcp_sessions"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    run_id = Column(
+        String(64),
+        ForeignKey("pcap_analysis_runs.run_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    evidence_id = Column(
+        Integer,
+        ForeignKey("investigation_evidence.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    src_ip = Column(INET, nullable=False)
+    dst_ip = Column(INET, nullable=False)
+    src_port = Column(Integer, nullable=False)
+    dst_port = Column(Integer, nullable=False)
+
+    state = Column(
+        String(16),
+        nullable=False,
+        default="open",
+        index=True,
+    )
+
+    server_isn = Column(BigInteger, nullable=True)
+    client_isn = Column(BigInteger, nullable=True)
+    server_win_size = Column(Integer, nullable=True)
+    client_win_size = Column(Integer, nullable=True)
+
+    total_bytes = Column(BigInteger, nullable=False, default=0)
+    reassembled_bytes = Column(BigInteger, nullable=False, default=0)
+    missing_bytes = Column(BigInteger, nullable=False, default=0)
+    retransmit_bytes = Column(BigInteger, nullable=False, default=0)
+    ooo_bytes = Column(BigInteger, nullable=False, default=0)
+    overlap_bytes = Column(BigInteger, nullable=False, default=0)
+    reassembly_quality = Column(Float, nullable=True, index=True)
+
+    syn_time = Column(DateTime(timezone=True), nullable=True)
+    established_time = Column(DateTime(timezone=True), nullable=True)
+    close_time = Column(DateTime(timezone=True), nullable=True)
+    last_activity = Column(DateTime(timezone=True), nullable=True)
+
+    snaplen = Column(Integer, nullable=False)
+    payload_truncated = Column(Boolean, nullable=False, default=False)
+    confidence = Column(
+        String(8),
+        nullable=False,
+        default="high",
+        index=True,
+    )
+
+    first_seen = Column(DateTime(timezone=True), nullable=False)
+    last_seen = Column(DateTime(timezone=True), nullable=False)
+    duration_seconds = Column(Float, nullable=True)
+
+    captured_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+    __table_args__ = (
+        UniqueConstraint("run_id", "src_ip", "dst_ip", "src_port", "dst_port", "first_seen", name="uq_tcp_sessions_run_flow"),
+        CheckConstraint(
+            "state IN ('open', 'established', 'closed', 'reset', 'half_open', 'incomplete')",
+            name="ck_tcp_sessions_state",
+        ),
+        CheckConstraint(
+            "confidence IN ('high', 'medium', 'low')",
+            name="ck_tcp_sessions_confidence",
+        ),
+        CheckConstraint(
+            "src_port >= 0 AND src_port <= 65535",
+            name="ck_tcp_sessions_src_port",
+        ),
+        CheckConstraint(
+            "dst_port >= 0 AND dst_port <= 65535",
+            name="ck_tcp_sessions_dst_port",
+        ),
+    )
+
+    run = relationship("PcapAnalysisRuns", back_populates="sessions")
+    evidence = relationship("InvestigationEvidence", foreign_keys=[evidence_id])
+    artifacts = relationship("PcapArtifacts", back_populates="session")
+
+
+class PcapArtifacts(Base):
+    """Forensic payload artifacts extracted from streams (HTTP, DNS, TLS metadata)."""
+
+    __tablename__ = "pcap_artifacts"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    run_id = Column(
+        String(64),
+        ForeignKey("pcap_analysis_runs.run_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    evidence_id = Column(
+        Integer,
+        ForeignKey("investigation_evidence.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    artifact_type = Column(
+        String(32),
+        nullable=False,
+        index=True,
+    )
+    session_id = Column(
+        BigInteger,
+        ForeignKey("tcp_sessions.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    flow_id = Column(
+        BigInteger,
+        ForeignKey("pcap_flows.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
+    content_type = Column(String(255), nullable=True)
+    content_length = Column(BigInteger, nullable=True)
+    sha256 = Column(String(64), nullable=True, index=True)
+    storage_key = Column(String(1024), nullable=True)
+    storage_prefix = Column(String(255), nullable=True, index=True)
+
+    metadata_json = Column("metadata", JSONB, nullable=False, default=dict)
+    size_bytes = Column(BigInteger, nullable=False, default=0)
+    max_size_exceeded = Column(Boolean, nullable=False, default=False)
+
+    captured_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "artifact_type IN ('http_request', 'http_response', 'dns_query', 'dns_response', 'tls_client_hello', 'tls_server_hello', 'tls_certificate', 'tls_ja3')",
+            name="ck_pcap_artifacts_type",
+        ),
+        CheckConstraint(
+            "size_bytes >= 0",
+            name="ck_pcap_artifacts_size_bytes",
+        ),
+        CheckConstraint(
+            "(storage_key IS NULL AND sha256 IS NULL) OR (storage_key IS NOT NULL AND sha256 IS NOT NULL)",
+            name="ck_pcap_artifacts_storage",
+        ),
+    )
+
+    run = relationship("PcapAnalysisRuns", back_populates="artifacts")
+    evidence = relationship("InvestigationEvidence", foreign_keys=[evidence_id])
+    session = relationship("TcpSessions", back_populates="artifacts")
+    flow = relationship("PcapFlows", back_populates="artifacts")

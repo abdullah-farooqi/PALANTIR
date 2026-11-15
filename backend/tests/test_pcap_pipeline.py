@@ -13,15 +13,18 @@ from sqlalchemy import select
 
 from core.config import settings
 from core.database import get_sync_session
+from core.storage import get_storage_backend
 from models.investigation import AgentInvestigation
 from models.investigation_evidence import InvestigationEvidence
 from models.node import MonitoredNode
-from models.pcap_analysis import PcapAnalysisRuns, PcapFlows
+from models.pcap_analysis import PcapAnalysisRuns, PcapArtifacts, PcapFlows, TcpSessions
 from workers.pcap_pipeline import (
     _read_pure_python_packets,
     normalize_flow_key,
     open_decompressed_pcap,
+    pcap_analysis_extract_artifacts,
     pcap_analysis_extract_flows,
+    pcap_analysis_reconstruct_sessions,
     pcap_analysis_validate,
     start_pcap_analysis,
 )
@@ -259,7 +262,7 @@ def test_flow_extraction_persists_flows(tmp_path, monkeypatch):
         ev_id = ev.id
 
     res = pcap_analysis_extract_flows(ev_id, run_id=run_id)
-    assert res["status"] == "complete"
+    assert res["status"] == "flows_extracted"
     assert res["flow_count"] == 2  # 1 TCP bidirectional flow + 1 UDP flow
 
     with get_sync_session() as session:
@@ -312,3 +315,364 @@ def test_start_pcap_analysis_enqueues_chain(tmp_path, monkeypatch):
         assert run.status == "pending"
         assert run.evidence_id == ev_id
         assert run.investigation_id == inv_id
+
+
+def make_custom_pcap(packet_bytes_list: list[bytes], snaplen: int = 65535) -> bytes:
+    """Build a PCAP with specified packets and snaplen."""
+    magic = b"\xd4\xc3\xb2\xa1"
+    gh = magic + struct.pack("<HHiIII", 2, 4, 0, 0, snaplen, 1)
+    pkts = []
+    base_ts = 1700000000
+    for idx, raw_pkt in enumerate(packet_bytes_list):
+        cap_len = min(len(raw_pkt), snaplen)
+        hdr = struct.pack("<IIII", base_ts + idx, idx * 1000, cap_len, len(raw_pkt))
+        pkts.append(hdr + raw_pkt[:cap_len])
+    return gh + b"".join(pkts)
+
+
+def build_custom_tcp_packet(
+    src_ip: str,
+    dst_ip: str,
+    src_port: int,
+    dst_port: int,
+    seq: int,
+    ack: int,
+    flags: int,
+    payload: bytes = b"",
+    win: int = 65535,
+) -> bytes:
+    """Construct an IPv4 TCP frame with specified 5-tuple, sequence, flags, and payload."""
+    eth = b"\x00\x11\x22\x33\x44\x55\x66\x77\x88\x99\xaa\xbb\x08\x00"
+    ip = struct.pack(
+        "!BBHHHBBH4s4s",
+        0x45, 0, 40 + len(payload), 101, 0x4000, 64, 6, 0,
+        socket.inet_aton(src_ip), socket.inet_aton(dst_ip),
+    )
+    data_offset_flags = (5 << 12) | flags
+    tcp = struct.pack("!HHIIHH", src_port, dst_port, seq, ack, data_offset_flags, win) + b"\x00\x00\x00\x00"
+    return eth + ip + tcp + payload
+
+
+def build_custom_udp_packet(
+    src_ip: str,
+    dst_ip: str,
+    src_port: int,
+    dst_port: int,
+    payload: bytes = b"",
+) -> bytes:
+    """Construct an IPv4 UDP frame."""
+    eth = b"\x00\x11\x22\x33\x44\x55\x66\x77\x88\x99\xaa\xbb\x08\x00"
+    ip = struct.pack(
+        "!BBHHHBBH4s4s",
+        0x45, 0, 28 + len(payload), 101, 0, 64, 17, 0,
+        socket.inet_aton(src_ip), socket.inet_aton(dst_ip),
+    )
+    udp = struct.pack("!HHHH", src_port, dst_port, 8 + len(payload), 0)
+    return eth + ip + udp + payload
+
+
+def test_tcp_session_reconstruction(tmp_path, monkeypatch):
+    """Verify TCP 3-way handshake and session reconstruction."""
+    monkeypatch.setattr(settings, "PCAP_STORAGE_DIR", tmp_path)
+    pkts = [
+        # 1. SYN
+        build_custom_tcp_packet("192.168.1.100", "10.0.0.1", 45100, 80, seq=1000, ack=0, flags=0x02, win=64240),
+        # 2. SYN-ACK
+        build_custom_tcp_packet("10.0.0.1", "192.168.1.100", 80, 45100, seq=5000, ack=1001, flags=0x12, win=65535),
+        # 3. ACK
+        build_custom_tcp_packet("192.168.1.100", "10.0.0.1", 45100, 80, seq=1001, ack=5001, flags=0x10, win=64240),
+        # 4. Data
+        build_custom_tcp_packet("192.168.1.100", "10.0.0.1", 45100, 80, seq=1001, ack=5001, flags=0x18, payload=b"HELLO_SERVER", win=64240),
+    ]
+    pcap_data = make_custom_pcap(pkts)
+    pcap_path = tmp_path / "sessions.pcap"
+    pcap_path.write_bytes(pcap_data)
+
+    with get_sync_session() as session:
+        node = MonitoredNode(hostname="test-node-sess", collector_url="http://127.0.0.1:20000", active=True)
+        session.add(node)
+        session.flush()
+        inv = AgentInvestigation(node_id=node.id, trigger_type="manual", status="complete")
+        session.add(inv)
+        session.flush()
+        ev = InvestigationEvidence(
+            investigation_id=inv.id,
+            node_id=node.id,
+            evidence_type="pcap_collection",
+            file_name="sessions.pcap",
+            storage_key="sessions.pcap",
+            status="complete",
+        )
+        session.add(ev)
+        session.flush()
+        run_id = uuid4().hex
+        run = PcapAnalysisRuns(
+            run_id=run_id,
+            evidence_id=ev.id,
+            investigation_id=inv.id,
+            node_id=node.id,
+            status="running",
+            current_step="extract_flows",
+        )
+        session.add(run)
+        session.commit()
+        ev_id = ev.id
+
+    res = pcap_analysis_reconstruct_sessions(ev_id, run_id=run_id)
+    assert res["status"] == "sessions_reconstructed"
+    assert res["session_count"] == 1
+
+    with get_sync_session() as session:
+        sess = session.execute(
+            select(TcpSessions).where(TcpSessions.run_id == run_id)
+        ).scalar_one()
+        assert sess.client_isn == 1000
+        assert sess.server_isn == 5000
+        assert sess.client_win_size == 64240
+        assert sess.server_win_size == 65535
+        assert sess.state == "established"
+        assert sess.reassembled_bytes == 12
+        assert sess.confidence == "high"
+        assert sess.payload_truncated is False
+
+
+def test_artifact_extraction_http(tmp_path, monkeypatch):
+    """Extract HTTP request and response artifacts and store payload bodies."""
+    monkeypatch.setattr(settings, "PCAP_STORAGE_DIR", tmp_path)
+    req_body = b"GET /index.html HTTP/1.1\r\nHost: example.com\r\n\r\n"
+    resp_body = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 17\r\n\r\n<h1>Palantir</h1>"
+    pkts = [
+        build_custom_tcp_packet("192.168.1.100", "10.0.0.1", 45200, 80, seq=1000, ack=5000, flags=0x18, payload=req_body),
+        build_custom_tcp_packet("10.0.0.1", "192.168.1.100", 80, 45200, seq=5000, ack=1000 + len(req_body), flags=0x18, payload=resp_body),
+    ]
+    pcap_data = make_custom_pcap(pkts)
+    pcap_path = tmp_path / "http.pcap"
+    pcap_path.write_bytes(pcap_data)
+
+    with get_sync_session() as session:
+        node = MonitoredNode(hostname="test-node-http", collector_url="http://127.0.0.1:20000", active=True)
+        session.add(node)
+        session.flush()
+        inv = AgentInvestigation(node_id=node.id, trigger_type="manual", status="complete")
+        session.add(inv)
+        session.flush()
+        ev = InvestigationEvidence(
+            investigation_id=inv.id,
+            node_id=node.id,
+            evidence_type="pcap_collection",
+            file_name="http.pcap",
+            storage_key="http.pcap",
+            status="complete",
+        )
+        session.add(ev)
+        session.flush()
+        run_id = uuid4().hex
+        run = PcapAnalysisRuns(
+            run_id=run_id,
+            evidence_id=ev.id,
+            investigation_id=inv.id,
+            node_id=node.id,
+            status="running",
+            current_step="reconstruct_sessions",
+        )
+        session.add(run)
+        session.commit()
+        ev_id = ev.id
+
+    res = pcap_analysis_extract_artifacts(ev_id, run_id=run_id)
+    assert res["status"] == "complete"
+    assert res["artifact_count"] >= 2
+
+    with get_sync_session() as session:
+        arts = session.execute(
+            select(PcapArtifacts).where(PcapArtifacts.run_id == run_id)
+        ).scalars().all()
+        req_art = next(a for a in arts if a.artifact_type == "http_request")
+        assert req_art.metadata_json["uri"] == "/index.html"
+        assert req_art.metadata_json["method"] == "GET"
+
+        resp_art = next(a for a in arts if a.artifact_type == "http_response")
+        assert resp_art.metadata_json["status_code"] == 200
+        assert resp_art.content_type == "text/html"
+        assert resp_art.storage_key is not None
+        storage = get_storage_backend()
+        stored_bytes = storage.get_artifact(resp_art.storage_key)
+        assert stored_bytes == b"<h1>Palantir</h1>"
+
+
+def test_artifact_extraction_dns(tmp_path, monkeypatch):
+    """Extract DNS query artifacts from UDP port 53 packets."""
+    monkeypatch.setattr(settings, "PCAP_STORAGE_DIR", tmp_path)
+    dns_query = (
+        struct.pack("!HHHHHH", 0xABCD, 0x0100, 1, 0, 0, 0)
+        + b"\x07example\x03com\x00"
+        + struct.pack("!HH", 1, 1)
+    )
+    pkt = build_custom_udp_packet("192.168.1.100", "8.8.8.8", 53100, 53, payload=dns_query)
+    pcap_data = make_custom_pcap([pkt])
+    pcap_path = tmp_path / "dns.pcap"
+    pcap_path.write_bytes(pcap_data)
+
+    with get_sync_session() as session:
+        node = MonitoredNode(hostname="test-node-dns", collector_url="http://127.0.0.1:20000", active=True)
+        session.add(node)
+        session.flush()
+        inv = AgentInvestigation(node_id=node.id, trigger_type="manual", status="complete")
+        session.add(inv)
+        session.flush()
+        ev = InvestigationEvidence(
+            investigation_id=inv.id,
+            node_id=node.id,
+            evidence_type="pcap_collection",
+            file_name="dns.pcap",
+            storage_key="dns.pcap",
+            status="complete",
+        )
+        session.add(ev)
+        session.flush()
+        run_id = uuid4().hex
+        run = PcapAnalysisRuns(
+            run_id=run_id,
+            evidence_id=ev.id,
+            investigation_id=inv.id,
+            node_id=node.id,
+            status="running",
+            current_step="reconstruct_sessions",
+        )
+        session.add(run)
+        session.commit()
+        ev_id = ev.id
+
+    res = pcap_analysis_extract_artifacts(ev_id, run_id=run_id)
+    assert res["status"] == "complete"
+    assert res["artifact_count"] == 1
+
+    with get_sync_session() as session:
+        art = session.execute(
+            select(PcapArtifacts).where(PcapArtifacts.run_id == run_id)
+        ).scalar_one()
+        assert art.artifact_type == "dns_query"
+        assert art.metadata_json["query_name"] == "example.com"
+
+
+def test_artifact_extraction_tls(tmp_path, monkeypatch):
+    """Extract TLS ClientHello SNI and JA3 hash fingerprints."""
+    monkeypatch.setattr(settings, "PCAP_STORAGE_DIR", tmp_path)
+    sni_host = b"secure.corp.local"
+    sni_ext = struct.pack("!HHHB", 0, len(sni_host) + 5, len(sni_host) + 3, 0) + struct.pack("!H", len(sni_host)) + sni_host
+    exts_data = sni_ext
+    ciphers = struct.pack("!HHH", 4, 0x002f, 0x0035)
+    handshake = (
+        struct.pack("!B", 1) + b"\x00"
+        + struct.pack("!H", 38 + len(ciphers) + len(exts_data))
+        + struct.pack("!H", 0x0303)
+        + (b"\x02" * 32)
+        + b"\x00"
+        + ciphers
+        + b"\x01\x00"
+        + struct.pack("!H", len(exts_data))
+        + exts_data
+    )
+    record = b"\x16\x03\x01" + struct.pack("!H", len(handshake)) + handshake
+    pkt = build_custom_tcp_packet("192.168.1.100", "10.0.0.1", 45300, 443, seq=1000, ack=0, flags=0x18, payload=record)
+    pcap_data = make_custom_pcap([pkt])
+    pcap_path = tmp_path / "tls.pcap"
+    pcap_path.write_bytes(pcap_data)
+
+    with get_sync_session() as session:
+        node = MonitoredNode(hostname="test-node-tls", collector_url="http://127.0.0.1:20000", active=True)
+        session.add(node)
+        session.flush()
+        inv = AgentInvestigation(node_id=node.id, trigger_type="manual", status="complete")
+        session.add(inv)
+        session.flush()
+        ev = InvestigationEvidence(
+            investigation_id=inv.id,
+            node_id=node.id,
+            evidence_type="pcap_collection",
+            file_name="tls.pcap",
+            storage_key="tls.pcap",
+            status="complete",
+        )
+        session.add(ev)
+        session.flush()
+        run_id = uuid4().hex
+        run = PcapAnalysisRuns(
+            run_id=run_id,
+            evidence_id=ev.id,
+            investigation_id=inv.id,
+            node_id=node.id,
+            status="running",
+            current_step="reconstruct_sessions",
+        )
+        session.add(run)
+        session.commit()
+        ev_id = ev.id
+
+    res = pcap_analysis_extract_artifacts(ev_id, run_id=run_id)
+    assert res["status"] == "complete"
+    assert res["artifact_count"] >= 2
+
+    with get_sync_session() as session:
+        arts = session.execute(
+            select(PcapArtifacts).where(PcapArtifacts.run_id == run_id)
+        ).scalars().all()
+        hello_art = next(a for a in arts if a.artifact_type == "tls_client_hello")
+        assert hello_art.metadata_json["sni"] == "secure.corp.local"
+        assert hello_art.metadata_json["ja3_hash"] is not None
+
+        ja3_art = next(a for a in arts if a.artifact_type == "tls_ja3")
+        assert ja3_art.metadata_json["ja3_hash"] == hello_art.metadata_json["ja3_hash"]
+
+
+def test_snaplen_truncation_confidence(tmp_path, monkeypatch):
+    """Verify snaplen <= 128 results in low confidence and truncated flag."""
+    monkeypatch.setattr(settings, "PCAP_STORAGE_DIR", tmp_path)
+    pkt = build_custom_tcp_packet(
+        "192.168.1.100", "10.0.0.1", 45400, 80, seq=1000, ack=0, flags=0x02, win=64240
+    )
+    pcap_data = make_custom_pcap([pkt], snaplen=128)
+    pcap_path = tmp_path / "truncated.pcap"
+    pcap_path.write_bytes(pcap_data)
+
+    with get_sync_session() as session:
+        node = MonitoredNode(hostname="test-node-trunc", collector_url="http://127.0.0.1:20000", active=True)
+        session.add(node)
+        session.flush()
+        inv = AgentInvestigation(node_id=node.id, trigger_type="manual", status="complete")
+        session.add(inv)
+        session.flush()
+        ev = InvestigationEvidence(
+            investigation_id=inv.id,
+            node_id=node.id,
+            evidence_type="pcap_collection",
+            file_name="truncated.pcap",
+            storage_key="truncated.pcap",
+            status="complete",
+        )
+        session.add(ev)
+        session.flush()
+        run_id = uuid4().hex
+        run = PcapAnalysisRuns(
+            run_id=run_id,
+            evidence_id=ev.id,
+            investigation_id=inv.id,
+            node_id=node.id,
+            status="running",
+            current_step="extract_flows",
+        )
+        session.add(run)
+        session.commit()
+        ev_id = ev.id
+
+    res = pcap_analysis_reconstruct_sessions(ev_id, run_id=run_id)
+    assert res["status"] == "sessions_reconstructed"
+
+    with get_sync_session() as session:
+        sess = session.execute(
+            select(TcpSessions).where(TcpSessions.run_id == run_id)
+        ).scalar_one()
+        assert sess.snaplen == 128
+        assert sess.payload_truncated is True
+        assert sess.confidence == "low"
+
