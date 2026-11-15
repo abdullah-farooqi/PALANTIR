@@ -49,6 +49,7 @@ ALTER TABLE monitored_nodes ADD COLUMN IF NOT EXISTS machine_id TEXT;
 ALTER TABLE monitored_nodes ADD COLUMN IF NOT EXISTS collector_url TEXT;
 ALTER TABLE monitored_nodes ADD COLUMN IF NOT EXISTS capabilities JSONB;
 ALTER TABLE monitored_nodes ADD COLUMN IF NOT EXISTS last_collection_at TIMESTAMPTZ;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='monitored_nodes' AND column_name='netdata_url') THEN ALTER TABLE monitored_nodes ALTER COLUMN netdata_url DROP NOT NULL; END IF; END $$;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_monitored_nodes_machine_id ON monitored_nodes(machine_id) WHERE machine_id IS NOT NULL;
 ALTER TABLE monitored_nodes DROP CONSTRAINT IF EXISTS monitored_nodes_hostname_key;
 
@@ -408,4 +409,68 @@ VALUES
   ('ram', 'ram_in_use', 'system.ram', 'ram_pct', '%', 50.0, 85.0, 'Host memory utilization threshold'),
   ('disk', 'root_disk_space', 'system.disk', 'root_used_pct', '%', 80.0, 90.0, 'Root disk partition used percentage')
 ON CONFLICT (id) DO NOTHING;
+
+-- ─────────────────────────────────────────────────────────────────────
+-- PCAP Forensic Analysis Pipeline
+-- ─────────────────────────────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS pcap_analysis_runs (
+    id                  SERIAL PRIMARY KEY,
+    run_id              VARCHAR(64) NOT NULL UNIQUE,
+    evidence_id         INT NOT NULL REFERENCES investigation_evidence(id) ON DELETE CASCADE,
+    investigation_id    INT NOT NULL REFERENCES agent_investigations(id) ON DELETE CASCADE,
+    node_id             INT NOT NULL REFERENCES monitored_nodes(id) ON DELETE CASCADE,
+    status              VARCHAR(16) NOT NULL DEFAULT 'pending'
+                        CHECK (status IN ('pending', 'running', 'complete', 'failed', 'rolled_back')),
+    current_step        VARCHAR(64),
+    started_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at        TIMESTAMPTZ,
+    error_message       TEXT,
+    error_step          VARCHAR(64),
+    rollback_started_at TIMESTAMPTZ,
+    rollback_completed_at TIMESTAMPTZ,
+    CONSTRAINT ck_pcap_analysis_runs_evidence_inv
+        CHECK (evidence_id IS NOT NULL AND investigation_id IS NOT NULL)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pcap_runs_evidence ON pcap_analysis_runs(evidence_id);
+CREATE INDEX IF NOT EXISTS idx_pcap_runs_investigation ON pcap_analysis_runs(investigation_id);
+CREATE INDEX IF NOT EXISTS idx_pcap_runs_node ON pcap_analysis_runs(node_id);
+CREATE INDEX IF NOT EXISTS idx_pcap_runs_status ON pcap_analysis_runs(status) WHERE status IN ('running', 'pending');
+
+CREATE TABLE IF NOT EXISTS pcap_flows (
+    id                  BIGSERIAL PRIMARY KEY,
+    run_id              VARCHAR(64) NOT NULL REFERENCES pcap_analysis_runs(run_id) ON DELETE CASCADE,
+    evidence_id         INT NOT NULL REFERENCES investigation_evidence(id) ON DELETE CASCADE,
+    src_ip              INET NOT NULL,
+    dst_ip              INET NOT NULL,
+    src_port            INT CHECK (src_port >= 0 AND src_port <= 65535),
+    dst_port            INT CHECK (dst_port >= 0 AND dst_port <= 65535),
+    protocol            VARCHAR(8) NOT NULL CHECK (protocol IN ('tcp', 'udp', 'icmp', 'icmpv6')),
+    flow_key            VARCHAR(128) NOT NULL,
+    packet_count        INT NOT NULL DEFAULT 0 CHECK (packet_count >= 0),
+    byte_count          BIGINT NOT NULL DEFAULT 0 CHECK (byte_count >= 0),
+    first_seen          TIMESTAMPTZ NOT NULL,
+    last_seen           TIMESTAMPTZ NOT NULL,
+    duration_seconds    FLOAT,
+    bidirectional       BOOLEAN NOT NULL DEFAULT FALSE,
+    reverse_packet_count INT DEFAULT 0 CHECK (reverse_packet_count >= 0),
+    reverse_byte_count   BIGINT DEFAULT 0 CHECK (reverse_byte_count >= 0),
+    flags               JSONB,
+    dscp                INT,
+    fragment_count      INT DEFAULT 0,
+    captured_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_pcap_flows_run_key UNIQUE (run_id, flow_key),
+    CONSTRAINT ck_pcap_flows_duration CHECK (duration_seconds IS NULL OR duration_seconds >= 0)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pcap_flows_run ON pcap_flows(run_id);
+CREATE INDEX IF NOT EXISTS idx_pcap_flows_evidence ON pcap_flows(evidence_id);
+CREATE INDEX IF NOT EXISTS idx_pcap_flows_src_ip ON pcap_flows(src_ip);
+CREATE INDEX IF NOT EXISTS idx_pcap_flows_dst_ip ON pcap_flows(dst_ip);
+CREATE INDEX IF NOT EXISTS idx_pcap_flows_dst_port ON pcap_flows(dst_port);
+CREATE INDEX IF NOT EXISTS idx_pcap_flows_protocol ON pcap_flows(protocol);
+CREATE INDEX IF NOT EXISTS idx_pcap_flows_time ON pcap_flows(first_seen, last_seen);
+CREATE INDEX IF NOT EXISTS idx_pcap_flows_flow_key ON pcap_flows(flow_key);
+
 

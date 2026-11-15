@@ -187,6 +187,11 @@ def transfer_pcap_artifact(self, evidence_id: int):
             row.error_message = None
             session.commit()
         _release_snapshot_if_done(snapshot_id, node_id)
+        try:
+            from workers.pcap_pipeline import start_pcap_analysis
+            start_pcap_analysis(evidence_id)
+        except Exception:
+            logger.exception("Could not enqueue PCAP analysis for evidence %s", evidence_id)
         return {"status": "complete", "evidence_id": evidence_id, "size_bytes": transfer["size_bytes"]}
     except Exception as exc:
         partial.unlink(missing_ok=True)
