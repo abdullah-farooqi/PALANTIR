@@ -25,6 +25,7 @@ export function statusTone(status) {
       return 'green';
     case 'running':
     case 'queued':
+    case 'pending':
     case 'stale':
     case 'partial':
       return 'yellow';

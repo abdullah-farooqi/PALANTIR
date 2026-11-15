@@ -1,5 +1,5 @@
 import pytest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 import respx
 import httpx
@@ -8,6 +8,7 @@ from main import app
 from core.config import settings
 from core.api_auth import get_api_role
 from models.node import MonitoredNode
+from models.metric import MetricSnapshot
 from models.alert import AlertEvent
 from models.investigation_evidence import InvestigationEvidence
 from models.investigation import AgentInvestigation
@@ -126,6 +127,45 @@ async def test_list_and_get_nodes(client: AsyncClient, existing_node: MonitoredN
     # Invalid path parameter validation
     resp = await client.get("/api/v1/nodes/0")
     assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_fleet_telemetry_returns_latest_full_snapshot_and_omits_sample_rows(
+    client: AsyncClient,
+    existing_node: MonitoredNode,
+):
+    now = datetime.now(timezone.utc)
+    async with AsyncSessionLocal() as session:
+        session.add_all([
+            MetricSnapshot(
+                node_id=existing_node.id,
+                collected_at=now,
+                category="system",
+                data={"cpu_pct": 44.5},
+                cpu_pct=44.5,
+                ram_used_mb=400.0,
+                ram_total_mb=1000.0,
+                top_processes=[{"name": "collector", "cpu_pct": 3.2}],
+            ),
+            MetricSnapshot(
+                node_id=existing_node.id,
+                collected_at=now + timedelta(seconds=1),
+                category="system",
+                data={"sample": "cpu", "cpu_pct": 99.0},
+                cpu_pct=99.0,
+            ),
+        ])
+        await session.commit()
+
+    response = await client.get("/api/v1/fleet/telemetry?limit=5")
+    assert response.status_code == 200
+    payload = response.json()
+    entry = next(row for row in payload["items"] if row["node_id"] == existing_node.id)
+    assert entry["cpu_pct"] == 44.5
+    assert entry["ram_pct"] == 40.0
+    assert entry["top_processes"] == [{"name": "collector", "cpu_pct": 3.2}]
+    assert entry["collected_at"] == now.isoformat()
+    assert "storage_key" not in entry
 
 
 @pytest.mark.asyncio
@@ -652,6 +692,56 @@ async def test_investigation_pcap_analysis_api(
             last_seen=datetime.now(timezone.utc),
         )
         session.add(flow)
+        session.add_all([
+            PcapFlows(
+                run_id=run_id,
+                evidence_id=ev_id,
+                src_ip="192.168.1.101",
+                dst_ip="198.51.100.10",
+                src_port=54001,
+                dst_port=53,
+                protocol="udp",
+                flow_key=f"udp:192.168.1.101:54001-198.51.100.10:53-{run_id}",
+                packet_count=4,
+                byte_count=320,
+                first_seen=datetime.now(timezone.utc),
+                last_seen=datetime.now(timezone.utc),
+            ),
+            PcapFlows(
+                run_id=run_id,
+                evidence_id=ev_id,
+                src_ip="192.168.1.102",
+                dst_ip="203.0.113.8",
+                src_port=54002,
+                dst_port=443,
+                protocol="tcp",
+                flow_key=f"tcp:192.168.1.102:54002-203.0.113.8:443-{run_id}",
+                packet_count=8,
+                byte_count=640,
+                first_seen=datetime.now(timezone.utc),
+                last_seen=datetime.now(timezone.utc),
+            ),
+        ])
+        await session.flush()
+
+        tcp_session = TcpSessions(
+            run_id=run_id,
+            evidence_id=ev_id,
+            src_ip="192.168.1.100",
+            dst_ip="93.184.216.34",
+            src_port=54321,
+            dst_port=443,
+            state="established",
+            total_bytes=2500,
+            reassembled_bytes=2200,
+            reassembly_quality=0.88,
+            confidence="high",
+            snaplen=65535,
+            first_seen=datetime.now(timezone.utc),
+            last_seen=datetime.now(timezone.utc),
+        )
+        session.add(tcp_session)
+        await session.flush()
 
         cve = PcapCveMatches(
             run_id=run_id,
@@ -662,6 +752,7 @@ async def test_investigation_pcap_analysis_api(
             match_type="payload_signature",
             confidence="high",
             description="Log4Shell attempt",
+            flow_id=flow.id,
         )
         session.add(cve)
 
@@ -686,6 +777,8 @@ async def test_investigation_pcap_analysis_api(
             size_bytes=22,
             sha256=_sha,
             storage_key=storage_key,
+            flow_id=flow.id,
+            session_id=tcp_session.id,
             metadata_json={"status_code": 200},
         )
         session.add(art)
@@ -706,7 +799,8 @@ async def test_investigation_pcap_analysis_api(
     run_item = next(r for r in list_json["items"] if r["run_id"] == run_id)
     assert run_item["status"] == "complete"
     assert run_item["severity_score"]["overall_score"] == 8.5
-    assert run_item["flow_count"] == 1
+    assert run_item["flow_count"] == 3
+    assert run_item["session_count"] == 1
     assert run_item["cve_match_count"] == 1
 
     # 3. Detail run endpoint
@@ -714,10 +808,100 @@ async def test_investigation_pcap_analysis_api(
     assert detail_resp.status_code == 200
     detail_json = detail_resp.json()
     assert detail_json["severity"]["overall_severity"] == "high"
-    assert len(detail_json["flows"]) == 1
+    assert len(detail_json["flows"]) == 3
+    assert len(detail_json["sessions"]) == 1
     assert len(detail_json["cve_matches"]) == 1
     assert detail_json["cve_matches"][0]["cve_id"] == "CVE-2021-44228"
     assert len(detail_json["iocs"]) == 1
+
+    compact_resp = await client.get(
+        f"/api/v1/investigations/{investigation_id}/analysis/{run_id}?include_records=false"
+    )
+    assert compact_resp.status_code == 200
+    assert compact_resp.json()["flows"] == []
+    assert compact_resp.json()["counts"]["flows"] == 3
+
+    first_page = await client.get(
+        f"/api/v1/investigations/{investigation_id}/analysis/{run_id}/collections/flows?limit=2"
+    )
+    assert first_page.status_code == 200
+    first_json = first_page.json()
+    assert first_json["total_count"] == 3
+    assert len(first_json["items"]) == 2
+    assert first_json["has_more"] is True
+    assert "storage_key" not in first_json["items"][0]
+
+    second_page = await client.get(
+        f"/api/v1/investigations/{investigation_id}/analysis/{run_id}/collections/flows",
+        params={"limit": 2, "cursor": first_json["next_cursor"]},
+    )
+    assert second_page.status_code == 200
+    assert len(second_page.json()["items"]) == 1
+    assert second_page.json()["has_more"] is False
+    assert not {row["id"] for row in first_json["items"]} & {row["id"] for row in second_page.json()["items"]}
+
+    udp = await client.get(
+        f"/api/v1/investigations/{investigation_id}/analysis/{run_id}/collections/flows?protocol=udp"
+    )
+    assert udp.status_code == 200
+    assert udp.json()["total_count"] == 1
+    assert udp.json()["items"][0]["protocol"] == "udp"
+
+    sessions = await client.get(
+        f"/api/v1/investigations/{investigation_id}/analysis/{run_id}/collections/sessions",
+        params={"state": "established", "confidence": "high"},
+    )
+    assert sessions.status_code == 200
+    assert sessions.json()["total_count"] == 1
+    assert sessions.json()["items"][0]["reassembled_bytes"] == 2200
+
+    artifacts = await client.get(
+        f"/api/v1/investigations/{investigation_id}/analysis/{run_id}/collections/artifacts",
+        params={"artifact_type": "http_response", "q": "text/html"},
+    )
+    assert artifacts.status_code == 200
+    assert artifacts.json()["total_count"] == 1
+    assert artifacts.json()["items"][0]["has_file"] is True
+    assert "storage_key" not in artifacts.json()["items"][0]
+
+    cves = await client.get(
+        f"/api/v1/investigations/{investigation_id}/analysis/{run_id}/collections/cve_matches",
+        params={"severity": "critical", "confidence": "high", "q": "Log4Shell"},
+    )
+    assert cves.status_code == 200
+    assert cves.json()["total_count"] == 1
+    assert cves.json()["items"][0]["flow_id"] == flow.id
+
+    unallowlisted = await client.get(
+        f"/api/v1/investigations/{investigation_id}/analysis/{run_id}/collections/iocs",
+        params={"is_allowlisted": "false"},
+    )
+    assert unallowlisted.status_code == 200
+    assert unallowlisted.json()["total_count"] == 1
+    assert unallowlisted.json()["items"][0]["is_allowlisted"] is False
+
+    invalid_cursor = await client.get(
+        f"/api/v1/investigations/{investigation_id}/analysis/{run_id}/collections/flows?cursor=invalid"
+    )
+    assert invalid_cursor.status_code == 400
+
+    unsupported_filter = await client.get(
+        f"/api/v1/investigations/{investigation_id}/analysis/{run_id}/collections/flows?state=closed"
+    )
+    assert unsupported_filter.status_code == 400
+
+    no_matches = await client.get(
+        f"/api/v1/investigations/{investigation_id}/analysis/{run_id}/collections/flows",
+        params={"protocol": "icmpv6", "q": "no-matching-indicator"},
+    )
+    assert no_matches.status_code == 200
+    assert no_matches.json()["total_count"] == 0
+    assert no_matches.json()["items"] == []
+
+    wrong_investigation = await client.get(
+        f"/api/v1/investigations/{investigation_id + 1}/analysis/{run_id}/collections/flows"
+    )
+    assert wrong_investigation.status_code == 404
 
     # 4. Artifact download endpoint
     dl_resp = await client.get(f"/api/v1/investigations/{investigation_id}/analysis/{run_id}/artifacts/{art_id}/download")

@@ -51,7 +51,7 @@ function friendly(status, detail) {
 function qs(params) {
   const sp = new URLSearchParams();
   Object.entries(params || {}).forEach(([k, v]) => {
-    if (v === null || v === undefined || v === '' || v === false) return;
+    if (v === null || v === undefined || v === '') return;
     sp.set(k, String(v));
   });
   const s = sp.toString();
@@ -126,9 +126,19 @@ export const api = {
   getInvestigationEvidence: (id) => request(`/investigations/${id}/evidence`),
   investigationEvidenceDownloadUrl: (id, fileId) =>
     `${BASE}/investigations/${id}/evidence/${encodeURIComponent(fileId)}/download`,
+  getInvestigationAnalysisRuns: (id) => request(`/investigations/${id}/analysis`),
+  getInvestigationAnalysisDetail: (id, runId, includeRecords = false) =>
+    request(`/investigations/${id}/analysis/${encodeURIComponent(runId)}${qs({ include_records: includeRecords })}`),
+  getInvestigationAnalysisCollection: (id, runId, collection, params = {}) =>
+    request(`/investigations/${id}/analysis/${encodeURIComponent(runId)}/collections/${encodeURIComponent(collection)}${qs(params)}`),
+  triggerInvestigationAnalysis: (id, evidenceId) =>
+    request(`/investigations/${id}/analysis/trigger${qs({ evidence_id: evidenceId })}`, { method: 'POST' }),
+  investigationAnalysisArtifactDownloadUrl: (id, runId, artifactId) =>
+    `${BASE}/investigations/${id}/analysis/${encodeURIComponent(runId)}/artifacts/${encodeURIComponent(artifactId)}/download`,
 
   // ---- fleet / health --------------------------------------------------------
   getFleetSummary: () => request('/fleet/summary'),
+  getFleetTelemetry: (limit = 10) => request(`/fleet/telemetry${qs({ limit })}`),
   getOpsHealth: () => request('/health/operations'),
   getMetricSchema: () => request('/metrics/schema'),
   // ---- system settings -------------------------------------------------------

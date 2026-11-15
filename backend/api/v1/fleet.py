@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends
-from sqlalchemy import func, select
+from fastapi import APIRouter, Depends, Query
+from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.config import settings
@@ -126,4 +126,73 @@ async def get_fleet_summary(session: AsyncSession = Depends(get_session)):
             },
             "worker_semantics": "A task heartbeat confirms pipeline execution and reports node-level failures, not per-category or per-node collection success.",
         },
+    }
+
+
+@router.get("/telemetry")
+async def get_fleet_telemetry(
+    limit: int = Query(default=10, ge=1, le=50),
+    session: AsyncSession = Depends(get_session),
+):
+    """Return each active host's newest full system snapshot, ranked by CPU."""
+    now = datetime.now(timezone.utc)
+    latest_per_node = (
+        select(
+            MetricSnapshot.id.label("snapshot_id"),
+            MetricSnapshot.node_id.label("node_id"),
+            MetricSnapshot.collected_at.label("collected_at"),
+            func.row_number().over(
+                partition_by=MetricSnapshot.node_id,
+                order_by=(MetricSnapshot.collected_at.desc(), MetricSnapshot.id.desc()),
+            ).label("snapshot_rank"),
+        )
+        .where(
+            MetricSnapshot.category == "system",
+            MetricSnapshot.data["sample"].as_string().is_(None),
+        )
+        .subquery()
+    )
+    statement = (
+        select(MonitoredNode, MetricSnapshot)
+        .join(latest_per_node, latest_per_node.c.node_id == MonitoredNode.id)
+        .join(
+            MetricSnapshot,
+            and_(
+                MetricSnapshot.id == latest_per_node.c.snapshot_id,
+                MetricSnapshot.collected_at == latest_per_node.c.collected_at,
+            ),
+        )
+        .where(MonitoredNode.active.is_(True), latest_per_node.c.snapshot_rank == 1)
+        .where(MetricSnapshot.cpu_pct.is_not(None))
+        .order_by(MetricSnapshot.cpu_pct.desc().nulls_last(), MonitoredNode.hostname.asc())
+        .limit(limit)
+    )
+    rows = (await session.execute(statement)).all()
+    return {
+        "schema_version": 1,
+        "generated_at": now.isoformat(),
+        "items": [
+            {
+                "node_id": node.id,
+                "hostname": node.hostname,
+                "os_type": node.os_type,
+                "collector_url": node.collector_url,
+                "last_seen_at": _utc(node.last_seen_at).isoformat(),
+                "collected_at": snapshot.collected_at.isoformat(),
+                "cpu_pct": snapshot.cpu_pct,
+                "ram_used_mb": snapshot.ram_used_mb,
+                "ram_total_mb": snapshot.ram_total_mb,
+                "ram_pct": (
+                    snapshot.ram_used_mb / snapshot.ram_total_mb * 100
+                    if snapshot.ram_used_mb is not None
+                    and snapshot.ram_total_mb is not None
+                    and snapshot.ram_total_mb > 0
+                    else None
+                ),
+                "load_avg": snapshot.load_avg,
+                "top_processes": snapshot.top_processes,
+                "age_seconds": max(0, int((now - _utc(snapshot.collected_at)).total_seconds())),
+            }
+            for node, snapshot in rows
+        ],
     }

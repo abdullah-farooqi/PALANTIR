@@ -106,3 +106,25 @@ test('fleet and operational summaries use their existing backend routes', async 
     ['/api/v1/fleet/summary', '/api/v1/health/operations']
   );
 });
+
+test('fleet telemetry and investigation analysis use their persisted API routes', async (t) => {
+  const calls = mockFetch(t, { items: [] });
+  await Promise.all([
+    api.getFleetTelemetry(8),
+    api.getInvestigationAnalysisRuns(31),
+    api.getInvestigationAnalysisDetail(31, 'run-a', false),
+    api.getInvestigationAnalysisCollection(31, 'run-a', 'iocs', { is_allowlisted: false, limit: 25 }),
+  ]);
+
+  const urls = calls.map(({ url }) => new URL(url, 'http://ui.local'));
+  assert.deepEqual(urls.map((url) => url.pathname), [
+    '/api/v1/fleet/telemetry',
+    '/api/v1/investigations/31/analysis',
+    '/api/v1/investigations/31/analysis/run-a',
+    '/api/v1/investigations/31/analysis/run-a/collections/iocs',
+  ]);
+  assert.equal(urls[0].searchParams.get('limit'), '8');
+  assert.equal(urls[2].searchParams.get('include_records'), 'false');
+  assert.equal(urls[3].searchParams.get('is_allowlisted'), 'false');
+  assert.equal(urls[3].searchParams.get('limit'), '25');
+});

@@ -2,7 +2,7 @@ import { useMemo } from 'react';
 import { Activity, AlertTriangle, ArrowRight, CircleDot, Clock3, Server, ShieldAlert } from 'lucide-react';
 import { api } from '../api';
 import { usePolling } from '../hooks/usePolling';
-import { formatDateTime, formatRelative } from '../lib/format';
+import { formatBytes, formatDateTime, formatNumber, formatRelative } from '../lib/format';
 
 function StatCard({ label, value, detail, icon: Icon, tone = 'neutral', onClick }) {
   const content = (
@@ -31,6 +31,7 @@ function eventDescription(event) {
 export default function FleetOverviewTab({ fleet, nodes = [], query = '', onSelectNode, onChangeView, onShowHosts, onSelectInvestigation, onAddNode, canWrite, refreshMs }) {
   const events = usePolling(() => api.getEvents({ event_type: 'all', limit: 8 }), [], refreshMs, true);
   const investigations = usePolling(() => api.searchInvestigations({ limit: 5 }), [], refreshMs, true);
+  const cpuTelemetry = usePolling(() => api.getFleetTelemetry(10), [], refreshMs, true);
   const summary = fleet?.data?.summary;
   const counts = summary?.nodes;
   const attentionTotal = nodes.filter((node) => node.reachability !== 'reachable' || Number(node.active_alerts_count || 0) > 0).length;
@@ -45,6 +46,10 @@ export default function FleetOverviewTab({ fleet, nodes = [], query = '', onSele
     .sort((a, b) => Number(b.active_alerts_count || 0) - Number(a.active_alerts_count || 0) || a.hostname.localeCompare(b.hostname)), [filteredNodes]);
   const latestEvents = events.data?.items || [];
   const recentInvestigations = investigations.data?.items || [];
+  const topCpuHosts = (cpuTelemetry.data?.items || []).filter((item) => {
+    const needle = query.trim().toLowerCase();
+    return !needle || [item.hostname, item.collector_url, item.os_type].some((field) => String(field || '').toLowerCase().includes(needle));
+  }).slice(0, 8);
 
   return (
     <div className="fleet-overview">
@@ -119,6 +124,31 @@ export default function FleetOverviewTab({ fleet, nodes = [], query = '', onSele
           ) : <div className="fleet-panel-empty">{events.data ? 'No events in the current feed.' : 'Event feed is unavailable.'}</div>}
         </div>
 
+        <div className="fleet-panel fleet-cpu-panel">
+          <div className="fleet-panel-header">
+            <div><div className="fleet-panel-kicker">LATEST FULL SYSTEM SNAPSHOTS</div><h2>Top CPU hosts</h2></div>
+            <button className="fleet-text-link" onClick={() => onShowHosts('all')}>All hosts <ArrowRight size={14} /></button>
+          </div>
+          {cpuTelemetry.error && <div className="fleet-inline-error">{cpuTelemetry.error}</div>}
+          {cpuTelemetry.loading && !cpuTelemetry.data ? <div className="fleet-panel-empty">Loading host telemetry…</div> : topCpuHosts.length ? (
+            <div className="fleet-cpu-list">
+              {topCpuHosts.map((host) => {
+                const cpu = Math.max(0, Math.min(100, Number(host.cpu_pct)));
+                const ram = host.ram_used_mb != null && host.ram_total_mb != null
+                  ? `${formatBytes(host.ram_used_mb * 1024 * 1024)} / ${formatBytes(host.ram_total_mb * 1024 * 1024)}`
+                  : 'RAM not reported';
+                return (
+                  <button className="fleet-cpu-row" key={host.node_id} onClick={() => onSelectNode(host.node_id)}>
+                    <span className="fleet-cpu-rank">{formatNumber(host.cpu_pct, 1)}<small>% CPU</small></span>
+                    <span className="fleet-cpu-main"><strong>{host.hostname}</strong><small>{ram} · {host.os_type || 'OS not reported'}</small><i aria-hidden="true"><b style={{ width: `${cpu}%` }} /></i></span>
+                    <time title={formatDateTime(host.collected_at)}>{formatRelative(host.collected_at)}</time>
+                  </button>
+                );
+              })}
+            </div>
+          ) : <div className="fleet-panel-empty">{query ? 'No reporting hosts match this search.' : 'No full system snapshots with CPU values are available yet.'}</div>}
+        </div>
+
         <div className="fleet-panel fleet-investigations-panel">
           <div className="fleet-panel-header">
             <div><div className="fleet-panel-kicker">INVESTIGATION QUEUE</div><h2>Recent investigations</h2></div>
@@ -138,7 +168,7 @@ export default function FleetOverviewTab({ fleet, nodes = [], query = '', onSele
           ) : <div className="fleet-panel-empty">{investigations.data ? 'No investigations have been recorded.' : 'Investigation queue is unavailable.'}</div>}
         </div>
       </section>
-      <div className="fleet-overview-footnote">Live values are provided by PALANTIR’s fleet summary and event services. Host-specific metric charts are available from the Hosts screen.</div>
+      <div className="fleet-overview-footnote">Host CPU and memory values come from each host’s latest full system snapshot. The sample time is shown beside each value; per second CPU samples are excluded.</div>
     </div>
   );
 }

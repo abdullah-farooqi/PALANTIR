@@ -92,7 +92,7 @@ function ActiveAlerts({ state, onInvestigate }) {
           }}
         >
           <span style={{ color: '#39e569', fontSize: 14 }}>✔</span>
-          <span>No WARNING or CRITICAL alert is currently firing on this node. All metric monitors are healthy.</span>
+          <span>No WARNING or CRITICAL alert is currently firing on this node.</span>
         </div>
       ) : (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>

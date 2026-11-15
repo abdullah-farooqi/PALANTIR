@@ -4,6 +4,7 @@ import { usePolling } from '../hooks/usePolling';
 import { Badge, Box, Chips, DataTable, Empty, ErrorLine, Spinner } from './ui';
 import NodeHeaderNav from './NodeHeaderNav';
 import NetworkEvidence from './NetworkEvidence';
+import InvestigationAnalysis from './InvestigationAnalysis';
 import { CAN_WRITE } from '../lib/role';
 import { describeTrigger, severityTone, statusTone } from '../lib/events';
 import { formatDateTime, formatDuration, formatRelative, formatNumber, formatBytes, scoreToPercent } from '../lib/format';
@@ -223,6 +224,7 @@ function Evidence({ inv }) {
 export default function InvestigationsTab({ node, scope, setScope, refreshMs, focusId, onToast, onBack, onChangeView, fleet }) {
   const [status, setStatus] = useState('');
   const [selected, setSelected] = useState(null);
+  const [detailSection, setDetailSection] = useState('summary');
   const [creating, setCreating] = useState(false);
 
   const params = { node_id: scope === 'node' && node ? node.id : '', status, limit: 100 };
@@ -236,6 +238,7 @@ export default function InvestigationsTab({ node, scope, setScope, refreshMs, fo
   useEffect(() => { if (!selected && items.length > 0) setSelected(items[0].id); }, [items, selected]);
 
   const current = items.find((i) => i.id === selected) || null;
+  useEffect(() => { setDetailSection('summary'); }, [current?.id]);
 
   async function create() {
     if (!node) return;
@@ -331,7 +334,7 @@ export default function InvestigationsTab({ node, scope, setScope, refreshMs, fo
     <>
       {scope === 'node' && node && <NodeHeaderNav node={node} currentView="investigations" onViewChange={onChangeView} onBack={onBack} />}
 
-      <div className="two-col" style={{ alignItems: 'start' }}>
+      <div className={`two-col investigation-layout ${detailSection === 'analysis' ? 'analysis-active' : ''}`} style={{ alignItems: 'start' }}>
         {/* Left Box: Investigations List */}
         <Box
           n={5}
@@ -421,6 +424,21 @@ export default function InvestigationsTab({ node, scope, setScope, refreshMs, fo
             <Empty>Select an investigation to view incident evidence.</Empty>
           ) : (
             <div className="box-scroll" style={{ maxHeight: 'calc(100vh - 210px)' }}>
+              <div className="investigation-detail-tabs" role="tablist" aria-label="Investigation detail">
+                {[
+                  ['summary', 'Summary'],
+                  ['evidence', 'Capture evidence'],
+                  ['analysis', 'Analysis'],
+                ].map(([key, label]) => (
+                  <button type="button" role="tab" aria-selected={detailSection === key} className={detailSection === key ? 'active' : ''} key={key} onClick={() => setDetailSection(key)}>{label}</button>
+                ))}
+              </div>
+              {detailSection === 'analysis' ? (
+                <InvestigationAnalysis investigation={current} refreshMs={refreshMs} onToast={onToast} />
+              ) : detailSection === 'evidence' ? (
+                <NetworkEvidence investigation={current} refreshMs={refreshMs} />
+              ) : (
+              <div className="investigation-summary-detail">
               <div
                 style={{
                   display: 'grid',
@@ -487,7 +505,6 @@ export default function InvestigationsTab({ node, scope, setScope, refreshMs, fo
                 </div>
               )}
               <Evidence inv={current} />
-              <NetworkEvidence investigation={current} refreshMs={refreshMs} />
 
               {current.raw_output && (
                 <details style={{ marginTop: 14 }}>
@@ -498,6 +515,8 @@ export default function InvestigationsTab({ node, scope, setScope, refreshMs, fo
                     {JSON.stringify(current.raw_output, null, 2)}
                   </pre>
                 </details>
+              )}
+              </div>
               )}
 
               {/* Bottom Right Actions */}

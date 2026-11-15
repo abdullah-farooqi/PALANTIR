@@ -5,7 +5,7 @@ from typing import List, Dict, Any, Optional
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, status
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, model_validator
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import String, and_, cast, func, or_, select
 from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 from core.database import get_session
@@ -370,6 +370,7 @@ async def list_investigation_analysis_runs(
 async def get_investigation_analysis_detail(
     investigation_id: int = Path(..., ge=1),
     run_id: str = Path(..., min_length=1),
+    include_records: bool = Query(default=True),
     session: AsyncSession = Depends(get_session),
     _role: None = Depends(require_read),
 ) -> dict[str, Any]:
@@ -386,25 +387,37 @@ async def get_investigation_analysis_detail(
         select(PcapSeverityScores).where(PcapSeverityScores.run_id == run_id)
     )).scalar_one_or_none()
 
-    flows = (await session.execute(
-        select(PcapFlows).where(PcapFlows.run_id == run_id).limit(100)
-    )).scalars().all()
-
-    tcp_sessions = (await session.execute(
-        select(TcpSessions).where(TcpSessions.run_id == run_id).limit(100)
-    )).scalars().all()
-
-    artifacts = (await session.execute(
-        select(PcapArtifacts).where(PcapArtifacts.run_id == run_id).limit(100)
-    )).scalars().all()
-
-    iocs = (await session.execute(
-        select(PcapIocs).where(PcapIocs.run_id == run_id).limit(100)
-    )).scalars().all()
-
-    cves = (await session.execute(
-        select(PcapCveMatches).where(PcapCveMatches.run_id == run_id).limit(100)
-    )).scalars().all()
+    collection_models = {
+        "flows": PcapFlows,
+        "sessions": TcpSessions,
+        "artifacts": PcapArtifacts,
+        "iocs": PcapIocs,
+        "cve_matches": PcapCveMatches,
+    }
+    counts = {
+        name: (await session.execute(
+            select(func.count(model.id)).where(model.run_id == run_id)
+        )).scalar_one()
+        for name, model in collection_models.items()
+    }
+    if include_records:
+        flows = (await session.execute(
+            select(PcapFlows).where(PcapFlows.run_id == run_id).order_by(PcapFlows.id.desc()).limit(100)
+        )).scalars().all()
+        tcp_sessions = (await session.execute(
+            select(TcpSessions).where(TcpSessions.run_id == run_id).order_by(TcpSessions.id.desc()).limit(100)
+        )).scalars().all()
+        artifacts = (await session.execute(
+            select(PcapArtifacts).where(PcapArtifacts.run_id == run_id).order_by(PcapArtifacts.id.desc()).limit(100)
+        )).scalars().all()
+        iocs = (await session.execute(
+            select(PcapIocs).where(PcapIocs.run_id == run_id).order_by(PcapIocs.id.desc()).limit(100)
+        )).scalars().all()
+        cves = (await session.execute(
+            select(PcapCveMatches).where(PcapCveMatches.run_id == run_id).order_by(PcapCveMatches.id.desc()).limit(100)
+        )).scalars().all()
+    else:
+        flows = tcp_sessions = artifacts = iocs = cves = []
 
     return {
         "schema_version": 1,
@@ -416,6 +429,7 @@ async def get_investigation_analysis_detail(
         "started_at": run.started_at.isoformat() if run.started_at else None,
         "completed_at": run.completed_at.isoformat() if run.completed_at else None,
         "error_message": run.error_message,
+        "counts": counts,
         "severity": {
             "overall_score": float(score_row.overall_score),
             "overall_severity": score_row.overall_severity,
@@ -493,6 +507,180 @@ async def get_investigation_analysis_detail(
             }
             for c in cves
         ],
+    }
+
+
+@router.get("/{investigation_id}/analysis/{run_id}/collections/{collection}")
+async def get_investigation_analysis_collection(
+    investigation_id: int = Path(..., ge=1),
+    run_id: str = Path(..., min_length=1),
+    collection: str = Path(..., pattern="^(flows|sessions|artifacts|iocs|cve_matches)$"),
+    q: Optional[str] = Query(default=None, max_length=256),
+    protocol: Optional[str] = Query(default=None, pattern="^(tcp|udp|icmp|icmpv6)$"),
+    state: Optional[str] = Query(default=None, pattern="^(open|established|closed|reset|half_open|incomplete)$"),
+    confidence: Optional[str] = Query(default=None, pattern="^(low|medium|high)$"),
+    artifact_type: Optional[str] = Query(default=None, max_length=32),
+    ioc_type: Optional[str] = Query(default=None, max_length=32),
+    is_allowlisted: Optional[bool] = None,
+    severity: Optional[str] = Query(default=None, pattern="^(none|low|medium|high|critical)$"),
+    limit: int = Query(default=50, ge=1, le=100),
+    cursor: Optional[str] = None,
+    session: AsyncSession = Depends(get_session),
+    _role: None = Depends(require_read),
+) -> dict[str, Any]:
+    """Filter and cursor-page records from one persisted PCAP analysis collection."""
+    run = (await session.execute(
+        select(PcapAnalysisRuns.run_id).where(
+            PcapAnalysisRuns.run_id == run_id,
+            PcapAnalysisRuns.investigation_id == investigation_id,
+        )
+    )).scalar_one_or_none()
+    if run is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Analysis run not found")
+
+    model_by_collection = {
+        "flows": PcapFlows,
+        "sessions": TcpSessions,
+        "artifacts": PcapArtifacts,
+        "iocs": PcapIocs,
+        "cve_matches": PcapCveMatches,
+    }
+    model = model_by_collection[collection]
+    unsupported = {
+        "flows": any(value is not None for value in (state, confidence, artifact_type, ioc_type, is_allowlisted, severity)),
+        "sessions": any(value is not None for value in (protocol, artifact_type, ioc_type, is_allowlisted, severity)),
+        "artifacts": any(value is not None for value in (protocol, state, confidence, ioc_type, is_allowlisted, severity)),
+        "iocs": any(value is not None for value in (protocol, state, confidence, artifact_type, severity)),
+        "cve_matches": any(value is not None for value in (protocol, state, artifact_type, ioc_type, is_allowlisted)),
+    }
+    if unsupported[collection]:
+        raise HTTPException(status_code=400, detail=f"A filter is not supported for {collection}")
+
+    filters = [model.run_id == run_id]
+    if collection == "flows" and protocol:
+        filters.append(PcapFlows.protocol == protocol)
+    elif collection == "sessions":
+        if state:
+            filters.append(TcpSessions.state == state)
+        if confidence:
+            filters.append(TcpSessions.confidence == confidence)
+    elif collection == "artifacts" and artifact_type:
+        filters.append(PcapArtifacts.artifact_type == artifact_type)
+    elif collection == "iocs":
+        if ioc_type:
+            filters.append(PcapIocs.ioc_type == ioc_type)
+        if is_allowlisted is not None:
+            filters.append(PcapIocs.is_allowlisted.is_(is_allowlisted))
+    elif collection == "cve_matches":
+        if severity:
+            filters.append(PcapCveMatches.severity == severity)
+        if confidence:
+            filters.append(PcapCveMatches.confidence == confidence)
+
+    needle = q.strip() if q else ""
+    if needle:
+        pattern = f"%{needle}%"
+        search_columns = {
+            "flows": (
+                PcapFlows.src_ip, PcapFlows.dst_ip, PcapFlows.protocol,
+                PcapFlows.flow_key, cast(PcapFlows.src_port, String), cast(PcapFlows.dst_port, String),
+            ),
+            "sessions": (
+                TcpSessions.src_ip, TcpSessions.dst_ip, TcpSessions.state,
+                TcpSessions.confidence, cast(TcpSessions.src_port, String), cast(TcpSessions.dst_port, String),
+            ),
+            "artifacts": (PcapArtifacts.artifact_type, PcapArtifacts.content_type, PcapArtifacts.sha256),
+            "iocs": (PcapIocs.ioc_type, PcapIocs.ioc_value),
+            "cve_matches": (
+                PcapCveMatches.cve_id, PcapCveMatches.severity,
+                PcapCveMatches.match_type, PcapCveMatches.confidence, PcapCveMatches.description,
+            ),
+        }[collection]
+        filters.append(or_(*(column.cast(String).ilike(pattern) for column in search_columns)))
+
+    try:
+        position = decode_cursor(cursor, {"id"})
+        cursor_id = int(position["id"]) if position else None
+        if position and cursor_id <= 0:
+            raise ValueError("Cursor is invalid")
+    except (ValueError, TypeError, KeyError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc) or "Cursor is invalid") from exc
+    if cursor_id is not None:
+        filters.append(model.id < cursor_id)
+
+    total_count = (await session.execute(
+        select(func.count(model.id)).where(*(filters[:-1] if cursor_id is not None else filters))
+    )).scalar_one()
+    rows = (await session.execute(
+        select(model).where(*filters).order_by(model.id.desc()).limit(limit + 1)
+    )).scalars().all()
+    has_more = len(rows) > limit
+    page = rows[:limit]
+    next_cursor = encode_cursor({"id": page[-1].id}) if has_more and page else None
+
+    if collection == "flows":
+        items = [{
+            "id": row.id, "flow_key": row.flow_key,
+            "src_ip": str(row.src_ip), "dst_ip": str(row.dst_ip),
+            "src_port": row.src_port, "dst_port": row.dst_port,
+            "protocol": row.protocol, "packet_count": row.packet_count,
+            "byte_count": row.byte_count, "first_seen": row.first_seen.isoformat(),
+            "last_seen": row.last_seen.isoformat(), "duration_seconds": row.duration_seconds,
+            "bidirectional": row.bidirectional, "reverse_packet_count": row.reverse_packet_count,
+            "reverse_byte_count": row.reverse_byte_count, "flags": row.flags,
+        } for row in page]
+    elif collection == "sessions":
+        items = [{
+            "id": row.id, "src_ip": str(row.src_ip), "dst_ip": str(row.dst_ip),
+            "src_port": row.src_port, "dst_port": row.dst_port, "state": row.state,
+            "client_isn": row.client_isn, "server_isn": row.server_isn,
+            "total_bytes": row.total_bytes, "reassembled_bytes": row.reassembled_bytes,
+            "missing_bytes": row.missing_bytes, "retransmit_bytes": row.retransmit_bytes,
+            "ooo_bytes": row.ooo_bytes, "overlap_bytes": row.overlap_bytes,
+            "reassembly_quality": row.reassembly_quality, "confidence": row.confidence,
+            "payload_truncated": row.payload_truncated, "snaplen": row.snaplen,
+            "first_seen": row.first_seen.isoformat(), "last_seen": row.last_seen.isoformat(),
+            "duration_seconds": row.duration_seconds,
+        } for row in page]
+    elif collection == "artifacts":
+        items = [{
+            "id": row.id, "artifact_type": row.artifact_type,
+            "session_id": row.session_id, "flow_id": row.flow_id,
+            "content_type": row.content_type, "content_length": row.content_length,
+            "size_bytes": row.size_bytes, "sha256": row.sha256,
+            "has_file": bool(row.storage_key), "max_size_exceeded": row.max_size_exceeded,
+            "metadata": row.metadata_json, "captured_at": row.captured_at.isoformat(),
+        } for row in page]
+    elif collection == "iocs":
+        items = [{
+            "id": row.id, "ioc_type": row.ioc_type, "ioc_value": row.ioc_value,
+            "is_allowlisted": row.is_allowlisted, "threat_intel_match": row.threat_intel_match,
+            "context": row.context, "created_at": row.created_at.isoformat(),
+        } for row in page]
+    else:
+        items = [{
+            "id": row.id, "cve_id": row.cve_id,
+            "flow_id": row.flow_id, "artifact_id": row.artifact_id,
+            "cvss_score": float(row.cvss_score) if row.cvss_score is not None else None,
+            "severity": row.severity, "match_type": row.match_type,
+            "confidence": row.confidence, "description": row.description,
+            "matched_data": row.matched_data, "created_at": row.created_at.isoformat(),
+        } for row in page]
+
+    return {
+        "schema_version": 1,
+        "investigation_id": investigation_id,
+        "run_id": run_id,
+        "collection": collection,
+        "filters": {
+            "q": needle or None, "protocol": protocol, "state": state,
+            "confidence": confidence, "artifact_type": artifact_type,
+            "ioc_type": ioc_type, "is_allowlisted": is_allowlisted, "severity": severity,
+        },
+        "items": items,
+        "total_count": total_count,
+        "has_more": has_more,
+        "next_cursor": next_cursor,
     }
 
 
