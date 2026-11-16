@@ -48,6 +48,47 @@ async def test_metrics_service_without_collector(local_node_sync):
         assert result is False
 
 
+@pytest.mark.asyncio
+async def test_system_snapshot_keeps_distro_in_json_without_changing_os_family(monkeypatch):
+    service = MetricsService()
+
+    class FakeSession:
+        def __init__(self):
+            self.added = []
+
+        def add(self, row):
+            self.added.append(row)
+
+        async def execute(self, _statement):
+            raise AssertionError("system snapshot persistence should not rewrite the node OS family")
+
+    session = FakeSession()
+
+    async def no_cpu_samples(_node_id, _session):
+        return []
+
+    async def no_alerts(_node_id, _session, _typed):
+        return None
+
+    async def no_status(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(service, "_cpu_sample_rows", no_cpu_samples)
+    monkeypatch.setattr(service, "_evaluate_system_alerts", no_alerts)
+    monkeypatch.setattr(service, "_record_category_status", no_status)
+
+    await service._persist_category(
+        1,
+        session,
+        "system",
+        {"status": "available", "data": {"os_release": {"ID": "ubuntu"}}},
+        datetime.now(timezone.utc),
+    )
+
+    snapshots = [row for row in session.added if isinstance(row, MetricSnapshot)]
+    assert snapshots[0].data["data"]["os_release"]["ID"] == "ubuntu"
+
+
 def test_prune_old_snapshots_maintenance(local_node_sync):
     # Insert an old snapshot (>24h) and a fresh snapshot
     old_time = datetime.now(timezone.utc) - timedelta(hours=36)

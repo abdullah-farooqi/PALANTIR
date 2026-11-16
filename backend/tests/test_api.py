@@ -180,7 +180,12 @@ async def test_register_and_deactivate_node(client: AsyncClient):
     )
     respx.get(f"{new_node_url}/api/v1/info").respond(
         status_code=200,
-        json={"version": "1.0.0", "hostname": "test-sensor-node", "os_release": {"ID": "linux"}},
+        json={
+            "version": "1.0.0",
+            "hostname": "test-sensor-node",
+            "os": "Linux-6.8.0-x86_64-with-glibc2.39",
+            "os_release": {"ID": "ubuntu", "PRETTY_NAME": "Ubuntu 24.04 LTS"},
+        },
     )
     respx.get(f"{new_node_url}/api/v1/capabilities").respond(
         status_code=200,
@@ -199,6 +204,7 @@ async def test_register_and_deactivate_node(client: AsyncClient):
     node_id = node_data["id"]
     assert node_data["hostname"] == "test-sensor-node"
     assert node_data["collector_url"] == new_node_url
+    assert node_data["os_type"] == "linux"
     assert node_data["active"] is True
 
     # 2. Re-registering existing node updates metadata

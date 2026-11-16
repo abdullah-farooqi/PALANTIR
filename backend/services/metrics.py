@@ -299,15 +299,8 @@ class MetricsService:
                     session.add(sample_row)
                 if sample_rows:
                     floor = max(row.collected_at for row in sample_rows) + timedelta(milliseconds=1)
-                os_release = payload_data.get("os_release")
-                if isinstance(os_release, dict):
-                    detected = os_release.get("ID") or os_release.get("NAME") or os_release.get("PRETTY_NAME")
-                    if detected:
-                        node = (await _maybe_await(
-                            session.execute(select(MonitoredNode).where(MonitoredNode.id == node_id))
-                        )).scalar_one_or_none()
-                        if node is not None and node.os_type != str(detected).strip().lower():
-                            node.os_type = str(detected).strip().lower()
+                # Keep os_type as the platform family accepted by the node
+                # registry. Distro details remain in this JSONB snapshot.
             elif category == "processes":
                 top_processes = top_processes_from_payload(payload_data)
 

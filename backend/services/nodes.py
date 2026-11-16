@@ -41,11 +41,14 @@ class NodeService:
             logger.warning("Could not read collector capabilities for %s: %s", hostname, exc)
             capabilities = None
 
-        # Use the real distro reported by the host instead of the generic "linux" placeholder.
+        # `os_type` is a platform family constrained to linux/windows in the node
+        # registry. Preserve the distro name in the agent's os_release telemetry.
         os_release = info.get("os_release") if isinstance(info.get("os_release"), dict) else {}
-        detected_os = os_release.get("ID") or os_release.get("NAME")
-        if detected_os and isinstance(detected_os, str):
-            os_type = detected_os.strip().lower()
+        reported_platform = str(info.get("os") or "").lower()
+        if "windows" in reported_platform:
+            os_type = "windows"
+        elif "linux" in reported_platform or os_release:
+            os_type = "linux"
         elif os_type not in {"linux", "windows"}:
             os_type = "linux"
 
