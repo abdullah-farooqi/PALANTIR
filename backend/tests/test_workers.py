@@ -1,3 +1,4 @@
+import asyncio
 import pytest
 from datetime import datetime, timezone, timedelta
 from sqlalchemy import select
@@ -5,6 +6,7 @@ from core.database import get_sync_session, AsyncSessionLocal
 from models.node import MonitoredNode
 from models.metric import MetricSnapshot
 from services.metrics import MetricsService
+from workers import metrics_tasks
 from workers.maintenance_tasks import prune_old_snapshots
 
 
@@ -133,3 +135,25 @@ def test_prune_old_snapshots_maintenance(local_node_sync):
 
         assert check_old is None
         assert check_fresh is not None
+
+
+@pytest.mark.asyncio
+async def test_collect_batch_limits_parallel_node_sessions(monkeypatch):
+    current = 0
+    peak = 0
+
+    async def fake_collect_one(*_item):
+        nonlocal current, peak
+        current += 1
+        peak = max(peak, current)
+        await asyncio.sleep(0.01)
+        current -= 1
+        return True
+
+    monkeypatch.setattr(metrics_tasks, "_collect_one", fake_collect_one)
+    failures = await metrics_tasks._collect_batch(
+        [(node_id, f"node-{node_id}", None) for node_id in range(25)]
+    )
+
+    assert failures == 0
+    assert peak == metrics_tasks.MAX_CONCURRENT_NODE_COLLECTIONS

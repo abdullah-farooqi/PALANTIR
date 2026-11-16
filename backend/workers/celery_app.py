@@ -66,6 +66,8 @@ celery_app.conf.beat_schedule = {
     "collect-metrics-top-of-minute": {
         "task": "workers.metrics_tasks.collect_all_nodes",
         "schedule": crontab(minute="*"),
+        # A delayed full-fleet poll is obsolete once the next minute's poll is due.
+        "options": {"expires": 55},
     },
     "collect-anomaly-5min": {
         "task": "workers.anomaly_tasks.evaluate_all_nodes",
