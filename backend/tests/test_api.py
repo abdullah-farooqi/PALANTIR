@@ -587,7 +587,8 @@ async def test_warning_alert_snapshot_is_recorded_and_transfer_is_queued(
         event_id, investigation_id = event.id, investigation.id
         await session.commit()
 
-        async def fake_snapshot(_self):
+        async def fake_snapshot(_self, trigger_type="manual"):
+            assert trigger_type == "alert"
             return {
                 "snapshot_id": "a" * 32,
                 "files": [{

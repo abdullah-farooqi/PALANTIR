@@ -182,7 +182,7 @@ async def request_pcap_evidence_for_alert(
 
     client = AgentCollectorClient(node.collector_url, timeout=min(settings.PCAP_TRANSFER_TIMEOUT_SECONDS, 30.0))
     try:
-        snapshot = await client.create_pcap_snapshot()
+        snapshot = await client.create_pcap_snapshot(trigger_type="alert")
     except Exception as exc:
         logger.warning("Could not snapshot PCAP evidence for alert %s: %s", event_id, exc)
         session.add(InvestigationEvidence(
