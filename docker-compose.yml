@@ -174,7 +174,7 @@ services:
     restart: unless-stopped
     extra_hosts:
       - "host.docker.internal:host-gateway"
-    command: celery -A workers.celery_app.celery_app worker --loglevel=info -Q pcap_analysis,pcap_transfer,default
+    command: celery -A workers.celery_app.celery_app worker --loglevel=info --concurrency=${CELERY_WORKER_CONCURRENCY:-2} -Q pcap_analysis,pcap_transfer,default
     depends_on:
       backend:
         condition: service_started
