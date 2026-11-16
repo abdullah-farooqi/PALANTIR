@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gzip
+import hashlib
 import json
 import mmap
 import os
@@ -37,12 +38,12 @@ def build_bpf_filter(exclude_expression: str) -> str:
     return f"not ({expression})" if expression else ""
 
 
-def _pcap_packet_bounds(path: Path) -> tuple[datetime, datetime] | None:
-    """Read first/last packet timestamps from a classic pcap without loading payloads."""
+def _pcap_packet_info(path: Path) -> tuple[tuple[datetime, datetime] | None, int | None]:
+    """Read packet bounds and count from a classic pcap without loading payloads."""
     try:
         with path.open("rb") as stream:
             if path.stat().st_size < 24:
-                return None
+                return None, None
             with mmap.mmap(stream.fileno(), length=0, access=mmap.ACCESS_READ) as data:
                 formats = {
                     b"\xd4\xc3\xb2\xa1": ("<", 1_000_000),
@@ -52,30 +53,37 @@ def _pcap_packet_bounds(path: Path) -> tuple[datetime, datetime] | None:
                 }
                 encoding = formats.get(data[:4])
                 if encoding is None:
-                    return None
+                    return None, None
                 endian, fraction_scale = encoding
                 packet_header = struct.Struct(f"{endian}IIII")
                 file_size = len(data)
                 offset = 24
                 first_timestamp = last_timestamp = None
+                packet_count = 0
                 while offset + packet_header.size <= file_size:
                     seconds, fraction, captured_length, _original_length = packet_header.unpack_from(data, offset)
                     packet_offset = offset + packet_header.size
                     if captured_length > 262144 or packet_offset + captured_length > file_size:
-                        return None
+                        return None, None
                     timestamp = seconds + fraction / fraction_scale
                     if first_timestamp is None:
                         first_timestamp = timestamp
                     last_timestamp = timestamp
+                    packet_count += 1
                     offset = packet_offset + captured_length
                 if first_timestamp is None or last_timestamp is None:
-                    return None
-                return (
+                    return None, packet_count
+                bounds = (
                     datetime.fromtimestamp(first_timestamp, timezone.utc),
                     datetime.fromtimestamp(last_timestamp, timezone.utc),
                 )
+                return bounds, packet_count
     except (OSError, OverflowError, ValueError, struct.error):
-        return None
+        return None, None
+
+
+def _pcap_packet_bounds(path: Path) -> tuple[datetime, datetime] | None:
+    return _pcap_packet_info(path)[0]
 
 
 class PCapManager:
@@ -102,6 +110,9 @@ class PCapManager:
         compression: str,
         snapshot_ttl_seconds: int = 1800,
         max_active_snapshots: int = 3,
+        alert_snaplen: int | None = None,
+        alert_window_seconds: int = 10,
+        max_total_bytes: int | None = None,
     ) -> None:
         if not interface or len(interface) > 64:
             raise ValueError("PCAP_INTERFACE must be a non-empty interface name")
@@ -117,6 +128,11 @@ class PCapManager:
             raise ValueError("PCAP_COMPRESSION must be zstd, gzip, or none")
         if not 1 <= max_active_snapshots <= 100:
             raise ValueError("PCAP_MAX_ACTIVE_SNAPSHOTS must be between 1 and 100")
+        alert_snaplen = alert_snaplen if alert_snaplen is not None else snaplen
+        if not snaplen <= alert_snaplen <= 262144:
+            raise ValueError("PCAP_ALERT_SNAPLEN must be between PCAP_SNAPLEN and 262144")
+        if not 1 <= alert_window_seconds <= 30:
+            raise ValueError("PCAP_ALERT_WINDOW_SECONDS must be between 1 and 30")
 
         self.enabled = enabled
         self.interface = interface
@@ -129,22 +145,34 @@ class PCapManager:
         self.compression = compression
         self.snapshot_ttl_seconds = max(60, snapshot_ttl_seconds)
         self.max_active_snapshots = max_active_snapshots
+        self.default_snaplen = snaplen
+        self.alert_snaplen = alert_snaplen
+        self.alert_window_seconds = alert_window_seconds
+        self.max_total_bytes = max_total_bytes if max_total_bytes is not None else max_size_mb * max_files * 1024 * 1024
+        if self.max_total_bytes < max_size_mb * 1024 * 1024:
+            raise ValueError("PCAP_MAX_TOTAL_SIZE_MB must be at least PCAP_MAX_SIZE_MB")
 
         self._lock = threading.RLock()
         self._snapshot_call_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._snapshot_requested = threading.Event()
         self._snapshot_completed = threading.Event()
+        self._alert_requested = threading.Event()
+        self._alert_started = threading.Event()
+        self._alert_until: float | None = None
         self._compression_queue: queue.Queue[Path | None] = queue.Queue(maxsize=max(8, max_files * 4))
+        self._hash_queue: queue.Queue[tuple[Path, str] | None] = queue.Queue(maxsize=max(8, max_files * 4))
         self._compressing: set[str] = set()
         self._pins: dict[str, dict[str, Any]] = {}
         self._thread: threading.Thread | None = None
         self._compression_thread: threading.Thread | None = None
+        self._hash_thread: threading.Thread | None = None
         self._process: subprocess.Popen | None = None
         self._current_prefix: Path | None = None
         self._current_started_at: datetime | None = None
         self._snapshot_result: dict[str, Any] | None = None
         self._last_error: str | None = None
+        self._dropped_files = 0
         self._last_started_at: str | None = None
         self._runtime_enabled = enabled
 
@@ -170,11 +198,16 @@ class PCapManager:
                 self._last_error = f"PCAP storage is not writable: {exc}"
                 return False
             self._runtime_enabled = True
+            self.snaplen = self.default_snaplen
+            self._alert_until = None
+            self._alert_requested.clear()
+            self._alert_started.clear()
             self._stop_event.clear()
             self._snapshot_requested.clear()
             self._snapshot_completed.clear()
             self._snapshot_result = None
             self._ensure_compressor()
+            self._ensure_hash_worker()
             self._recover_closed_files()
             self._thread = threading.Thread(target=self._run, name="palantir-pcap", daemon=True)
             self._thread.start()
@@ -199,11 +232,23 @@ class PCapManager:
             self._current_started_at = None
         self._prune()
 
-    def snapshot(self, timeout: float = 12.0) -> dict[str, Any]:
+    def snapshot(self, timeout: float = 12.0, trigger_type: str = "manual") -> dict[str, Any]:
         """Close the active segment and return a pinned manifest of retained files."""
+        if trigger_type not in {"manual", "alert", "anomaly"}:
+            raise PCapError("Unknown PCAP snapshot trigger type")
         if not self.status()["running"]:
             raise PCapError("Packet capture is not running")
         with self._snapshot_call_lock:
+            if trigger_type == "alert" and self.alert_snaplen > self.default_snaplen:
+                self._alert_started.clear()
+                self._alert_requested.set()
+                if not self._alert_started.wait(timeout=8.0):
+                    raise PCapError("Timed out while starting the alert capture window")
+                with self._lock:
+                    alert_until = self._alert_until
+                if alert_until is not None:
+                    time.sleep(max(0.0, alert_until - time.monotonic()))
+                timeout = max(timeout, self.alert_window_seconds + 10.0)
             self._snapshot_completed.clear()
             self._snapshot_result = None
             self._snapshot_requested.set()
@@ -211,7 +256,7 @@ class PCapManager:
                 raise PCapError("Timed out while finalizing the active PCAP segment")
             if self._snapshot_result is None:
                 raise PCapError("The collector could not create a PCAP snapshot")
-            return self._snapshot_result
+            return {**self._snapshot_result, "trigger_type": trigger_type}
 
     def release_snapshot(self, snapshot_id: str) -> bool:
         """Release files pinned for a completed or expired evidence transfer."""
@@ -263,6 +308,11 @@ class PCapManager:
                     "duration_seconds": metadata.get("duration_seconds"),
                     "compression": expected_compression,
                     "status": "compressing" if is_compressing else "ready",
+                    "interface": metadata.get("interface"),
+                    "snaplen": metadata.get("snaplen"),
+                    "packet_count": metadata.get("packet_count"),
+                    "sha256": metadata.get("sha256"),
+                    "hash_status": metadata.get("hash_status", "pending"),
                 })
             except (OSError, ValueError, TypeError):
                 continue
@@ -304,6 +354,8 @@ class PCapManager:
             started = self._last_started_at
             enabled = self._runtime_enabled
             active_snapshots = len(self._pins)
+            dropped_files = self._dropped_files
+        retained_bytes = sum(int(item.get("size_bytes") or 0) for item in files)
         return {
             "enabled": enabled,
             "configured_enabled": self.enabled,
@@ -311,14 +363,19 @@ class PCapManager:
             "pid": process.pid if running and process else None,
             "interface": self.interface,
             "snaplen": self.snaplen,
+            "alert_snaplen": self.alert_snaplen,
+            "alert_window_seconds": self.alert_window_seconds,
             "rotation_seconds": self.rotation_seconds,
             "max_files": self.max_files,
             "max_size_mb": self.max_size_mb,
+            "max_total_bytes": self.max_total_bytes,
+            "dropped_files": dropped_files,
             "active_snapshots": active_snapshots,
             "max_active_snapshots": self.max_active_snapshots,
             "filter": build_bpf_filter(self.filter_exclude),
             "compression": self.compression,
             "file_count": len(files),
+            "retained_bytes": retained_bytes,
             "disk": disk,
             "last_started_at": started,
             "last_error": error,
@@ -362,15 +419,28 @@ class PCapManager:
                 self._current_started_at = started_at
                 self._last_started_at = started_at.isoformat()
                 self._last_error = None
+                if self.snaplen == self.alert_snaplen and self.alert_snaplen > self.default_snaplen and self._alert_until is None:
+                    self._alert_until = time.monotonic() + self.alert_window_seconds
+                    self._alert_started.set()
             backoff = 1.0
             deadline = time.monotonic() + self.rotation_seconds
             reason = "time"
             while not self._stop_event.is_set():
-                if self._snapshot_requested.wait(timeout=min(1.0, max(0.05, deadline - time.monotonic()))):
+                wait_seconds = min(1.0, max(0.05, deadline - time.monotonic()))
+                if self._alert_requested.wait(timeout=wait_seconds):
+                    self._alert_requested.clear()
+                    reason = "alert_start"
+                    break
+                if self._snapshot_requested.is_set():
                     reason = "snapshot"
                     break
                 if process.poll() is not None:
                     reason = "process_exit"
+                    break
+                with self._lock:
+                    alert_until = self._alert_until
+                if alert_until is not None and time.monotonic() >= alert_until:
+                    reason = "alert_end"
                     break
                 if time.monotonic() >= deadline:
                     reason = "time"
@@ -380,10 +450,22 @@ class PCapManager:
 
             self._stop_process(process)
             self._register_closed_files(prefix, started_at)
+            self._prune()
             with self._lock:
                 self._process = None
                 self._current_prefix = None
                 self._current_started_at = None
+
+            if reason == "alert_start":
+                with self._lock:
+                    self.snaplen = self.alert_snaplen
+                    self._alert_until = None
+                continue
+            if reason == "alert_end":
+                with self._lock:
+                    self.snaplen = self.default_snaplen
+                    self._alert_until = None
+                continue
 
             if reason == "snapshot":
                 snapshot_id = uuid4().hex
@@ -464,7 +546,7 @@ class PCapManager:
                 self._delete_artifact(path.name)
                 continue
             exact_process_file = path.name == prefix.name
-            packet_bounds = _pcap_packet_bounds(path)
+            packet_bounds, packet_count = _pcap_packet_info(path)
             if packet_bounds is not None:
                 capture_started_at, capture_finished_at = packet_bounds
                 duration_seconds = max(0, int((capture_finished_at - capture_started_at).total_seconds()))
@@ -480,6 +562,11 @@ class PCapManager:
                 "capture_finished_at": capture_finished_at.isoformat() if capture_finished_at else None,
                 "duration_seconds": duration_seconds,
                 "original_size_bytes": size_bytes,
+                "interface": self.interface,
+                "snaplen": self.snaplen,
+                "packet_count": packet_count,
+                "sha256": None,
+                "hash_status": "pending",
             }
             try:
                 self._write_json_atomic(metadata_path, metadata)
@@ -489,6 +576,12 @@ class PCapManager:
                 continue
             if self.compression != "none":
                 self._queue_compression(path)
+                with self._lock:
+                    queued_for_compression = path.name in self._compressing
+                if not queued_for_compression:
+                    self._queue_hash(path, path.name)
+            else:
+                self._queue_hash(path, path.name)
 
     def _ensure_compressor(self) -> None:
         with self._lock:
@@ -498,6 +591,65 @@ class PCapManager:
                 target=self._compress_loop, name="palantir-pcap-compressor", daemon=True
             )
             self._compression_thread.start()
+
+    def _ensure_hash_worker(self) -> None:
+        with self._lock:
+            if self._hash_thread and self._hash_thread.is_alive():
+                return
+            self._hash_thread = threading.Thread(
+                target=self._hash_loop, name="palantir-pcap-hasher", daemon=True
+            )
+            self._hash_thread.start()
+
+    def _queue_hash(self, path: Path, file_id: str) -> None:
+        self._ensure_hash_worker()
+        try:
+            self._hash_queue.put_nowait((path, file_id))
+        except queue.Full:
+            try:
+                metadata_path = self._metadata_path(file_id)
+                metadata = json.loads(metadata_path.read_text())
+                metadata["hash_status"] = "queue_full"
+                self._write_json_atomic(metadata_path, metadata)
+            except (OSError, ValueError, TypeError):
+                pass
+            with self._lock:
+                self._last_error = "PCAP hash queue is full; a file digest is pending"
+
+    def _hash_loop(self) -> None:
+        while True:
+            item = self._hash_queue.get()
+            try:
+                if item is None:
+                    return
+                self._hash_one(*item)
+            finally:
+                self._hash_queue.task_done()
+
+    def _hash_one(self, path: Path, file_id: str) -> None:
+        try:
+            digest = hashlib.sha256()
+            size = 0
+            with path.open("rb") as stream:
+                while chunk := stream.read(1024 * 1024):
+                    digest.update(chunk)
+                    size += len(chunk)
+            metadata_path = self._metadata_path(file_id)
+            metadata = json.loads(metadata_path.read_text())
+            metadata.update(sha256=digest.hexdigest(), hash_status="complete", stored_size_bytes=size)
+            metadata["stored_filename"] = path.name
+            self._write_json_atomic(metadata_path, metadata)
+        except FileNotFoundError:
+            try:
+                metadata_path = self._metadata_path(file_id)
+                metadata = json.loads(metadata_path.read_text())
+                metadata.update(sha256=None, hash_status="unavailable")
+                self._write_json_atomic(metadata_path, metadata)
+            except (OSError, ValueError, TypeError):
+                pass
+        except (OSError, ValueError, TypeError) as exc:
+            with self._lock:
+                self._last_error = f"Could not hash PCAP file {file_id}: {exc}"
 
     def _queue_compression(self, path: Path) -> None:
         if not path.exists() or self.compression == "none":
@@ -553,6 +705,7 @@ class PCapManager:
                 os.fsync(target.fileno())
             os.replace(temporary, output)
             path.unlink(missing_ok=True)
+            self._queue_hash(output, file_id)
         except (OSError, PCapError) as exc:
             temporary.unlink(missing_ok=True)
             with self._lock:
@@ -640,6 +793,13 @@ class PCapManager:
                     continue
             if path.suffix not in {".zst", ".gz"} and self.compression != "none":
                 self._queue_compression(path)
+            else:
+                try:
+                    metadata = json.loads(metadata_path.read_text())
+                    if not metadata.get("sha256"):
+                        self._queue_hash(path, metadata["file_id"])
+                except (OSError, ValueError, TypeError, KeyError):
+                    continue
 
     def _expire_pins(self) -> None:
         now = datetime.now(timezone.utc)
@@ -663,21 +823,33 @@ class PCapManager:
                 for file_id in record.get("file_ids", [])
             }
             compressing = set(self._compressing)
-        records = []
+        records: list[tuple[float, str, int]] = []
         for path in self.storage_dir.glob("capture_*.pcap*.json"):
             try:
                 record = json.loads(path.read_text())
                 file_id = record.get("file_id")
                 if isinstance(file_id, str) and _FILE_ID.fullmatch(file_id):
-                    records.append((path.stat().st_mtime, file_id))
+                    raw_path, final_path = self._artifact_paths(file_id)
+                    artifact = final_path if final_path.exists() else raw_path
+                    records.append((path.stat().st_mtime, file_id, artifact.stat().st_size if artifact.exists() else 0))
             except (OSError, ValueError, TypeError):
                 continue
         records.sort(reverse=True)
-        keep = {file_id for _, file_id in records[:self.max_files]} | pinned
-        for _, file_id in records:
+        keep = {file_id for _, file_id, _ in records[:self.max_files]} | pinned
+        for _, file_id, _ in records:
             if file_id in keep or file_id in compressing:
                 continue
             self._delete_artifact(file_id)
+        retained = [record for record in records if record[1] in keep]
+        total_bytes = sum(size for _, _, size in retained)
+        for _, file_id, size in reversed(retained):
+            if total_bytes <= self.max_total_bytes:
+                break
+            if file_id in pinned or file_id in compressing:
+                continue
+            self._delete_artifact(file_id)
+            keep.discard(file_id)
+            total_bytes -= size
 
     def _expire_pins_without_pruning(self) -> None:
         now = datetime.now(timezone.utc)
@@ -698,6 +870,9 @@ class PCapManager:
 
     def _delete_artifact(self, file_id: str) -> None:
         raw_path = self.storage_dir / file_id
+        existed = any(path.exists() for path in (
+            raw_path, Path(f"{raw_path}.zst"), Path(f"{raw_path}.gz"),
+        ))
         for path in (
             raw_path,
             Path(f"{raw_path}.zst"),
@@ -710,6 +885,9 @@ class PCapManager:
                 path.unlink(missing_ok=True)
             except OSError:
                 pass
+        if existed:
+            with self._lock:
+                self._dropped_files += 1
 
     def _coverage_seconds(self, files: list[dict[str, Any]]) -> int:
         starts = []

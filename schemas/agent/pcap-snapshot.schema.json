@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://palantir.local/schemas/agent/pcap-snapshot.schema.json",
+  "title": "PALANTIR host agent PCAP snapshot manifest",
+  "type": "object",
+  "required": ["schema_version", "collector_version", "snapshot_id", "created_at", "expires_at", "coverage_seconds", "trigger_type", "files"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "collector_version": {"type": "string"},
+    "snapshot_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+    "created_at": {"type": "string", "format": "date-time"},
+    "expires_at": {"type": "string", "format": "date-time"},
+    "coverage_seconds": {"type": "integer", "minimum": 0},
+    "trigger_type": {"enum": ["manual", "alert", "anomaly"]},
+    "files": {"type": "array", "items": {"type": "object", "required": ["file_id", "size_bytes", "compression", "snaplen", "interface", "hash_status"]}}
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://palantir.local/schemas/agent/snapshot-envelope.schema.json",
+  "title": "PALANTIR host agent category snapshot",
+  "type": "object",
+  "required": ["schema_version", "category", "collector_version", "collected_at", "status", "data"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "category": {"enum": ["system", "storage", "network", "services", "processes", "connections", "containers", "virtual_machines"]},
+    "collector_version": {"type": "string"},
+    "collected_at": {"type": "string", "format": "date-time"},
+    "status": {"$ref": "#/$defs/status"},
+    "data": {"type": ["object", "null"]}
+  },
+  "$defs": {
+    "status": {
+      "type": "object",
+      "required": ["state", "reason", "source", "last_success", "last_attempt"],
+      "properties": {
+        "state": {"enum": ["available", "partial", "stale", "unsupported", "not_configured", "permission_denied", "unavailable"]},
+        "reason": {"type": ["string", "null"]},
+        "source": {"type": "string"},
+        "last_success": {"type": ["string", "null"], "format": "date-time"},
+        "last_attempt": {"type": ["string", "null"], "format": "date-time"}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

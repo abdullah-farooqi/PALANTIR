@@ -1,0 +1,15 @@
+{
+  "schema_version": "1.0",
+  "collector_version": "0.1.0",
+  "collected_at": "2026-11-16T12:00:00.000Z",
+  "categories": {
+    "system": {"schema_version": "1.0", "category": "system", "collector_version": "0.1.0", "collected_at": "2026-11-16T12:00:00.000Z", "status": {"state": "available", "reason": null, "source": "linux-host-collector", "last_success": "2026-11-16T12:00:00.000Z", "last_attempt": "2026-11-16T12:00:00.000Z"}, "data": {}},
+    "storage": {"schema_version": "1.0", "category": "storage", "collector_version": "0.1.0", "collected_at": "2026-11-16T12:00:00.000Z", "status": {"state": "available", "reason": null, "source": "linux-host-collector", "last_success": "2026-11-16T12:00:00.000Z", "last_attempt": "2026-11-16T12:00:00.000Z"}, "data": {}},
+    "network": {"schema_version": "1.0", "category": "network", "collector_version": "0.1.0", "collected_at": "2026-11-16T12:00:00.000Z", "status": {"state": "available", "reason": null, "source": "linux-host-collector", "last_success": "2026-11-16T12:00:00.000Z", "last_attempt": "2026-11-16T12:00:00.000Z"}, "data": {}},
+    "services": {"schema_version": "1.0", "category": "services", "collector_version": "0.1.0", "collected_at": "2026-11-16T12:00:00.000Z", "status": {"state": "available", "reason": null, "source": "linux-host-collector", "last_success": "2026-11-16T12:00:00.000Z", "last_attempt": "2026-11-16T12:00:00.000Z"}, "data": {}},
+    "processes": {"schema_version": "1.0", "category": "processes", "collector_version": "0.1.0", "collected_at": "2026-11-16T12:00:00.000Z", "status": {"state": "available", "reason": null, "source": "linux-host-collector", "last_success": "2026-11-16T12:00:00.000Z", "last_attempt": "2026-11-16T12:00:00.000Z"}, "data": {}},
+    "connections": {"schema_version": "1.0", "category": "connections", "collector_version": "0.1.0", "collected_at": "2026-11-16T12:00:00.000Z", "status": {"state": "available", "reason": null, "source": "linux-host-collector", "last_success": "2026-11-16T12:00:00.000Z", "last_attempt": "2026-11-16T12:00:00.000Z"}, "data": {}},
+    "containers": {"schema_version": "1.0", "category": "containers", "collector_version": "0.1.0", "collected_at": "2026-11-16T12:00:00.000Z", "status": {"state": "available", "reason": null, "source": "linux-host-collector", "last_success": "2026-11-16T12:00:00.000Z", "last_attempt": "2026-11-16T12:00:00.000Z"}, "data": {}},
+    "virtual_machines": {"schema_version": "1.0", "category": "virtual_machines", "collector_version": "0.1.0", "collected_at": "2026-11-16T12:00:00.000Z", "status": {"state": "unsupported", "reason": "No hypervisor is configured.", "source": "linux-host-collector", "last_success": null, "last_attempt": "2026-11-16T12:00:00.000Z"}, "data": null}
+  }
+}

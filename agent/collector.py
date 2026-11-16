@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import copy
+import logging
 import os
 import platform
 import re
@@ -23,11 +25,13 @@ from typing import Any
 
 import psutil
 import httpx
-from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi import Body, FastAPI, Header, HTTPException, Query
 from fastapi.responses import FileResponse
 from pcap import PCapError, PCapFileNotReady, PCapManager
 
 APP_VERSION = "0.1.0"
+SCHEMA_VERSION = "1.0"
+logger = logging.getLogger("palantir.agent")
 HOST_PROC = Path(os.getenv("HOST_PROC", "/host/proc" if Path("/host/proc").exists() else "/proc"))
 HOST_SYS = Path(os.getenv("HOST_SYS", "/host/sys" if Path("/host/sys").exists() else "/sys"))
 HOST_ROOT = Path(os.getenv("HOST_ROOT", "/host" if Path("/host").exists() else "/"))
@@ -96,6 +100,7 @@ def _stop_pcap_manager() -> None:
     _PCAP_MANAGER.stop()
 
 CATEGORIES = ("system", "storage", "network", "services", "processes", "connections", "containers", "vms")
+CANONICAL_CATEGORIES = (*CATEGORIES[:-1], "virtual_machines")
 
 # --------------------------------------------------------------------------------------
 # Sampling configuration (all optional environment variables)
@@ -110,6 +115,13 @@ CPU_SAMPLE_BUFFER = max(60, int(os.getenv("CPU_SAMPLE_BUFFER", "900")))        #
 CPU_CURRENT_WINDOW = max(1, int(os.getenv("CPU_CURRENT_WINDOW", "5")))         # samples averaged for "current" CPU
 RATE_SAMPLE_SECONDS = max(2.0, float(os.getenv("RATE_SAMPLE_SECONDS", "5")))   # process / network / disk rates
 PID_REUSE_TOLERANCE_SECONDS = 5.0                                              # create_time jitter vs. PID reuse
+CATEGORY_REFRESH_SECONDS = min(300.0, max(5.0, float(os.getenv("CATEGORY_REFRESH_SECONDS", "60"))))
+CATEGORY_TIMEOUT_SECONDS = min(10.0, max(0.5, float(os.getenv("CATEGORY_TIMEOUT_SECONDS", "4"))))
+PROCESS_LIMIT = min(5000, max(1, int(os.getenv("PROCESS_LIMIT", "100"))))
+SOCKET_LIMIT = min(50000, max(1, int(os.getenv("SOCKET_LIMIT", "5000"))))
+ACTIONS_ENABLED = os.getenv("ACTIONS_ENABLED", "1") == "1"
+UNREDACTED_LOGS = os.getenv("UNREDACTED_LOGS", "0") == "1"
+AGENT_STARTED_MONOTONIC = time.monotonic()
 
 # Packet capture is opt-in because it records network metadata and may include payload bytes.
 PCAP_ENABLED = os.getenv("PCAP_ENABLED", "0") == "1"
@@ -123,6 +135,9 @@ PCAP_STORAGE_DIR = Path(os.getenv("PCAP_STORAGE_DIR", "/var/lib/palantir-agent/p
 PCAP_COMPRESSION = os.getenv("PCAP_COMPRESSION", "zstd").strip().lower()
 PCAP_SNAPSHOT_TTL_SECONDS = int(os.getenv("PCAP_SNAPSHOT_TTL_SECONDS", "1800"))
 PCAP_MAX_ACTIVE_SNAPSHOTS = int(os.getenv("PCAP_MAX_ACTIVE_SNAPSHOTS", "3"))
+PCAP_ALERT_SNAPLEN = min(262144, max(PCAP_SNAPLEN, int(os.getenv("PCAP_ALERT_SNAPLEN", "4096"))))
+PCAP_ALERT_WINDOW_SECONDS = min(30, max(1, int(os.getenv("PCAP_ALERT_WINDOW_SECONDS", "10"))))
+PCAP_MAX_TOTAL_SIZE_MB = max(PCAP_MAX_SIZE_MB, int(os.getenv("PCAP_MAX_TOTAL_SIZE_MB", str(PCAP_MAX_SIZE_MB * PCAP_MAX_FILES))))
 
 _CPU_FIELDS = ("user", "nice", "system", "idle", "iowait", "irq", "softirq", "steal")
 
@@ -437,6 +452,9 @@ _PCAP_MANAGER = PCapManager(
     compression=PCAP_COMPRESSION,
     snapshot_ttl_seconds=PCAP_SNAPSHOT_TTL_SECONDS,
     max_active_snapshots=PCAP_MAX_ACTIVE_SNAPSHOTS,
+    alert_snaplen=PCAP_ALERT_SNAPLEN,
+    alert_window_seconds=PCAP_ALERT_WINDOW_SECONDS,
+    max_total_bytes=PCAP_MAX_TOTAL_SIZE_MB * 1024 * 1024,
 )
 
 
@@ -449,22 +467,22 @@ def _redact_text(value: str) -> str:
     return SENSITIVE_VALUE.sub(r"\1[REDACTED]", value)
 
 
-def _safe_fields(fields: dict[str, Any]) -> dict[str, Any]:
+def _safe_fields(fields: dict[str, Any], redact: bool = True) -> dict[str, Any]:
     safe = {}
     for key, value in fields.items():
-        if SENSITIVE_KEY.search(key):
+        if redact and SENSITIVE_KEY.search(key):
             safe[key] = "[REDACTED]"
         elif isinstance(value, dict):
-            safe[key] = _safe_fields(value)
+            safe[key] = _safe_fields(value, redact)
         elif isinstance(value, list):
             safe[key] = [
-                _safe_fields(item) if isinstance(item, dict)
-                else _redact_text(item) if isinstance(item, str)
+                _safe_fields(item, redact) if isinstance(item, dict)
+                else _redact_text(item) if redact and isinstance(item, str)
                 else item
                 for item in value
             ]
         elif isinstance(value, str):
-            safe[key] = _redact_text(value)
+            safe[key] = _redact_text(value) if redact else value
         else:
             safe[key] = value
     return safe
@@ -482,6 +500,14 @@ def _guard_pcap(token: str | None) -> None:
         raise HTTPException(status_code=503, detail="Packet capture requires PALANTIR_AGENT_TOKEN")
     if not token or not hmac.compare_digest(token.encode(), AGENT_TOKEN.encode()):
         raise HTTPException(status_code=403, detail="Invalid agent token")
+
+
+def _guard_actions(token: str | None) -> None:
+    if not ACTIONS_ENABLED:
+        raise HTTPException(status_code=403, detail="Agent actions are disabled")
+    _guard(token)
+    if not AGENT_TOKEN and not ALLOW_ANONYMOUS_KILL:
+        raise HTTPException(status_code=403, detail="Actions require PALANTIR_AGENT_TOKEN")
 
 
 def _status_data(data: Any, capability: str = "available") -> dict[str, Any]:
@@ -1050,7 +1076,7 @@ def collect_processes() -> dict[str, Any]:
     cores = len(_CPU_SAMPLER.current()["cores"] or []) if _CPU_SAMPLER.current() else 0
     cores = cores or psutil.cpu_count(logical=True) or 1
     rows: list[dict[str, Any]] = []
-    for proc in psutil.process_iter(attrs=["pid", "name", "status", "memory_info", "num_threads", "username", "create_time", "cpu_times"]):
+    for proc in psutil.process_iter(attrs=["pid", "name", "status", "memory_info", "num_threads", "username", "create_time", "cpu_times", "cmdline"]):
         try:
             item = proc.info
             pid = item.get("pid")
@@ -1066,6 +1092,7 @@ def collect_processes() -> dict[str, Any]:
                 "pid": pid, "name": item.get("name"), "status": item.get("status"),
                 "rss_bytes": memory.rss if memory else None, "threads": item.get("num_threads"),
                 "username": item.get("username"), "started_at": created,
+                "command": _redact_text(" ".join(item.get("cmdline") or []))[:2048] or item.get("name"),
                 "cpu_time_seconds": total_cpu_time,
                 # cpu_pct: share of the WHOLE machine (0-100, comparable with the system CPU figure).
                 # cpu_core_pct: share of one core, like `top` (can exceed 100 for multi-threaded processes).
@@ -1076,10 +1103,16 @@ def collect_processes() -> dict[str, Any]:
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
             continue
 
-    by_rss = sorted(rows, key=lambda row: row.get("rss_bytes") or 0, reverse=True)[:100]
-    by_cpu = sorted((row for row in rows if row["cpu_core_pct"]), key=lambda row: row["cpu_core_pct"], reverse=True)[:40]
-    selected = {row["pid"]: row for row in (*by_rss, *by_cpu)}  # a busy small process must not be dropped
-    top = sorted(selected.values(), key=lambda row: row.get("rss_bytes") or 0, reverse=True)
+    by_rss = sorted(rows, key=lambda row: row.get("rss_bytes") or 0, reverse=True)
+    by_cpu = sorted(rows, key=lambda row: row.get("cpu_core_pct") or 0, reverse=True)
+    selected = {row["pid"]: row for row in (*by_rss[:PROCESS_LIMIT], *by_cpu[:PROCESS_LIMIT])}
+    top = by_rss[:100]
+    ranked = sorted(
+        selected.values(),
+        key=lambda row: ((row.get("cpu_pct") or 0.0), (row.get("rss_bytes") or 0)),
+        reverse=True,
+    )
+    process_rows = ranked[:PROCESS_LIMIT]
 
     oom = {}
     for line in _read_text(HOST_PROC / "vmstat", 256_000).splitlines():
@@ -1090,14 +1123,15 @@ def collect_processes() -> dict[str, Any]:
             except ValueError:
                 pass
     return _status_data(
-        {"process_count": len(rows), "top_by_rss": top, "oom_counters": oom, "cpu_rates_measured": bool(rates)},
+        {"process_count": len(rows), "top_by_rss": top, "rows": process_rows,
+         "truncated": len(rows) > PROCESS_LIMIT, "oom_counters": oom, "cpu_rates_measured": bool(rates)},
         "available" if rows else "partial",
     )
 
 
 _TCP_STATES = {"01": "ESTABLISHED", "02": "SYN_SENT", "03": "SYN_RECV", "04": "FIN_WAIT1", "05": "FIN_WAIT2",
                "06": "TIME_WAIT", "07": "CLOSE", "08": "CLOSE_WAIT", "09": "LAST_ACK", "0A": "LISTEN", "0B": "CLOSING"}
-_MAX_SOCKETS = 5000
+_MAX_SOCKETS = SOCKET_LIMIT
 
 
 def _decode_socket_address(value: str, ipv6: bool) -> tuple[str, int] | None:
@@ -1144,6 +1178,7 @@ def _socket_inode_owners(wanted: set[str]) -> dict[str, int]:
 def collect_connections() -> dict[str, Any]:
     # Read the HOST's socket tables (not this container's) and resolve owners in a single pass.
     parsed: list[dict[str, Any]] = []
+    total_count = 0
     for table, kind, ipv6 in (("tcp", "tcp", False), ("tcp6", "tcp", True), ("udp", "udp", False), ("udp6", "udp", True)):
         for line in _host_net_file(table).splitlines()[1:]:
             fields = line.split()
@@ -1154,16 +1189,17 @@ def collect_connections() -> dict[str, Any]:
             if local is None:
                 continue
             connected = remote is not None and remote[1] != 0
-            parsed.append({
+            item = {
                 "family": "ipv6" if ipv6 else "ipv4", "type": kind, "local": local,
                 "remote": remote if connected else None,
                 "state": _TCP_STATES.get(fields[3].upper(), "UNKNOWN") if kind == "tcp" else "NONE",
                 "inode": fields[9],
-            })
-            if len(parsed) >= _MAX_SOCKETS:
-                break
+            }
+            total_count += 1
+            if len(parsed) < _MAX_SOCKETS:
+                parsed.append(item)
     if not parsed:
-        return _status_data({"count": 0, "truncated": False, "sockets": []}, "partial")
+        return _status_data({"count": total_count, "truncated": total_count > 0, "sockets": []}, "partial")
 
     owners = _socket_inode_owners({row["inode"] for row in parsed if row["inode"] != "0"})
     names: dict[int, str | None] = {}
@@ -1190,7 +1226,7 @@ def collect_connections() -> dict[str, Any]:
             "remote_port": row["remote"][1] if row["remote"] else None,
             "state": row["state"],
         })
-    return _status_data({"count": len(rows), "truncated": len(rows) >= _MAX_SOCKETS, "sockets": rows})
+    return _status_data({"count": total_count, "truncated": total_count > len(rows), "sockets": rows})
 
 
 def _service_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
@@ -1298,7 +1334,7 @@ def _docker_request(path: str, timeout: float = 5.0) -> Any:
 
 def _container_stats(container_id: str) -> dict[str, Any]:
     try:
-        stats = _docker_request(f"/containers/{container_id}/stats?stream=false", timeout=15.0)
+        stats = _docker_request(f"/containers/{container_id}/stats?stream=false", timeout=3.0)
         memory = stats.get("memory_stats") or {}
         cpu = stats.get("cpu_stats") or {}
         previous = stats.get("precpu_stats") or {}
@@ -1312,6 +1348,12 @@ def _container_stats(container_id: str) -> dict[str, Any]:
         # `docker stats` shows the working set: usage minus reclaimable page cache
         cache = mem_stats.get("inactive_file", mem_stats.get("total_inactive_file", mem_stats.get("cache")))
         working = usage - cache if isinstance(usage, (int, float)) and isinstance(cache, (int, float)) and usage >= cache else usage
+        memory_limit = memory.get("limit")
+        memory_percent = (
+            round(working / memory_limit * 100, 2)
+            if isinstance(working, (int, float)) and isinstance(memory_limit, (int, float)) and memory_limit > 0
+            else None
+        )
 
         networks = stats.get("networks") or {}
         block = (stats.get("blkio_stats") or {}).get("io_service_bytes_recursive") or []
@@ -1320,7 +1362,8 @@ def _container_stats(container_id: str) -> dict[str, Any]:
         return {
             "memory_usage_bytes": working,
             "memory_raw_usage_bytes": usage,
-            "memory_limit_bytes": memory.get("limit"),
+            "memory_limit_bytes": memory_limit,
+            "memory_percent": memory_percent,
             "cpu_percent": cpu_pct,
             "net_rx_bytes": sum(item.get("rx_bytes", 0) for item in networks.values()) if networks else None,
             "net_tx_bytes": sum(item.get("tx_bytes", 0) for item in networks.values()) if networks else None,
@@ -1345,8 +1388,10 @@ def collect_containers() -> dict[str, Any]:
     except (OSError, json.JSONDecodeError) as exc:
         containers = []
         docker_status, docker_reason = "unavailable", str(exc)[:300]
+    inventory_truncated = len(containers) > 500
     containers = containers[:500]
-    active = [item for item in containers if item.get("State") == "running"][:100]
+    all_running = [item for item in containers if item.get("State") == "running"]
+    active = all_running[:16]
     with ThreadPoolExecutor(max_workers=16) as pool:
         stats_by_id = dict(zip(
             (item.get("Id", "") for item in active),
@@ -1364,7 +1409,7 @@ def collect_containers() -> dict[str, Any]:
         "reason": docker_reason,
         "count": len(containers),
         "stats_count": len(active),
-        "stats_truncated": len([item for item in containers if item.get("State") == "running"]) > len(active),
+        "stats_truncated": len(all_running) > len(active),
     }
 
     lxd_path = LXD_SOCKET
@@ -1401,7 +1446,7 @@ def collect_containers() -> dict[str, Any]:
         status = "unavailable"
     else:
         status = "not_configured"
-    return _status_data({"containers": rows, "sources": sources}, status)
+    return _status_data({"containers": rows, "sources": sources, "truncated": inventory_truncated}, status)
 
 
 def _running_lxc_names() -> set[str]:
@@ -1954,9 +1999,229 @@ COLLECTORS = {
     "vms": collect_vms,
 }
 
+# Canonical reads use independent category caches. A slow optional source cannot delay or
+# overwrite a successful result from another category. The legacy endpoints below continue
+# to call collectors directly and keep their original response shape.
+_CANONICAL_EXECUTOR = ThreadPoolExecutor(max_workers=len(COLLECTORS), thread_name_prefix="palantir-category")
+_CANONICAL_LOCK = threading.RLock()
+_CANONICAL_CACHE: dict[str, dict[str, Any]] = {}
+
+
+def _iso_z(value: datetime | None) -> str | None:
+    return value.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z") if value else None
+
+
+def _category_task(category: str) -> None:
+    entry = _CANONICAL_CACHE[category]
+    try:
+        result = COLLECTORS[category]()
+        state = str(result.get("status", "unavailable"))
+        if category == "services" and state in {"unavailable", "permission_denied"}:
+            init_name = _read_first_line(HOST_PROC / "1/comm", 128).strip()
+            if init_name not in {"systemd", "systemd-shutdown"}:
+                state = "unsupported"
+                result.setdefault("data", {})["reason"] = "The host is not running systemd."
+        if state not in {"available", "partial", "not_configured", "unsupported", "permission_denied", "unavailable"}:
+            state = "unavailable"
+        with _CANONICAL_LOCK:
+            entry["last_attempt"] = datetime.now(timezone.utc)
+            entry["failure_reason"] = result.get("reason") or (
+                result.get("data", {}).get("reason") if isinstance(result.get("data"), dict) else None
+            )
+            entry["failure_state"] = state
+            if state in {"available", "partial"} and isinstance(result.get("data"), dict):
+                entry["data"] = result["data"]
+                entry["state"] = state
+                entry["last_success"] = entry["last_attempt"]
+                entry["failure_reason"] = None
+            entry["future"] = None
+    except Exception as exc:
+        with _CANONICAL_LOCK:
+            entry["last_attempt"] = datetime.now(timezone.utc)
+            entry["failure_state"] = "unavailable"
+            entry["failure_reason"] = f"{type(exc).__name__}: {exc}"[:300]
+            entry["future"] = None
+
+
+def _ensure_category_task(category: str):
+    now = datetime.now(timezone.utc)
+    with _CANONICAL_LOCK:
+        entry = _CANONICAL_CACHE.setdefault(category, {
+            "data": None, "state": "unavailable", "failure_state": "unavailable",
+            "failure_reason": "No collection attempt has completed.", "last_attempt": None,
+            "last_success": None, "future": None,
+        })
+        future = entry.get("future")
+        recently_attempted = entry["last_attempt"] is not None and (
+            now - entry["last_attempt"]
+        ).total_seconds() < CATEGORY_REFRESH_SECONDS
+        if future is not None and not future.done():
+            return future
+        if recently_attempted:
+            return None
+        entry["last_attempt"] = now
+        future = _CANONICAL_EXECUTOR.submit(_category_task, category)
+        entry["future"] = future
+        return future
+
+
+def _canonical_data(category: str, original: dict[str, Any]) -> dict[str, Any]:
+    data = copy.deepcopy(original)
+    if category == "system":
+        data.setdefault("system_info", {
+            "hostname": data.get("hostname"), "kernel": data.get("kernel"),
+            "architecture": data.get("architecture"), "os_release": data.get("os_release"),
+            "uptime_seconds": data.get("uptime_seconds"),
+        })
+        data.setdefault("cpu", {
+            "model": data.get("cpu_model"), "physical_cores": psutil.cpu_count(logical=False),
+            "logical_cores": data.get("cpu_logical_count"), "utilization_percent": data.get("cpu_pct"),
+            "per_core_percent": data.get("cpu_cores_pct", []), "load_average": data.get("load_average"),
+            "times": data.get("cpu_times"),
+        })
+        memory = data.get("memory") if isinstance(data.get("memory"), dict) else {}
+        data.setdefault("swap", {})
+        data["memory"] = {**memory, "used_bytes": memory.get("total_bytes", 0) - memory.get("available_bytes", 0)
+                           if memory.get("total_bytes") is not None and memory.get("available_bytes") is not None
+                           else memory.get("used_bytes")}
+    elif category == "network":
+        interfaces = data.get("interfaces") if isinstance(data.get("interfaces"), dict) else {}
+        interface_rows = [
+            {"name": name, "is_loopback": name == "lo" or info.get("kind") == "loopback", **info}
+            for name, info in interfaces.items() if isinstance(info, dict)
+        ]
+        data["interface_counters"] = interfaces
+        data["interface_rows"] = interface_rows
+        data["interfaces"] = interface_rows
+    elif category == "storage":
+        data["disks"] = data.get("disk_io", [])
+        filesystems = data.get("filesystems") if isinstance(data.get("filesystems"), list) else []
+        data["filesystems"] = [
+            {**filesystem, "used_percent": filesystem.get("percent")}
+            for filesystem in filesystems if isinstance(filesystem, dict)
+        ]
+        raid = data.get("raid") if isinstance(data.get("raid"), dict) else None
+        if raid is not None and not raid.get("detected"):
+            data["raid_details"] = raid
+            data["raid"] = None
+            data["raid_status"] = {"state": "unsupported", "reason": "No software RAID arrays were found in /proc/mdstat."}
+        else:
+            data["raid_status"] = {"state": "available", "reason": None}
+    elif category == "services":
+        units = data.get("services") if isinstance(data.get("services"), list) else []
+        data["units"] = units
+        data["summary"] = {
+            "total": len(units),
+            "active": sum(1 for row in units if row.get("active") == "active"),
+            "failed": sum(1 for row in units if row.get("active") == "failed"),
+            "manager": data.get("manager"),
+        }
+    elif category == "processes":
+        rows = data.get("rows") if isinstance(data.get("rows"), list) else data.get("top_by_rss", [])
+        data["rows"] = [
+            {**row, "user": row.get("username"), "start_time": row.get("started_at"),
+             "memory_bytes": row.get("rss_bytes")}
+            for row in rows if isinstance(row, dict)
+        ]
+        data["total"] = data.get("process_count", len(data["rows"]))
+    elif category == "connections":
+        data.setdefault("total", data.get("count", len(data.get("sockets", []))))
+        sockets = data.get("sockets") if isinstance(data.get("sockets"), list) else []
+        data["sockets"] = [
+            {**row, "owner_pid": row.get("pid"), "owner_name": row.get("process")}
+            for row in sockets if isinstance(row, dict)
+        ]
+    elif category == "containers":
+        containers = data.get("containers") if isinstance(data.get("containers"), list) else []
+        normalized = []
+        for row in containers:
+            if not isinstance(row, dict):
+                continue
+            metrics = row.get("metrics") if isinstance(row.get("metrics"), dict) else {}
+            for field in ("memory_usage_bytes", "memory_limit_bytes", "memory_percent", "cpu_percent",
+                          "net_rx_bytes", "net_tx_bytes", "block_read_bytes", "block_write_bytes", "pids"):
+                metrics.setdefault(field, None)
+            status_text = str(row.get("state") or row.get("status") or "").lower()
+            row = {**row, "metrics": metrics, "state": status_text.split()[0] if status_text else None}
+            normalized.append(row)
+        data["containers"] = normalized
+        data["summary"] = {
+            "total": len(normalized),
+            "running": sum(1 for row in normalized if row.get("state") in {"running", "up"}),
+        }
+    elif category == "vms":
+        vms = data.get("vms") if isinstance(data.get("vms"), list) else []
+        data["virtual_machines"] = [
+            {**vm, "source": vm.get("runtime"), "memory_used_bytes": vm.get("memory_bytes", vm.get("used_memory")),
+             "memory_limit_bytes": vm.get("max_memory_bytes", vm.get("max_memory")),
+             "virtual_cpus": vm.get("cpu_count")}
+            for vm in vms if isinstance(vm, dict)
+        ]
+        data["summary"] = {
+            "total": len(data["virtual_machines"]),
+            "running": sum(1 for vm in data["virtual_machines"] if str(vm.get("state", "")).lower() == "running"),
+        }
+    return data
+
+
+def _canonical_envelope(category: str, override_reason: str | None = None) -> dict[str, Any]:
+    entry = _CANONICAL_CACHE[category]
+    now = datetime.now(timezone.utc)
+    with _CANONICAL_LOCK:
+        data = entry.get("data")
+        last_success = entry.get("last_success")
+        last_attempt = entry.get("last_attempt")
+        state = entry.get("state") if data is not None else entry.get("failure_state", "unavailable")
+        reason = entry.get("failure_reason")
+        future = entry.get("future")
+    if override_reason:
+        state = "stale" if data is not None else "unavailable"
+        reason = override_reason
+    elif future is not None and not future.done():
+        state = "stale" if data is not None else "unavailable"
+        reason = "Collection is still in progress."
+    elif data is not None and last_success is not None and (
+        now - last_success
+    ).total_seconds() > CATEGORY_REFRESH_SECONDS * 3:
+        state, reason = "stale", "Last successful collection is older than three refresh intervals."
+    elif data is not None and entry.get("failure_state") not in {"available", "partial"}:
+        state = "stale"
+    canonical_name = "virtual_machines" if category == "vms" else category
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "category": canonical_name,
+        "collector_version": APP_VERSION,
+        "collected_at": _iso_z(last_success or last_attempt) or _iso_z(now),
+        "status": {
+            "state": state,
+            "reason": reason,
+            "source": "linux-host-collector",
+            "last_success": _iso_z(last_success),
+            "last_attempt": _iso_z(last_attempt),
+        },
+        "data": _canonical_data(category, data) if isinstance(data, dict) else None,
+    }
+
+
+def _canonical_collect(category: str, wait_seconds: float | None = CATEGORY_TIMEOUT_SECONDS) -> dict[str, Any]:
+    future = _ensure_category_task(category)
+    if future is not None and wait_seconds is not None:
+        try:
+            future.result(timeout=wait_seconds)
+        except TimeoutError:
+            return _canonical_envelope(category, "Category collection exceeded its time limit.")
+    return _canonical_envelope(category)
+
 
 def discover_capabilities() -> dict[str, Any]:
     capabilities = {name: {"status": "available", "source": "linux host collector"} for name in CATEGORIES}
+    init_name = _read_first_line(HOST_PROC / "1/comm", 128).strip()
+    systemd_present = init_name in {"systemd", "systemd-shutdown"}
+    capabilities["services"] = {
+        "status": "available" if systemd_present else "unsupported",
+        "source": "systemd",
+        "reason": None if systemd_present else "The host is not running systemd.",
+    }
     journal_available = bool(shutil.which("journalctl") and any(path.is_dir() for path in (HOST_LOG / "journal", Path("/host/run/log/journal"))))
     app_logs_available = any(glob.glob(pattern, recursive=True) for pattern in APP_LOG_GLOBS)
     capabilities["logs"] = {
@@ -1972,16 +2237,18 @@ def discover_capabilities() -> dict[str, Any]:
 
     docker_ok, lxd_ok = is_socket(DOCKER_SOCKET), is_socket(LXD_SOCKET)
     k8s_endpoint, _, _ = _discover_k8s_endpoint()
-    kube_ok = bool(k8s_endpoint or shutil.which("kubectl") or shutil.which("k3s"))
+    kube_ok = bool(k8s_endpoint)
+    podman_ok = is_socket(DOCKER_SOCKET) and "podman" in str(DOCKER_SOCKET).lower()
     legacy_lxc = (HOST_ROOT / "var/lib/lxc").is_dir()
     capabilities["containers"] = {
         "status": "available" if (docker_ok or lxd_ok or kube_ok or legacy_lxc) else "not_configured",
-        "sources": {"docker": docker_ok, "lxd": lxd_ok, "kubernetes": kube_ok, "lxc": legacy_lxc},
+        "sources": {"docker": docker_ok and not podman_ok, "podman": podman_ok,
+                    "lxd": lxd_ok, "kubernetes": kube_ok, "lxc": legacy_lxc},
         "reason": None if (docker_ok or lxd_ok or kube_ok or legacy_lxc) else "No Docker/Podman/LXD socket, LXC directory or Kubernetes credentials found on this host",
     }
     containerd_socket = Path("/host/run/containerd/containerd.sock")
     capabilities["containerd"] = {
-        "status": "not_configured" if containerd_socket.exists() else "unavailable",
+        "status": "not_configured" if containerd_socket.exists() else "unsupported",
         "reason": "containerd CRI collection is not configured" if containerd_socket.exists() else "containerd socket not present",
     }
     capabilities["lxc"] = {
@@ -1991,10 +2258,12 @@ def discover_capabilities() -> dict[str, Any]:
     libvirt_ok = bool(shutil.which("virsh") and is_socket(LIBVIRT_SOCKET))
     proxmox_ok = bool(PROXMOX_API_URL and PROXMOX_API_TOKEN)
     qemu_ok = bool(_qemu_processes())
+    virtualbox_ok = bool(shutil.which("VBoxManage") or shutil.which("vboxmanage"))
     capabilities["vms"] = {
-        "status": "available" if (libvirt_ok or proxmox_ok or qemu_ok) else "not_configured",
-        "sources": {"libvirt": libvirt_ok, "proxmox": proxmox_ok, "qemu_processes": qemu_ok},
-        "reason": None if (libvirt_ok or proxmox_ok or qemu_ok) else "No hypervisor (libvirt / Proxmox / QEMU) found on this host",
+        "status": "available" if (libvirt_ok or proxmox_ok or qemu_ok or virtualbox_ok) else "not_configured",
+        "sources": {"libvirt": libvirt_ok, "proxmox": proxmox_ok, "qemu_processes": qemu_ok,
+                    "virtualbox": virtualbox_ok},
+        "reason": None if (libvirt_ok or proxmox_ok or qemu_ok or virtualbox_ok) else "No hypervisor (libvirt / Proxmox / QEMU / VirtualBox) found on this host",
     }
     capabilities["firewall"] = _firewall_state()
     cpu_now = _CPU_SAMPLER.current()
@@ -2018,7 +2287,7 @@ def discover_capabilities() -> dict[str, Any]:
 
 
 
-def _parse_file_log(raw: str, path: str, inode: int, offset: int) -> dict[str, Any]:
+def _parse_file_log(raw: str, path: str, inode: int, offset: int, redact: bool = True) -> dict[str, Any]:
     data: dict[str, Any] = {}
     syslog_match = re.match(r"^(?:<(\d+)>)?([A-Z][a-z]{2}\s+\d+\s+\d{2}:\d{2}:\d{2})\s+\S+\s+([A-Za-z0-9_.-]+)(?:\[(\d+)\])?:\s*(.*)$", raw)
     try:
@@ -2080,13 +2349,13 @@ def _parse_file_log(raw: str, path: str, inode: int, offset: int) -> dict[str, A
         "severity": severity,
         "service": str(service)[:255],
         "pid": int(pid) if str(pid or "").isdigit() else None,
-        "message": _redact_text(message)[:16_384],
-        "fields": _safe_fields(fields),
+        "message": (_redact_text(message) if redact else message)[:16_384],
+        "fields": _safe_fields(fields, redact),
         "parser": "json-line" if data else "plain-line",
     }
 
 
-def _collect_application_logs(since: float, limit: int) -> list[dict[str, Any]]:
+def _collect_application_logs(since: float, limit: int, redact: bool = True) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
     with _LOG_STATE_LOCK:
         for pattern in APP_LOG_GLOBS:
@@ -2111,7 +2380,7 @@ def _collect_application_logs(since: float, limit: int) -> list[dict[str, Any]]:
                                 raw = line.decode("utf-8", errors="replace").rstrip("\r\n")
                                 if not raw:
                                     continue
-                                event = _parse_file_log(raw, name, stat.st_ino, start)
+                                event = _parse_file_log(raw, name, stat.st_ino, start, redact)
                                 severity_priority = {"emergency": 0, "alert": 1, "critical": 2, "error": 3, "warning": 4, "notice": 5, "info": 6, "debug": 7}.get(event["severity"], 6)
                                 if severity_priority <= LOG_MIN_PRIORITY:
                                     events.append(event)
@@ -2130,7 +2399,7 @@ def _collect_application_logs(since: float, limit: int) -> list[dict[str, Any]]:
     return events
 
 
-def collect_logs(since: float, limit: int) -> dict[str, Any]:
+def collect_logs(since: float, limit: int, redact: bool = True) -> dict[str, Any]:
     journalctl = shutil.which("journalctl")
     paths = []
     for path in (HOST_LOG / "journal", Path("/host/run/log/journal")):
@@ -2168,9 +2437,9 @@ def collect_logs(since: float, limit: int) -> dict[str, Any]:
                             if pid_match:
                                 raw_pid = pid_match.group(1)
                         pid_val = int(raw_pid) if str(raw_pid or "").isdigit() else None
-                        safe_fields = _safe_fields({key: value for key, value in record.items() if not key.startswith("_") and key not in {"MESSAGE", "__CURSOR", "__REALTIME_TIMESTAMP", "__MONOTONIC_TIMESTAMP"}})
+                        safe_fields = _safe_fields({key: value for key, value in record.items() if not key.startswith("_") and key not in {"MESSAGE", "__CURSOR", "__REALTIME_TIMESTAMP", "__MONOTONIC_TIMESTAMP"}}, redact)
                         event_id = hashlib.sha256((cursor or f"{event_at}:{source}:{message}").encode()).hexdigest()
-                        events.append({"event_id": event_id, "timestamp": datetime.fromtimestamp(event_at, timezone.utc).isoformat(), "timestamp_epoch": event_at, "source": source, "severity": {0: "emergency", 1: "alert", 2: "critical", 3: "error", 4: "warning", 5: "notice", 6: "info", 7: "debug"}.get(priority, "unknown"), "service": record.get("_SYSTEMD_UNIT") or record.get("UNIT"), "pid": pid_val, "message": _redact_text(message)[:16_384], "fields": safe_fields, "parser": "systemd-journal"})
+                        events.append({"event_id": event_id, "timestamp": datetime.fromtimestamp(event_at, timezone.utc).isoformat(), "timestamp_epoch": event_at, "source": source, "severity": {0: "emergency", 1: "alert", 2: "critical", 3: "error", 4: "warning", 5: "notice", 6: "info", 7: "debug"}.get(priority, "unknown"), "service": record.get("_SYSTEMD_UNIT") or record.get("UNIT"), "pid": pid_val, "message": (_redact_text(message) if redact else message)[:16_384], "fields": safe_fields, "parser": "systemd-journal"})
                     except (ValueError, TypeError, json.JSONDecodeError):
                         continue
             except (OSError, subprocess.TimeoutExpired) as exc:
@@ -2179,7 +2448,7 @@ def collect_logs(since: float, limit: int) -> dict[str, Any]:
             status = "available"
         elif reason:
             status = "permission_denied"
-    file_events = _collect_application_logs(since, max(0, min(limit, LOG_LIMIT_MAX) - len(events)))
+    file_events = _collect_application_logs(since, max(0, min(limit, LOG_LIMIT_MAX) - len(events)), redact=redact)
     events.extend(file_events)
     if file_events and not journal_available:
         status = "available"
@@ -2232,6 +2501,110 @@ def metrics(category: str, x_palantir_agent_token: str | None = Header(default=N
         return {"category": category, **_status_data({"error": str(exc)[:300]}, "unavailable")}
 
 
+@app.get("/v1/snapshot")
+def canonical_snapshot(x_palantir_agent_token: str | None = Header(default=None)) -> dict[str, Any]:
+    _guard(x_palantir_agent_token)
+    futures = {category: _ensure_category_task(category) for category in CATEGORIES}
+    deadline = time.monotonic() + CATEGORY_TIMEOUT_SECONDS
+    for future in futures.values():
+        if future is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                future.result(timeout=remaining)
+            except TimeoutError:
+                break
+    categories = {
+        "virtual_machines" if category == "vms" else category: _canonical_envelope(category)
+        for category in CATEGORIES
+    }
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "collector_version": APP_VERSION,
+        "collected_at": _iso_z(datetime.now(timezone.utc)),
+        "categories": categories,
+    }
+
+
+@app.get("/v1/snapshot/{category}")
+def canonical_snapshot_category(
+    category: str,
+    x_palantir_agent_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    _guard(x_palantir_agent_token)
+    internal = "vms" if category == "virtual_machines" else category
+    if internal not in COLLECTORS:
+        raise HTTPException(status_code=404, detail=f"Unknown category: {category}")
+    return _canonical_collect(internal)
+
+
+@app.get("/v1/capabilities")
+def canonical_capabilities(x_palantir_agent_token: str | None = Header(default=None)) -> dict[str, Any]:
+    _guard(x_palantir_agent_token)
+    discovered = discover_capabilities()
+    entries: list[dict[str, Any]] = []
+    for name, details in discovered.items():
+        if name == "vms":
+            name = "virtual_machines"
+        details = details if isinstance(details, dict) else {"status": "unavailable"}
+        entries.append({
+            "name": name,
+            "status": details.get("status", "unavailable"),
+            "reason": details.get("reason"),
+            "source": details.get("source", "linux-host-collector"),
+            "details": details,
+        })
+        nested = details.get("sources")
+        if isinstance(nested, dict):
+            for source_name, available in nested.items():
+                entries.append({
+                    "name": str(source_name),
+                    "status": "available" if available else "not_configured",
+                    "reason": None if available else f"{source_name} source is not configured or present",
+                    "source": str(name),
+                })
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "collector_version": APP_VERSION,
+        "collected_at": _iso_z(datetime.now(timezone.utc)),
+        "capabilities": entries,
+    }
+
+
+@app.get("/v1/health")
+def canonical_health() -> dict[str, Any]:
+    try:
+        process = psutil.Process(os.getpid())
+        memory_rss = process.memory_info().rss
+        cpu_percent = process.cpu_percent(interval=0.05)
+    except (OSError, psutil.Error):
+        memory_rss, cpu_percent = None, None
+    categories = {}
+    for name in CATEGORIES:
+        with _CANONICAL_LOCK:
+            item = _CANONICAL_CACHE.get(name)
+            entry_exists = item is not None
+        if entry_exists:
+            category_status = _canonical_envelope(name)["status"]
+        else:
+            category_status = {"state": "unavailable", "last_success": None, "last_attempt": None}
+        categories["virtual_machines" if name == "vms" else name] = {
+            "state": category_status["state"],
+            "last_success": category_status.get("last_success"),
+            "last_attempt": category_status.get("last_attempt"),
+        }
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "collector_version": APP_VERSION,
+        "status": "ok",
+        "checked_at": _iso_z(datetime.now(timezone.utc)),
+        "uptime_seconds": round(time.monotonic() - AGENT_STARTED_MONOTONIC, 2),
+        "process": {"rss_bytes": memory_rss, "cpu_percent": cpu_percent},
+        "categories": categories,
+    }
+
+
 @app.get("/api/v1/diagnostics")
 def diagnostics(x_palantir_agent_token: str | None = Header(default=None)) -> dict[str, Any]:
     """Why is a number missing?  Shows what the collector can actually read on this host."""
@@ -2277,6 +2650,17 @@ def capture_status(x_palantir_agent_token: str | None = Header(default=None)) ->
     return {"schema_version": 1, **_PCAP_MANAGER.status()}
 
 
+@app.get("/v1/pcap/status")
+def canonical_capture_status(x_palantir_agent_token: str | None = Header(default=None)) -> dict[str, Any]:
+    _guard_pcap(x_palantir_agent_token)
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "collector_version": APP_VERSION,
+        "checked_at": _iso_z(datetime.now(timezone.utc)),
+        "status": _PCAP_MANAGER.status(),
+    }
+
+
 @app.post("/api/v1/capture/start")
 def capture_start(x_palantir_agent_token: str | None = Header(default=None)) -> dict[str, Any]:
     _guard_pcap(x_palantir_agent_token)
@@ -2299,6 +2683,19 @@ def capture_snapshot(x_palantir_agent_token: str | None = Header(default=None)) 
         return {"schema_version": 1, **_PCAP_MANAGER.snapshot()}
     except PCapError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/v1/pcap/snapshot")
+def canonical_capture_snapshot(
+    trigger_type: str = Query(default="manual", pattern="^(manual|alert|anomaly)$"),
+    x_palantir_agent_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    _guard_pcap(x_palantir_agent_token)
+    try:
+        manifest = _PCAP_MANAGER.snapshot(trigger_type=trigger_type)
+    except PCapError as exc:
+        raise HTTPException(status_code=409, detail={"code": "snapshot_unavailable", "message": str(exc)}) from exc
+    return {"schema_version": SCHEMA_VERSION, "collector_version": APP_VERSION, **manifest}
 
 
 @app.get("/api/v1/capture/files")
@@ -2369,13 +2766,93 @@ def logs(
     return collect_logs(since, limit)
 
 
+@app.get("/v1/logs")
+def canonical_logs(
+    since_cursor: str | None = Query(default=None, max_length=128),
+    limit: int = Query(default=500, ge=1, le=5000),
+    service: str | None = Query(default=None, max_length=255),
+    severity: str | None = Query(default=None, max_length=32),
+    contains: str | None = Query(default=None, max_length=512),
+    pid: int | None = Query(default=None, ge=1),
+    source: str | None = Query(default=None, max_length=255),
+    since: float | None = Query(default=None, ge=0),
+    until: float | None = Query(default=None, ge=0),
+    x_palantir_agent_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    _guard(x_palantir_agent_token)
+    cursor_time = since or 0.0
+    cursor_event_id = None
+    if since_cursor:
+        try:
+            raw_time, separator, raw_id = since_cursor.partition("|")
+            cursor_time = max(cursor_time, float(raw_time))
+            cursor_event_id = raw_id if separator else None
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="since_cursor must be an epoch cursor optionally followed by |event_id") from exc
+    if until is not None and since is not None and until < since:
+        raise HTTPException(status_code=400, detail="until must be greater than or equal to since")
+
+    legacy = collect_logs(cursor_time, min(limit + 1, LOG_LIMIT_MAX), redact=not UNREDACTED_LOGS)
+    legacy_data = legacy.get("data") if isinstance(legacy.get("data"), dict) else {}
+    candidates = legacy_data.get("events") if isinstance(legacy_data.get("events"), list) else []
+    filtered = []
+    wanted_severity = severity.lower() if severity else None
+    for event in candidates:
+        if not isinstance(event, dict):
+            continue
+        event_time = float(event.get("timestamp_epoch") or 0)
+        if cursor_event_id and event_time == cursor_time and str(event.get("event_id")) <= cursor_event_id:
+            continue
+        if since is not None and event_time < since or until is not None and event_time > until:
+            continue
+        if service and service.lower() not in str(event.get("service") or "").lower():
+            continue
+        if source and source.lower() not in str(event.get("source") or "").lower():
+            continue
+        if wanted_severity and str(event.get("severity", "")).lower() != wanted_severity:
+            continue
+        if pid is not None and event.get("pid") != pid:
+            continue
+        if contains and contains.lower() not in str(event.get("message") or "").lower():
+            continue
+        filtered.append(event)
+    filtered.sort(key=lambda event: (event.get("timestamp_epoch", 0), event.get("event_id", "")))
+    has_more = len(filtered) > limit
+    dropped = max(0, len(filtered) - limit)
+    events = filtered[:limit]
+    last = events[-1] if events else None
+    next_cursor = (
+        f"{last.get('timestamp_epoch')}|{last.get('event_id')}" if last else f"{legacy_data.get('next_since', cursor_time)}"
+    )
+    state = str(legacy.get("status", "unavailable"))
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "collector_version": APP_VERSION,
+        "collected_at": _iso_z(datetime.now(timezone.utc)),
+        "status": {
+            "state": state,
+            "reason": legacy_data.get("reason"),
+            "source": "journald-and-allowlisted-files",
+            "last_success": _iso_z(datetime.now(timezone.utc)) if state == "available" else None,
+            "last_attempt": _iso_z(datetime.now(timezone.utc)),
+        },
+        "data": {
+            "events": [{key: value for key, value in event.items() if key != "timestamp_epoch"} for event in events],
+            "next_cursor": next_cursor,
+            "has_more": has_more,
+            "dropped": dropped,
+            "redaction_applied": not UNREDACTED_LOGS,
+        },
+    }
+
+
 @app.post("/api/v1/processes/{pid}/kill")
 def kill_process(
     pid: int,
     signal_type: str = Query(default="SIGTERM", pattern="^(SIGTERM|SIGKILL|15|9)$"),
     x_palantir_agent_token: str | None = Header(default=None),
 ) -> dict[str, Any]:
-    _guard(x_palantir_agent_token)
+    _guard_actions(x_palantir_agent_token)
     if not AGENT_TOKEN and not ALLOW_ANONYMOUS_KILL:
         # Without a token anybody who can reach port 20000 could kill any host process.
         raise HTTPException(status_code=403, detail="Process control is disabled: start the collector with PALANTIR_AGENT_TOKEN set")
@@ -2400,7 +2877,7 @@ def stop_container(
     timeout_seconds: int = Query(default=10, ge=0, le=60),
     x_palantir_agent_token: str | None = Header(default=None),
 ) -> dict[str, Any]:
-    _guard(x_palantir_agent_token)
+    _guard_actions(x_palantir_agent_token)
     if not AGENT_TOKEN and not ALLOW_ANONYMOUS_KILL:
         raise HTTPException(status_code=403, detail="Container control is disabled: start the collector with PALANTIR_AGENT_TOKEN set")
     if not DOCKER_SOCKET.exists() or not DOCKER_SOCKET.is_socket():
@@ -2458,7 +2935,7 @@ def stop_vm(
     force: bool = Query(default=False),
     x_palantir_agent_token: str | None = Header(default=None),
 ) -> dict[str, Any]:
-    _guard(x_palantir_agent_token)
+    _guard_actions(x_palantir_agent_token)
     if not AGENT_TOKEN and not ALLOW_ANONYMOUS_KILL:
         raise HTTPException(status_code=403, detail="VM control is disabled: start the collector with PALANTIR_AGENT_TOKEN set")
 
@@ -2533,7 +3010,7 @@ def start_container(
     container_id: str,
     x_palantir_agent_token: str | None = Header(default=None),
 ) -> dict[str, Any]:
-    _guard(x_palantir_agent_token)
+    _guard_actions(x_palantir_agent_token)
     if not AGENT_TOKEN and not ALLOW_ANONYMOUS_KILL:
         raise HTTPException(status_code=403, detail="Container control is disabled: start the collector with PALANTIR_AGENT_TOKEN set")
     if not DOCKER_SOCKET.exists() or not DOCKER_SOCKET.is_socket():
@@ -2571,7 +3048,7 @@ def restart_container(
     timeout_seconds: int = Query(default=10, ge=0, le=60),
     x_palantir_agent_token: str | None = Header(default=None),
 ) -> dict[str, Any]:
-    _guard(x_palantir_agent_token)
+    _guard_actions(x_palantir_agent_token)
     if not AGENT_TOKEN and not ALLOW_ANONYMOUS_KILL:
         raise HTTPException(status_code=403, detail="Container control is disabled: start the collector with PALANTIR_AGENT_TOKEN set")
     if not DOCKER_SOCKET.exists() or not DOCKER_SOCKET.is_socket():
@@ -2648,7 +3125,7 @@ def start_vm(
     vm_id: str,
     x_palantir_agent_token: str | None = Header(default=None),
 ) -> dict[str, Any]:
-    _guard(x_palantir_agent_token)
+    _guard_actions(x_palantir_agent_token)
     if not AGENT_TOKEN and not ALLOW_ANONYMOUS_KILL:
         raise HTTPException(status_code=403, detail="VM control is disabled: start the collector with PALANTIR_AGENT_TOKEN set")
 
@@ -2698,7 +3175,7 @@ def restart_vm(
     force: bool = Query(default=False),
     x_palantir_agent_token: str | None = Header(default=None),
 ) -> dict[str, Any]:
-    _guard(x_palantir_agent_token)
+    _guard_actions(x_palantir_agent_token)
     if not AGENT_TOKEN and not ALLOW_ANONYMOUS_KILL:
         raise HTTPException(status_code=403, detail="VM control is disabled: start the collector with PALANTIR_AGENT_TOKEN set")
 
@@ -2742,6 +3219,156 @@ def restart_vm(
             pass
 
     raise HTTPException(status_code=404, detail=f"VM '{target}' could not be restarted (not found or hypervisor unreachable)")
+
+
+def _canonical_action_error(exc: HTTPException) -> HTTPException:
+    code = {
+        400: "invalid_request", 403: "permission_denied", 404: "not_found",
+        409: "conflict", 503: "unavailable", 504: "timeout",
+    }.get(exc.status_code, "action_failed")
+    message = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
+    return HTTPException(status_code=exc.status_code, detail={"code": code, "message": message})
+
+
+def _audit_action(
+    action: str,
+    target: str,
+    token: str | None,
+    request_actor: str | None,
+    parameters: dict[str, Any] | None = None,
+) -> None:
+    actor = (request_actor or ("token-authenticated-client" if token else "anonymous-client"))[:128]
+    logger.info("agent action requested", extra={
+        "action": action, "target": target, "actor": actor, "parameters": parameters or {},
+    })
+
+
+@app.post("/v1/processes/{pid}/terminate")
+def canonical_terminate_process(
+    pid: int,
+    request: dict[str, Any] = Body(default={}),
+    x_palantir_agent_token: str | None = Header(default=None),
+    x_palantir_user: str | None = Header(default=None),
+) -> dict[str, Any]:
+    _guard_actions(x_palantir_agent_token)
+    if pid <= 1 or pid in {os.getpid(), os.getppid()}:
+        raise HTTPException(status_code=400, detail={"code": "protected_pid", "message": "Refusing to terminate PID 1, the agent, or its parent."})
+    signal_name = str(request.get("signal", "SIGTERM"))
+    if signal_name not in {"SIGTERM", "SIGKILL"}:
+        raise HTTPException(status_code=400, detail={"code": "invalid_signal", "message": "signal must be SIGTERM or SIGKILL."})
+    expected_name = request.get("expected_process_name")
+    expected_start = request.get("expected_start_time")
+    try:
+        process = psutil.Process(pid)
+        current_name = process.name()
+        current_start = process.create_time()
+        command_line = process.cmdline()
+        if not command_line:
+            raise HTTPException(status_code=400, detail={"code": "protected_process", "message": "Refusing to terminate kernel threads or processes without a command line."})
+        if expected_name is not None and str(expected_name) != current_name:
+            raise HTTPException(status_code=409, detail={"code": "process_identity_mismatch", "message": "The process name no longer matches the requested identity."})
+        if expected_start is not None:
+            try:
+                if abs(float(expected_start) - current_start) > PID_REUSE_TOLERANCE_SECONDS:
+                    raise HTTPException(status_code=409, detail={"code": "process_identity_mismatch", "message": "The process start time no longer matches the requested identity."})
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(status_code=400, detail={"code": "invalid_start_time", "message": "expected_start_time must be a Unix timestamp."}) from exc
+        # Re-read identity immediately before signaling to guard against PID reuse.
+        if abs(psutil.Process(pid).create_time() - current_start) > PID_REUSE_TOLERANCE_SECONDS:
+            raise HTTPException(status_code=409, detail={"code": "process_identity_mismatch", "message": "The process identity changed before signaling."})
+        _audit_action(f"terminate:{signal_name}", str(pid), x_palantir_agent_token, x_palantir_user)
+        process.send_signal(signal.SIGKILL if signal_name == "SIGKILL" else signal.SIGTERM)
+    except psutil.NoSuchProcess as exc:
+        raise HTTPException(status_code=404, detail={"code": "not_found", "message": f"Process {pid} was not found."}) from exc
+    except psutil.AccessDenied as exc:
+        raise HTTPException(status_code=403, detail={"code": "permission_denied", "message": f"Permission denied for process {pid}."}) from exc
+    except HTTPException:
+        raise
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail={"code": "signal_failed", "message": str(exc)[:300]}) from exc
+    return {"schema_version": SCHEMA_VERSION, "success": True, "pid": pid, "signal": signal_name}
+
+
+@app.post("/v1/containers/{container_id}/action")
+def canonical_container_action(
+    container_id: str,
+    request: dict[str, Any] = Body(default={}),
+    x_palantir_agent_token: str | None = Header(default=None),
+    x_palantir_user: str | None = Header(default=None),
+) -> dict[str, Any]:
+    _guard_actions(x_palantir_agent_token)
+    action = request.get("action")
+    if action not in {"start", "stop", "restart"}:
+        raise HTTPException(status_code=400, detail={"code": "invalid_action", "message": "action must be start, stop, or restart."})
+    try:
+        timeout_value = request.get("timeout_seconds", 10)
+        if isinstance(timeout_value, bool) or not isinstance(timeout_value, int):
+            raise ValueError("timeout_seconds must be an integer")
+        timeout = min(60, max(0, timeout_value))
+        _audit_action(str(action), container_id, x_palantir_agent_token, x_palantir_user, {"timeout_seconds": timeout})
+        if action == "start":
+            result = start_container(container_id, x_palantir_agent_token)
+        elif action == "stop":
+            result = stop_container(container_id, timeout, x_palantir_agent_token)
+        else:
+            result = restart_container(container_id, timeout, x_palantir_agent_token)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail={"code": "invalid_timeout", "message": "timeout_seconds must be an integer."}) from exc
+    except (subprocess.TimeoutExpired, TimeoutError) as exc:
+        raise HTTPException(status_code=504, detail={"code": "timeout", "message": "The container action timed out."}) from exc
+    except HTTPException as exc:
+        raise _canonical_action_error(exc) from exc
+    return {"schema_version": SCHEMA_VERSION, "success": True, "action": action, "result": result}
+
+
+@app.post("/v1/vms/{vm_id}/action")
+def canonical_vm_action(
+    vm_id: str,
+    request: dict[str, Any] = Body(default={}),
+    x_palantir_agent_token: str | None = Header(default=None),
+    x_palantir_user: str | None = Header(default=None),
+) -> dict[str, Any]:
+    _guard_actions(x_palantir_agent_token)
+    action = request.get("action")
+    if action not in {"start", "stop", "restart"}:
+        raise HTTPException(status_code=400, detail={"code": "invalid_action", "message": "action must be start, stop, or restart."})
+    force = request.get("force", False)
+    if not isinstance(force, bool):
+        raise HTTPException(status_code=400, detail={"code": "invalid_force", "message": "force must be a boolean."})
+    try:
+        _audit_action(str(action), vm_id, x_palantir_agent_token, x_palantir_user, {"force": force})
+        if action == "start":
+            result = start_vm(vm_id, x_palantir_agent_token)
+        elif action == "stop":
+            result = stop_vm(vm_id, force, x_palantir_agent_token)
+        else:
+            result = restart_vm(vm_id, force, x_palantir_agent_token)
+    except HTTPException as exc:
+        raise _canonical_action_error(exc) from exc
+    except (subprocess.TimeoutExpired, httpx.TimeoutException, TimeoutError) as exc:
+        raise HTTPException(status_code=504, detail={"code": "timeout", "message": "The VM action timed out."}) from exc
+    return {"schema_version": SCHEMA_VERSION, "success": True, "action": action, "result": result}
+
+
+@app.get("/v1/containers/{container_id}/logs")
+def canonical_container_logs(
+    container_id: str,
+    tail: int = Query(default=200, ge=1, le=5000),
+    x_palantir_agent_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    _guard(x_palantir_agent_token)
+    if not AGENT_TOKEN and not ALLOW_ANONYMOUS_KILL:
+        raise HTTPException(status_code=403, detail="Container inspection requires PALANTIR_AGENT_TOKEN")
+    try:
+        result = get_container_logs(container_id, tail, x_palantir_agent_token)
+    except HTTPException as exc:
+        raise _canonical_action_error(exc) from exc
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "collected_at": _iso_z(datetime.now(timezone.utc)),
+        "status": {"state": "available", "reason": None, "source": "container-runtime"},
+        "data": result,
+    }
 
 
 _start_samplers()

@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://palantir.local/schemas/agent/pcap-status.schema.json",
+  "title": "PALANTIR host agent PCAP status",
+  "type": "object",
+  "required": ["schema_version", "collector_version", "checked_at", "status"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "collector_version": {"type": "string"},
+    "checked_at": {"type": "string", "format": "date-time"},
+    "status": {"type": "object", "required": ["enabled", "running", "interface", "snaplen", "file_count", "retained_bytes", "disk", "dropped_files"]}
+  }
+}

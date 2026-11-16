@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://palantir.local/schemas/agent/logs.schema.json",
+  "title": "PALANTIR host agent logs response",
+  "type": "object",
+  "required": ["schema_version", "collector_version", "collected_at", "status", "data"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "collector_version": {"type": "string"},
+    "collected_at": {"type": "string", "format": "date-time"},
+    "status": {"type": "object", "required": ["state", "reason", "source", "last_success", "last_attempt"]},
+    "data": {
+      "type": "object",
+      "required": ["events", "next_cursor", "has_more", "dropped", "redaction_applied"],
+      "properties": {
+        "events": {"type": "array", "items": {"type": "object", "required": ["event_id", "timestamp", "source", "severity", "message"]}},
+        "next_cursor": {"type": "string"},
+        "has_more": {"type": "boolean"},
+        "dropped": {"type": "integer", "minimum": 0},
+        "redaction_applied": {"type": "boolean"}
+      }
+    }
+  }
+}

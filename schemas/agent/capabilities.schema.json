@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://palantir.local/schemas/agent/capabilities.schema.json",
+  "title": "PALANTIR host agent capabilities",
+  "type": "object",
+  "required": ["schema_version", "collector_version", "collected_at", "capabilities"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "collector_version": {"type": "string"},
+    "collected_at": {"type": "string", "format": "date-time"},
+    "capabilities": {"type": "array", "items": {"$ref": "#/$defs/capability"}}
+  },
+  "$defs": {
+    "capability": {
+      "type": "object",
+      "required": ["name", "status", "reason", "source"],
+      "properties": {
+        "name": {"type": "string"},
+        "status": {"type": "string"},
+        "reason": {"type": ["string", "null"]},
+        "source": {"type": "string"},
+        "details": {"type": "object"}
+      }
+    }
+  }
+}

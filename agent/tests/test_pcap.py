@@ -1,6 +1,9 @@
 import gzip
+import hashlib
+import os
 import struct
 import sys
+from datetime import timedelta
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -163,4 +166,53 @@ def test_packet_timestamps_are_read_from_rotated_pcap_files(tmp_path):
     assert item["capture_started_at"] == "2023-11-14T22:13:20.100000+00:00"
     assert item["capture_finished_at"] == "2023-11-14T22:13:22.900000+00:00"
     assert item["duration_seconds"] == 2
+
+
+def test_capture_metadata_includes_packet_count_snaplen_and_file_digest(tmp_path):
+    manager = manager_for(tmp_path)
+    filename = "capture_20261112T120000Z_0123456789ab.pcap"
+    capture = tmp_path / filename
+    global_header = struct.pack("<IHHIIII", 0xA1B2C3D4, 2, 4, 0, 0, 128, 1)
+    packet = struct.pack("<IIII", 1_700_000_000, 100_000, 4, 4) + b"data"
+    payload = global_header + packet * 2
+    capture.write_bytes(payload)
+    manager._register_closed_files(capture, datetime.now(timezone.utc) - timedelta(minutes=1))
+    manager._hash_queue.join()
+
+    item = manager.files()[0]
+
+    assert item["packet_count"] == 2
+    assert item["snaplen"] == 128
+    assert item["interface"] == "any"
+    assert item["sha256"] == hashlib.sha256(payload).hexdigest()
+    assert item["hash_status"] == "complete"
+
+
+def test_alert_capture_configuration_is_bounded_and_keeps_manual_snaplen(tmp_path):
+    manager = manager_for(tmp_path, snaplen=128, alert_snaplen=2048, alert_window_seconds=5)
+
+    assert manager.default_snaplen == 128
+    assert manager.alert_snaplen == 2048
+    assert manager.alert_window_seconds == 5
+    assert manager.max_total_bytes == 150 * 1024 * 1024
+
+
+def test_total_byte_cap_evicts_oldest_unpinned_ring_files(tmp_path):
+    manager = manager_for(tmp_path, max_size_mb=1, max_total_bytes=1_100_000)
+    first = tmp_path / "capture_20261112T120000Z_0123456789ab.pcap"
+    second = tmp_path / "capture_20261112T120100Z_1123456789ab.pcap"
+    first.write_bytes(b"a" * 800_000)
+    second.write_bytes(b"b" * 800_000)
+    now = datetime.now(timezone.utc)
+    manager._register_closed_files(first, now - timedelta(minutes=2))
+    manager._register_closed_files(second, now - timedelta(minutes=1))
+    manager._hash_queue.join()
+    os.utime(manager._metadata_path(first.name), (now.timestamp() - 60, now.timestamp() - 60))
+    os.utime(manager._metadata_path(second.name), (now.timestamp(), now.timestamp()))
+
+    manager._prune()
+
+    assert not first.exists()
+    assert second.exists()
+    assert manager.status()["dropped_files"] >= 1
 

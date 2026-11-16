@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://palantir.local/schemas/agent/action-response.schema.json",
+  "title": "PALANTIR host agent action success response",
+  "type": "object",
+  "required": ["schema_version", "success"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "success": {"const": true},
+    "action": {"enum": ["start", "stop", "restart"]},
+    "pid": {"type": "integer", "minimum": 2},
+    "signal": {"enum": ["SIGTERM", "SIGKILL"]},
+    "result": {"type": "object"}
+  }
+}

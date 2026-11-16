@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://palantir.local/schemas/agent/health.schema.json",
+  "title": "PALANTIR host agent health",
+  "type": "object",
+  "required": ["schema_version", "collector_version", "status", "checked_at", "uptime_seconds", "process", "categories"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "collector_version": {"type": "string"},
+    "status": {"const": "ok"},
+    "checked_at": {"type": "string", "format": "date-time"},
+    "uptime_seconds": {"type": "number", "minimum": 0},
+    "process": {"type": "object", "required": ["rss_bytes", "cpu_percent"], "properties": {"rss_bytes": {"type": ["integer", "null"]}, "cpu_percent": {"type": ["number", "null"]}}},
+    "categories": {"type": "object"}
+  }
+}

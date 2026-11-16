@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://palantir.local/schemas/agent/snapshot.schema.json",
+  "title": "PALANTIR host agent aggregate snapshot",
+  "type": "object",
+  "required": ["schema_version", "collector_version", "collected_at", "categories"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "collector_version": {"type": "string"},
+    "collected_at": {"type": "string", "format": "date-time"},
+    "categories": {
+      "type": "object",
+      "required": ["system", "storage", "network", "services", "processes", "connections", "containers", "virtual_machines"],
+      "properties": {
+        "system": {"$ref": "snapshot-envelope.schema.json"},
+        "storage": {"$ref": "snapshot-envelope.schema.json"},
+        "network": {"$ref": "snapshot-envelope.schema.json"},
+        "services": {"$ref": "snapshot-envelope.schema.json"},
+        "processes": {"$ref": "snapshot-envelope.schema.json"},
+        "connections": {"$ref": "snapshot-envelope.schema.json"},
+        "containers": {"$ref": "snapshot-envelope.schema.json"},
+        "virtual_machines": {"$ref": "snapshot-envelope.schema.json"}
+      },
+      "additionalProperties": false
+    }
+  }
+}
