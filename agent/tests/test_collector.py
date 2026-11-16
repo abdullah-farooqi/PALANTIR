@@ -10,6 +10,54 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import collector  # noqa: E402
 
 
+def test_rootless_docker_socket_candidates_prioritize_invoking_host_user(monkeypatch, tmp_path):
+    runtime_root = tmp_path / "run/user"
+    (runtime_root / "1000").mkdir(parents=True)
+    (runtime_root / "1001").mkdir()
+    monkeypatch.setattr(collector, "HOST_ROOT", tmp_path)
+    monkeypatch.setenv("SUDO_UID", "1000")
+    monkeypatch.delenv("HOST_UID", raising=False)
+
+    candidates = collector._rootless_docker_socket_candidates()
+
+    assert candidates == [
+        str(runtime_root / "1000/docker.sock"),
+        str(runtime_root / "1001/docker.sock"),
+    ]
+
+
+def test_virtualbox_process_merge_preserves_configured_limits():
+    manager_vms = [{
+        "runtime": "virtualbox",
+        "name": "fixture-vm",
+        "uuid": "9d7c5be3-8d08-413f-b683-ec3723e13aa5",
+        "state": "poweroff",
+        "cpu_count": 4,
+        "max_memory": 4 * 1024 ** 3,
+        "used_memory": None,
+    }]
+    process_vms = [{
+        "runtime": "virtualbox",
+        "name": "fixture-vm",
+        "uuid": "9d7c5be3-8d08-413f-b683-ec3723e13aa5",
+        "state": "running",
+        "pid": 1234,
+        "cpu_count": None,
+        "max_memory": None,
+        "used_memory": 512 * 1024 ** 2,
+        "cpu_pct": 2.0,
+    }]
+
+    result = collector._merge_virtualbox_vms(manager_vms, process_vms)
+
+    assert len(result) == 1
+    assert result[0]["state"] == "running"
+    assert result[0]["cpu_count"] == 4
+    assert result[0]["max_memory"] == 4 * 1024 ** 3
+    assert result[0]["used_memory"] == 512 * 1024 ** 2
+    assert result[0]["cpu_pct"] == 2.0
+
+
 def test_capabilities_handles_denied_host_namespace(monkeypatch):
     original_exists = Path.exists
 

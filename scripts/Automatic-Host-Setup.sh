@@ -66,6 +66,13 @@ if [ "$EUID" -ne 0 ] && [ "$DRY_RUN" != "1" ]; then
 fi
 
 # 2. Check Docker Installation
+DOCKER_USER_UID="${SUDO_UID:-$(id -u)}"
+ROOTLESS_DOCKER_SOCKET="/run/user/${DOCKER_USER_UID}/docker.sock"
+if [ -S "$ROOTLESS_DOCKER_SOCKET" ]; then
+  # Preserve the invoking user's rootless engine when this script was started with sudo.
+  export DOCKER_HOST="unix://${ROOTLESS_DOCKER_SOCKET}"
+fi
+
 if ! command -v docker &> /dev/null; then
   echo -e "${RED}ERROR: Docker engine is not installed on this host.${NC}"
   echo -e "Please install Docker first: https://docs.docker.com/engine/install/"
@@ -234,7 +241,9 @@ configure_access
 EXTRA_ENV=()
 SOURCES_FOUND=()
 
-if [ -S /run/docker.sock ] || [ -S /var/run/docker.sock ]; then
+if [ -S "$ROOTLESS_DOCKER_SOCKET" ]; then
+  EXTRA_ENV+=(-e "DOCKER_SOCKET=/host/run/user/${DOCKER_USER_UID}/docker.sock"); SOURCES_FOUND+=("Rootless Docker containers")
+elif [ -S /run/docker.sock ] || [ -S /var/run/docker.sock ]; then
   EXTRA_ENV+=(-e DOCKER_SOCKET=/host/run/docker.sock); SOURCES_FOUND+=("Docker containers")
 elif [ -S /run/podman/podman.sock ]; then
   EXTRA_ENV+=(-e DOCKER_SOCKET=/host/run/podman/podman.sock); SOURCES_FOUND+=("Podman containers")

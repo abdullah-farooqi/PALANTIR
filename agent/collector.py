@@ -53,9 +53,29 @@ def _first_socket(candidates: list[str], default: str) -> Path:
     return Path(default)
 
 
+def _rootless_docker_socket_candidates() -> list[str]:
+    """Prefer the launching host user's rootless Docker socket when present."""
+    user_ids: list[str] = []
+    for key in ("HOST_UID", "SUDO_UID"):
+        value = os.getenv(key, "")
+        if value.isdigit() and value not in user_ids:
+            user_ids.append(value)
+    runtime_root = HOST_ROOT / "run/user"
+    try:
+        runtime_dirs = sorted(
+            (path for path in runtime_root.iterdir() if path.name.isdigit()),
+            key=lambda path: path.name,
+        )
+    except OSError:
+        runtime_dirs = []
+    user_ids.extend(path.name for path in runtime_dirs if path.name not in user_ids)
+    return [str(runtime_root / user_id / "docker.sock") for user_id in user_ids]
+
+
 # Docker and Podman (Podman exposes a Docker-compatible API), LXD / Incus, libvirt: first live socket wins.
 DOCKER_SOCKET = _first_socket([
-    os.getenv("DOCKER_SOCKET", ""), "/host/run/docker.sock", "/host/var/run/docker.sock", "/var/run/docker.sock",
+    os.getenv("DOCKER_SOCKET", ""), *_rootless_docker_socket_candidates(),
+    "/host/run/docker.sock", "/host/var/run/docker.sock", "/var/run/docker.sock",
     "/run/docker.sock", "/host/run/podman/podman.sock", "/run/podman/podman.sock",
 ], "/host/run/docker.sock")
 LXD_SOCKET = _first_socket([
@@ -1833,18 +1853,25 @@ def _virtualbox_processes() -> list[dict[str, Any]]:
                 continue
 
             vm_name = None
+            vm_uuid = None
             for idx, arg in enumerate(args[:-1]):
-                if arg in ("--startvm", "-s", "-startvm"):
+                if arg == "--comment":
                     vm_name = args[idx + 1].strip("'\"")
-                    break
-                elif arg == "--comment":
-                    vm_name = args[idx + 1].strip("'\"")
+                elif arg in ("--startvm", "-s", "-startvm"):
+                    start_target = args[idx + 1].strip("'\"")
+                    if re.fullmatch(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", start_target):
+                        vm_uuid = start_target
+                    if not vm_name:
+                        vm_name = start_target
 
-            if not vm_name:
-                for arg in args:
-                    if str(arg).startswith("--startvm="):
-                        vm_name = str(arg).split("=", 1)[1].strip("'\"")
-                        break
+            for arg in args:
+                if str(arg).startswith("--startvm="):
+                    start_target = str(arg).split("=", 1)[1].strip("'\"")
+                    if re.fullmatch(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", start_target):
+                        vm_uuid = start_target
+                    if not vm_name:
+                        vm_name = start_target
+                    break
 
             memory = info.get("memory_info")
             measured = rates.get(info["pid"])
@@ -1853,6 +1880,7 @@ def _virtualbox_processes() -> list[dict[str, Any]]:
             guests.append({
                 "runtime": "virtualbox",
                 "name": vm_name or f"virtualbox-{info['pid']}",
+                "uuid": vm_uuid,
                 "state": "running",
                 "pid": info["pid"],
                 "cpu_count": None,
@@ -1890,19 +1918,60 @@ def _vboxmanage_vms() -> list[dict[str, Any]]:
             if m:
                 vm_name = m.group(1)
                 vm_uuid = m.group(2)
+                # VirtualBox can retain broken registrations after a VM directory is removed.
+                # They cannot be inspected or controlled, so keep them out of the live inventory.
+                if vm_name == "<inaccessible>":
+                    continue
                 is_running = vm_name in running_names
+                details = subprocess.run(
+                    [vbox_cli, "showvminfo", vm_uuid, "--machinereadable"],
+                    capture_output=True, text=True, timeout=5, check=False,
+                )
+                machine_info: dict[str, str] = {}
+                for info_line in details.stdout.splitlines():
+                    key, separator, value = info_line.partition("=")
+                    if separator:
+                        machine_info[key.strip()] = value.strip().strip('"')
+                memory_mb = _finite(machine_info.get("memory"))
+                cpu_count = machine_info.get("cpus")
                 vms.append({
                     "runtime": "virtualbox",
                     "name": vm_name,
                     "uuid": vm_uuid,
-                    "state": "running" if is_running else "poweroff",
-                    "cpu_count": None,
-                    "max_memory": None,
+                    "state": "running" if is_running or machine_info.get("VMState") == "running" else "poweroff",
+                    "cpu_count": int(cpu_count) if cpu_count and cpu_count.isdigit() else None,
+                    "max_memory": int(memory_mb * 1024 ** 2) if memory_mb is not None and memory_mb >= 0 else None,
                     "used_memory": None,
                 })
         return vms
     except Exception:
         return []
+
+
+def _merge_virtualbox_vms(
+    manager_vms: list[dict[str, Any]], process_vms: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Enrich manager inventory with live process metrics without duplicating UUID rows."""
+    by_name = {str(vm.get("name")): vm for vm in manager_vms if vm.get("name")}
+    by_uuid = {str(vm.get("uuid")).lower(): vm for vm in manager_vms if vm.get("uuid")}
+    merged = list(manager_vms)
+    for process_vm in process_vms:
+        process_uuid = str(process_vm.get("uuid") or process_vm.get("name") or "").lower()
+        manager_vm = by_uuid.get(process_uuid) or by_name.get(str(process_vm.get("name")))
+        if manager_vm is None:
+            merged.append(process_vm)
+            continue
+        manager_name = manager_vm.get("name")
+        manager_uuid = manager_vm.get("uuid")
+        # Process sampling does not know the configured CPU or memory limit. Keep
+        # those values from VBoxManage instead of overwriting them with nulls.
+        manager_vm.update({key: value for key, value in process_vm.items() if value is not None})
+        if manager_name:
+            manager_vm["name"] = manager_name
+        if manager_uuid:
+            manager_vm["uuid"] = manager_uuid
+        manager_vm["state"] = "running"
+    return merged
 
 
 def collect_vms() -> dict[str, Any]:
@@ -1912,14 +1981,7 @@ def collect_vms() -> dict[str, Any]:
     vbox_procs = _virtualbox_processes()
     vbox_cli_vms = _vboxmanage_vms()
 
-    # Merge VirtualBox CLI data and active process data
-    vbox_by_name = {vm["name"]: vm for vm in vbox_cli_vms}
-    for proc_vm in vbox_procs:
-        if proc_vm["name"] in vbox_by_name:
-            vbox_by_name[proc_vm["name"]].update(proc_vm)
-        else:
-            vbox_by_name[proc_vm["name"]] = proc_vm
-    virtualbox_vms = list(vbox_by_name.values())
+    virtualbox_vms = _merge_virtualbox_vms(vbox_cli_vms, vbox_procs)
 
     vms: list[dict[str, Any]] = list(libvirt["vms"]) + list(proxmox.get("vms", [])) + virtualbox_vms
     known_names = {str(vm.get("name")) for vm in vms}
