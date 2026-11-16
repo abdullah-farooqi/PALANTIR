@@ -65,6 +65,9 @@ export default defineConfig(({ mode }) => {
 
   return {
     plugins: [react()],
+    // Keep Vite's writable optimizer cache out of node_modules. Dependencies may
+    // be installed by another user/container and left read-only for this account.
+    cacheDir: path.resolve(here, '.vite'),
     define: {
       // Lets the UI hide write controls when it only holds a read token.
       __PALANTIR_UI_ROLE__: JSON.stringify(effectiveRole),
