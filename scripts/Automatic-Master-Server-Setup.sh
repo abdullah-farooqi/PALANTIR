@@ -274,9 +274,19 @@ check_and_free_port 8000 "FastAPI Backend"
 check_and_free_port 5432 "PostgreSQL"
 check_and_free_port 6379 "Redis"
 
-# 5. Start Backend Infrastructure Stack with Docker Compose
-echo -e "${CYAN}[3/4] Starting PALANTIR Master Backend Stack (PostgreSQL, Redis, Celery, FastAPI)...${NC}"
-docker compose up -d --force-recreate backend celery_worker celery_beat postgres redis
+# 5. Pull published images, then start the backend stack
+BACKEND_IMAGE="${PALANTIR_BACKEND_IMAGE:-abdullahahmadfarooqi/palantir-backend:latest}"
+export PALANTIR_BACKEND_IMAGE="${BACKEND_IMAGE}"
+
+echo -e "${CYAN}[3/4] Pulling master images and starting the backend stack...${NC}"
+echo -e "Backend image: ${YELLOW}${BACKEND_IMAGE}${NC}"
+if docker pull "${BACKEND_IMAGE}"; then
+  echo -e "${GREEN}✓ Backend image is ready.${NC}"
+else
+  echo -e "${YELLOW}WARNING: could not pull ${BACKEND_IMAGE}; docker compose will use whatever is already local.${NC}"
+fi
+
+docker compose up -d --force-recreate --pull missing backend celery_worker celery_beat postgres redis
 
 echo -e "${CYAN}Waiting for PostgreSQL database healthcheck...${NC}"
 until docker exec palantir-postgres pg_isready -U palantir -d palantir &>/dev/null; do
@@ -292,6 +302,15 @@ fi
 echo -e "${CYAN}Initializing PostgreSQL schema & partitioned tables...${NC}"
 docker exec -i palantir-postgres psql -U palantir -d palantir < sql/init.sql >/dev/null
 
+if [ -d sql/migrations ]; then
+  echo -e "${CYAN}Applying additive SQL migrations...${NC}"
+  for migration in sql/migrations/*.sql; do
+    [ -f "$migration" ] || continue
+    echo -e "  • $(basename "$migration")"
+    docker exec -i palantir-postgres psql -U palantir -d palantir < "$migration" >/dev/null
+  done
+fi
+
 echo -e "${GREEN}✓ PALANTIR Backend Stack is healthy and running!${NC}"
 
 # 6. Setup and Launch Frontend btop Terminal UI
@@ -304,11 +323,20 @@ if [ -d frontend ]; then
     npm install --quiet
   fi
   
+  AGENT_TOKEN_VALUE="$(grep "^AGENT_AUTH_TOKEN=" ../.env 2>/dev/null | cut -d'=' -f2- || true)"
+  [ -n "${AGENT_TOKEN_VALUE}" ] || AGENT_TOKEN_VALUE="$(grep "^AGENT_AUTH_TOKEN=" "${REPO_ROOT}/.env" 2>/dev/null | cut -d'=' -f2- || true)"
+
   echo -e "${GREEN}=====================================================${NC}"
   echo -e "${GREEN}   ✓ PALANTIR MASTER SERVER INITIALIZED SUCCESSFULLY  ${NC}"
   echo -e "${GREEN}=====================================================${NC}"
   echo -e "Master Backend API : ${CYAN}http://localhost:8000${NC} (Swagger: ${YELLOW}http://localhost:8000/docs${NC})"
   echo -e "Master UI Dashboard: ${CYAN}http://localhost:3000${NC}"
+  echo -e "Backend image      : ${YELLOW}${BACKEND_IMAGE}${NC}"
+  if [ -n "${AGENT_TOKEN_VALUE}" ]; then
+    echo -e "Host collector token (AGENT_AUTH_TOKEN): ${YELLOW}${AGENT_TOKEN_VALUE}${NC}"
+    echo -e "On each telemetry host, run:"
+    echo -e "  ${CYAN}curl -fsSL https://raw.githubusercontent.com/abdullah-farooqi/PALANTIR/telemetery_immproved_ui/scripts/Automatic-Host-Setup.sh | sudo env PALANTIR_AGENT_TOKEN=${AGENT_TOKEN_VALUE} bash${NC}"
+  fi
   echo -e "=====================================================\n"
   echo -e "${CYAN}Starting PALANTIR Terminal UI (Admin Mode)...${NC}\n"
 

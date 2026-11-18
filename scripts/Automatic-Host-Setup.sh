@@ -17,8 +17,18 @@
 #   PCAP_ENABLED=1                                                  Enable rolling packet capture
 #   PCAP_INTERFACE / PCAP_SNAPLEN / PCAP_*                          Packet capture settings
 #   DRY_RUN=1              only print the docker command
+#
+# One-liner from any host (pulls published collector image):
+#   curl -fsSL https://raw.githubusercontent.com/abdullah-farooqi/PALANTIR/telemetery_immproved_ui/scripts/Automatic-Host-Setup.sh \
+#     | sudo env PALANTIR_AGENT_TOKEN=<master-AGENT_AUTH_TOKEN> bash
 # ─────────────────────────────────────────────────────────────────────────────
 set -e
+
+# When this script is piped through curl|bash, stdin is the script itself.
+# Prefer an interactive TTY for prompts so token/access questions still work.
+if [ ! -t 0 ] && [ -r /dev/tty ]; then
+  exec </dev/tty
+fi
 
 GREEN='\033[0;32m'
 CYAN='\033[0;36m'
