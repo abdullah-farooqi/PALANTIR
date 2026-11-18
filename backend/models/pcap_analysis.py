@@ -61,6 +61,23 @@ class PcapAnalysisRuns(Base):
     error_step = Column(String(64), nullable=True)
     rollback_started_at = Column(DateTime(timezone=True), nullable=True)
     rollback_completed_at = Column(DateTime(timezone=True), nullable=True)
+    step_durations = Column(JSONB, nullable=False, default=dict)
+    step_progress = Column(JSONB, nullable=True)
+    rollback_id = Column(String(64), nullable=True)
+    exit_code = Column(String(32), nullable=True)
+    purged_scratch_files = Column(Integer, nullable=True, default=0)
+    snaplen = Column(Integer, nullable=True, default=65535)
+    is_truncated = Column(Boolean, nullable=False, default=False)
+    engine_versions = Column(
+        JSONB,
+        nullable=False,
+        default=lambda: {
+            "suricata": "7.0.2",
+            "zeek": "6.0.4",
+            "ruleset": "v4.12",
+            "engine_version": "v2.4",
+        },
+    )
 
     __table_args__ = (
         CheckConstraint(
@@ -296,6 +313,10 @@ class PcapArtifacts(Base):
     content_type = Column(String(255), nullable=True)
     content_length = Column(BigInteger, nullable=True)
     sha256 = Column(String(64), nullable=True, index=True)
+    md5 = Column(String(32), nullable=True)
+    source_uri = Column(String(1024), nullable=True)
+    source_protocol = Column(String(32), nullable=True)
+    expires_at = Column(DateTime(timezone=True), nullable=True)
     storage_key = Column(String(1024), nullable=True)
     storage_prefix = Column(String(255), nullable=True, index=True)
 
@@ -479,6 +500,8 @@ class PcapSeverityScores(Base):
     ioc_risk_score = Column(Numeric(3, 1), default=0.0)
     anomaly_score = Column(Numeric(3, 1), default=0.0)
     factors = Column(JSONB, nullable=False, default=dict)
+    top_risk_factors = Column(JSONB, nullable=False, default=list)
+    composite_weights = Column(JSONB, nullable=False, default=dict)
     calculated_at = Column(
         DateTime(timezone=True),
         nullable=False,

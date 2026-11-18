@@ -19,6 +19,7 @@ from api.v1.fleet_logs import router as fleet_logs_router
 from api.v1.health import router as operational_health_router
 from api.v1.settings import router as settings_router
 from api.v1.internal import router as internal_router
+from api.v1.copilot import router as copilot_router
 
 logging.basicConfig(
     level=logging.INFO,
@@ -91,6 +92,7 @@ app.include_router(fleet_logs_router, prefix=settings.API_V1_STR, dependencies=[
 app.include_router(operational_health_router, prefix=settings.API_V1_STR, dependencies=[Depends(require_read)])
 app.include_router(metric_catalog_router, prefix=settings.API_V1_STR)
 app.include_router(settings_router, prefix=settings.API_V1_STR)
+app.include_router(copilot_router, prefix=settings.API_V1_STR, dependencies=[Depends(require_read)])
 app.include_router(
     investigations_router,
     prefix=settings.API_V1_STR,

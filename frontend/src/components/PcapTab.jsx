@@ -11,7 +11,9 @@ export default function PcapTab({ onOpenInvestigations, refreshMs }) {
   const investigations = state.data?.items || [];
   const [selectedId, setSelectedId] = useState(null);
   useEffect(() => {
-    if (!selectedId && investigations.length) setSelectedId(investigations[0].id);
+    if (investigations.length && !investigations.some((item) => item.id === selectedId)) {
+      setSelectedId(investigations[0].id);
+    }
   }, [investigations, selectedId]);
   const selected = investigations.find((item) => item.id === selectedId) || null;
 
@@ -37,7 +39,7 @@ export default function PcapTab({ onOpenInvestigations, refreshMs }) {
         <Empty>No investigations are available yet. WARNING and CRITICAL alerts create investigation records.</Empty>
       ) : (
         <div className="grid grid-cols-1 xl:grid-cols-12 gap-4 items-start">
-          <Box n={4} title="INVESTIGATIONS" right={<span className="font-mono text-xs text-[#8B93A0]">{investigations.length} RECORDS</span>}>
+          <Box className="min-w-0 xl:col-span-4" title="INVESTIGATIONS" right={<span className="font-mono text-xs text-[#8B93A0]">{investigations.length} RECORDS</span>}>
             <div className="flex flex-col gap-1.5 max-h-[calc(100vh-250px)] overflow-y-auto">
               {investigations.map((item) => {
                 const active = selectedId === item.id;
@@ -61,8 +63,8 @@ export default function PcapTab({ onOpenInvestigations, refreshMs }) {
               })}
             </div>
           </Box>
-          <Box n={8} title={selected ? `INVESTIGATION #${selected.id}` : 'NETWORK EVIDENCE'}>
-            {selected ? <NetworkEvidence investigation={selected} refreshMs={refreshMs} /> : <Empty>Select an investigation to view network evidence.</Empty>}
+          <Box className="min-w-0 xl:col-span-8" title={selected ? `INVESTIGATION #${selected.id}` : 'NETWORK EVIDENCE'}>
+            {selected ? <NetworkEvidence investigation={selected} refreshMs={refreshMs} showAnalysis /> : <Empty>Select an investigation to view network evidence.</Empty>}
           </Box>
         </div>
       )}

@@ -7,6 +7,7 @@ from core.database import get_sync_session
 from models.metric import MetricSnapshot
 from models.log_event import LogEvent
 from models.investigation_evidence import InvestigationEvidence
+from models.pcap_analysis import PcapArtifacts
 from core.config import settings
 
 logger = logging.getLogger(__name__)
@@ -77,6 +78,15 @@ def _prune_pcap_evidence(session, now: datetime) -> tuple[int, int]:
             row.error_message = evicted[row.id]
         elif path:
             referenced.add(path)
+
+    # Protect active forensic artifacts from orphan cleanup
+    artifact_storage_keys = session.execute(
+        select(PcapArtifacts.storage_key).where(PcapArtifacts.storage_key.is_not(None))
+    ).scalars().all()
+    for akey in artifact_storage_keys:
+        apath = _evidence_file(root, akey)
+        if apath:
+            referenced.add(apath)
 
     # Recover disk space after interrupted transfers or evidence rows deleted by cascade.
     orphan_cutoff = now - timedelta(days=1)

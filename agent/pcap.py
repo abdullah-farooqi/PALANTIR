@@ -298,19 +298,28 @@ class PCapManager:
                     selected_path.suffix.removeprefix(".") if selected_path != raw_path else "none"
                 )
                 expected_name = final_path.name if is_compressing else selected_path.name
+                original_size = metadata.get("original_size_bytes")
+                if isinstance(original_size, bool) or not isinstance(original_size, int) or original_size < 0:
+                    original_size = None
+                snaplen = metadata.get("snaplen")
+                if isinstance(snaplen, bool) or not isinstance(snaplen, int) or snaplen < 1:
+                    snaplen = None
+                packet_count = metadata.get("packet_count")
+                if isinstance(packet_count, bool) or not isinstance(packet_count, int) or packet_count < 0:
+                    packet_count = None
                 results.append({
                     "file_id": file_id,
                     "filename": expected_name,
                     "size_bytes": selected_path.stat().st_size,
-                    "original_size_bytes": int(metadata.get("original_size_bytes", 0)),
+                    "original_size_bytes": original_size,
                     "capture_started_at": metadata.get("capture_started_at"),
                     "capture_finished_at": metadata.get("capture_finished_at"),
                     "duration_seconds": metadata.get("duration_seconds"),
                     "compression": expected_compression,
                     "status": "compressing" if is_compressing else "ready",
-                    "interface": metadata.get("interface"),
-                    "snaplen": metadata.get("snaplen"),
-                    "packet_count": metadata.get("packet_count"),
+                    "interface": metadata.get("interface") if isinstance(metadata.get("interface"), str) else None,
+                    "snaplen": snaplen,
+                    "packet_count": packet_count,
                     "sha256": metadata.get("sha256"),
                     "hash_status": metadata.get("hash_status", "pending"),
                 })
@@ -382,6 +391,18 @@ class PCapManager:
             "coverage_seconds": self._coverage_seconds(files),
         }
 
+    def _build_tcpdump_command(self, prefix: Path) -> list[str]:
+        command = [
+            "tcpdump", "-n", "-U", "-i", self.interface,
+            "-s", str(self.snaplen), "-B", "4096",
+            "-C", str(self.max_size_mb), "-W", str(self.max_files),
+            "-w", str(prefix),
+        ]
+        filter_expression = build_bpf_filter(self.filter_exclude)
+        if filter_expression:
+            command.append(filter_expression)
+        return command
+
     def _run(self) -> None:
         backoff = 1.0
         while not self._stop_event.is_set():
@@ -389,15 +410,7 @@ class PCapManager:
             prefix = self.storage_dir / (
                 f"capture_{started_at.strftime('%Y%m%dT%H%M%SZ')}_{uuid4().hex[:12]}.pcap"
             )
-            command = [
-                "tcpdump", "-n", "-U", "-i", self.interface,
-                "-s", str(self.snaplen), "-B", "4096",
-                "-C", f"{self.max_size_mb}M", "-W", str(self.max_files),
-                "-w", str(prefix),
-            ]
-            filter_expression = build_bpf_filter(self.filter_exclude)
-            if filter_expression:
-                command.append(filter_expression)
+            command = self._build_tcpdump_command(prefix)
             try:
                 process = subprocess.Popen(
                     command,
@@ -782,12 +795,20 @@ class PCapManager:
                 try:
                     started_at = datetime.strptime(match.group(1), "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc) if match else datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
                     finished_at = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
+                    packet_bounds, packet_count = _pcap_packet_info(path)
+                    if packet_bounds is not None:
+                        started_at, finished_at = packet_bounds
                     self._write_json_atomic(metadata_path, {
                         "file_id": path.name,
                         "capture_started_at": started_at.isoformat(),
                         "capture_finished_at": finished_at.isoformat(),
                         "duration_seconds": max(0, int((finished_at - started_at).total_seconds())),
                         "original_size_bytes": path.stat().st_size,
+                        "interface": self.interface,
+                        "snaplen": self.snaplen,
+                        "packet_count": packet_count,
+                        "sha256": None,
+                        "hash_status": "pending",
                     })
                 except OSError:
                     continue

@@ -12,6 +12,29 @@
     "expires_at": {"type": "string", "format": "date-time"},
     "coverage_seconds": {"type": "integer", "minimum": 0},
     "trigger_type": {"enum": ["manual", "alert", "anomaly"]},
-    "files": {"type": "array", "items": {"type": "object", "required": ["file_id", "size_bytes", "compression", "snaplen", "interface", "hash_status"]}}
+    "files": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["file_id", "filename", "size_bytes", "original_size_bytes", "compression", "status", "snaplen", "interface", "packet_count", "sha256", "hash_status"],
+        "properties": {
+          "file_id": {"type": "string", "pattern": "^capture_[0-9]{8}T[0-9]{6}Z_[0-9a-f]{12}\\.pcap[0-9]*$"},
+          "filename": {"type": "string", "minLength": 1},
+          "size_bytes": {"type": "integer", "minimum": 1},
+          "original_size_bytes": {"type": ["integer", "null"], "minimum": 24},
+          "capture_started_at": {"type": ["string", "null"], "format": "date-time"},
+          "capture_finished_at": {"type": ["string", "null"], "format": "date-time"},
+          "duration_seconds": {"type": ["integer", "null"], "minimum": 0},
+          "compression": {"enum": ["none", "gz", "gzip", "zst", "zstd"]},
+          "status": {"enum": ["ready", "compressing"]},
+          "interface": {"type": ["string", "null"], "minLength": 1},
+          "snaplen": {"type": ["integer", "null"], "minimum": 1, "maximum": 262144},
+          "packet_count": {"type": ["integer", "null"], "minimum": 0},
+          "sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+          "hash_status": {"enum": ["pending", "complete", "unavailable", "queue_full"]}
+        },
+        "additionalProperties": true
+      }
+    }
   }
 }

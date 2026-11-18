@@ -124,8 +124,14 @@ export const api = {
     }),
   deleteInvestigation: (id) => request(`/investigations/${id}`, { method: 'DELETE' }),
   getInvestigationEvidence: (id) => request(`/investigations/${id}/evidence`),
+  captureInvestigationEvidence: (id) => request(`/investigations/${id}/evidence/capture`, { method: 'POST' }),
+  retryInvestigationEvidenceTransfer: (id, fileId) =>
+    request(`/investigations/${id}/evidence/${encodeURIComponent(fileId)}/retry`, { method: 'POST' }),
   investigationEvidenceDownloadUrl: (id, fileId) =>
     `${BASE}/investigations/${id}/evidence/${encodeURIComponent(fileId)}/download`,
+  getNodeCaptureStatus: (id) => request(`/nodes/${id}/capture/status`),
+  startNodeCapture: (id) => request(`/nodes/${id}/capture/start`, { method: 'POST' }),
+  stopNodeCapture: (id) => request(`/nodes/${id}/capture/stop`, { method: 'POST' }),
   getInvestigationAnalysisRuns: (id) => request(`/investigations/${id}/analysis`),
   getInvestigationAnalysisDetail: (id, runId, includeRecords = false) =>
     request(`/investigations/${id}/analysis/${encodeURIComponent(runId)}${qs({ include_records: includeRecords })}`),
@@ -135,10 +141,27 @@ export const api = {
     request(`/investigations/${id}/analysis/trigger${qs({ evidence_id: evidenceId })}`, { method: 'POST' }),
   investigationAnalysisArtifactDownloadUrl: (id, runId, artifactId) =>
     `${BASE}/investigations/${id}/analysis/${encodeURIComponent(runId)}/artifacts/${encodeURIComponent(artifactId)}/download`,
+  getPivotForensics: (query, iocType = null, runId = null, investigationId = null) =>
+    request(`/investigations/forensics/pivot${qs({ query, ioc_type: iocType, run_id: runId, investigation_id: investigationId })}`),
+  getIocAllowlist: () => request('/investigations/allowlist'),
+  addIocAllowlist: (pattern, iocType, description = '') =>
+    request('/investigations/allowlist', { method: 'POST', body: JSON.stringify({ pattern, ioc_type: iocType, description }) }),
+  deleteIocAllowlist: (id) => request(`/investigations/allowlist/${id}`, { method: 'DELETE' }),
+  exportInvestigation: (id, format = 'json') => request(`/investigations/${id}/export${qs({ format })}`),
+  // ---- copilot --------------------------------------------------------------
+  getCopilotPresets: () => request('/copilot/presets'),
+  queryCopilot: (prompt, host = null) =>
+    request('/copilot/query', { method: 'POST', body: JSON.stringify({ prompt, host }) }),
+  // ---- alert rules & export -------------------------------------------------
+  getDetectionRules: () => request('/events/rules'),
+  acknowledgeEvents: (eventIds) =>
+    request('/events/acknowledge', { method: 'POST', body: JSON.stringify({ event_ids: eventIds }) }),
+  exportEvents: (format = 'json') => request(`/events/export${qs({ format })}`),
 
   // ---- fleet / health --------------------------------------------------------
   getFleetSummary: () => request('/fleet/summary'),
   getFleetTelemetry: (limit = 10) => request(`/fleet/telemetry${qs({ limit })}`),
+  triggerIngest: () => request('/fleet/refresh', { method: 'POST' }),
   getOpsHealth: () => request('/health/operations'),
   getMetricSchema: () => request('/metrics/schema'),
   // ---- system settings -------------------------------------------------------

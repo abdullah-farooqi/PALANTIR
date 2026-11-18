@@ -5,6 +5,7 @@ import { Badge, Box, Chips, DataTable, Empty, ErrorLine, Spinner } from './ui';
 import NodeHeaderNav from './NodeHeaderNav';
 import NetworkEvidence from './NetworkEvidence';
 import InvestigationAnalysis from './InvestigationAnalysis';
+import DeleteInvestigationModal from './DeleteInvestigationModal';
 import { CAN_WRITE } from '../lib/role';
 import { describeTrigger, severityTone, statusTone } from '../lib/events';
 import { formatDateTime, formatDuration, formatRelative, formatNumber, formatBytes, scoreToPercent } from '../lib/format';
@@ -221,7 +222,7 @@ function Evidence({ inv }) {
   );
 }
 
-export default function InvestigationsTab({ node, scope, setScope, refreshMs, focusId, onToast, onBack, onChangeView, fleet }) {
+export default function InvestigationsTab({ node, scope, setScope, refreshMs, focusId, onToast, onBack, onChangeView, fleet, onPivot }) {
   const [status, setStatus] = useState('');
   const [selected, setSelected] = useState(null);
   const [detailSection, setDetailSection] = useState('summary');
@@ -434,7 +435,7 @@ export default function InvestigationsTab({ node, scope, setScope, refreshMs, fo
                 ))}
               </div>
               {detailSection === 'analysis' ? (
-                <InvestigationAnalysis investigation={current} refreshMs={refreshMs} onToast={onToast} />
+                <InvestigationAnalysis investigation={current} refreshMs={refreshMs} onToast={onToast} onPivot={onPivot} />
               ) : detailSection === 'evidence' ? (
                 <NetworkEvidence investigation={current} refreshMs={refreshMs} />
               ) : (
@@ -453,7 +454,23 @@ export default function InvestigationsTab({ node, scope, setScope, refreshMs, fo
               >
                 <div>
                   <div style={{ fontSize: 11, color: '#728c78', textTransform: 'uppercase' }}>TARGET HOST</div>
-                  <div style={{ color: '#22d3ee', fontWeight: 700, fontSize: 13, marginTop: 2, fontFamily: 'JetBrains Mono, monospace' }}>
+                  <div
+                    style={{
+                      color: '#22d3ee',
+                      fontWeight: 700,
+                      fontSize: 13,
+                      marginTop: 2,
+                      fontFamily: 'JetBrains Mono, monospace',
+                      cursor: onPivot ? 'pointer' : 'default',
+                      textDecoration: onPivot ? 'underline' : 'none',
+                      textUnderlineOffset: '3px',
+                    }}
+                    onClick={() => {
+                      const target = current.node_hostname || (node ? node.hostname : '');
+                      if (target && onPivot) onPivot(target, 'Domain');
+                    }}
+                    title={onPivot ? 'Correlate in Pivot Forensic Drawer' : undefined}
+                  >
                     {current.node_hostname || (node ? node.hostname : `Node #${current.node_id}`)}
                   </div>
                 </div>
@@ -557,96 +574,16 @@ export default function InvestigationsTab({ node, scope, setScope, refreshMs, fo
         </Box>
       </div>
 
-      {pendingDelete && (
-        <div
-          className="modal-back"
-          style={{
-            position: 'fixed',
-            inset: 0,
-            background: 'rgba(0, 0, 0, 0.75)',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            zIndex: 1000,
-          }}
-          onMouseDown={(e) => {
-            if (e.target === e.currentTarget && !deleting) setPendingDelete(null);
-          }}
-        >
-          <div
-            className="box modal hot"
-            role="dialog"
-            aria-modal="true"
-            style={{
-              maxWidth: 440,
-              width: '90%',
-              padding: '22px 20px',
-              background: '#070c08',
-              border: '1px solid #7f1d1d',
-              borderRadius: 8,
-              boxShadow: '0 10px 25px rgba(0,0,0,0.8)',
-            }}
-          >
-            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 12 }}>
-              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#ef4444" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                <polyline points="3 6 5 6 21 6"/>
-                <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
-                <line x1="10" y1="11" x2="10" y2="17"/>
-                <line x1="14" y1="11" x2="14" y2="17"/>
-              </svg>
-              <h3 style={{ margin: 0, fontSize: 16, fontWeight: 800, color: '#f87171', letterSpacing: '0.04em' }}>
-                DELETE INVESTIGATION
-              </h3>
-            </div>
-
-            <p style={{ margin: '0 0 18px', fontSize: 13, color: '#d8dee9', lineHeight: 1.5 }}>
-              Are you sure you want to permanently delete investigation <b>#{pendingDelete.id}</b> ({describeTrigger(pendingDelete)})?
-            </p>
-
-            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10 }}>
-              <button
-                type="button"
-                className="btn"
-                disabled={deleting}
-                onClick={() => setPendingDelete(null)}
-                style={{
-                  background: 'transparent',
-                  border: '1px solid #1a3821',
-                  color: '#94a3b8',
-                  padding: '6px 14px',
-                  borderRadius: 6,
-                  cursor: 'pointer',
-                  fontWeight: 600,
-                  fontSize: 12,
-                }}
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                className="btn"
-                disabled={deleting}
-                onClick={handleConfirmDelete}
-                style={{
-                  background: '#dc2626',
-                  border: 'none',
-                  color: '#fff',
-                  padding: '6px 16px',
-                  borderRadius: 6,
-                  cursor: 'pointer',
-                  fontWeight: 700,
-                  fontSize: 12,
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: 6,
-                }}
-              >
-                {deleting ? 'Deleting…' : 'Delete Investigation'}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+      <DeleteInvestigationModal
+        isOpen={Boolean(pendingDelete)}
+        onClose={() => setPendingDelete(null)}
+        investigation={pendingDelete}
+        onSuccess={(deletedId) => {
+          if (selected === deletedId) setSelected(null);
+          state.refresh();
+        }}
+        onToast={onToast}
+      />
     </>
   );
 }

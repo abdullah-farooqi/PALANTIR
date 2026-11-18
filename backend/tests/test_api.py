@@ -1,10 +1,13 @@
 import pytest
+import socket
+import struct
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 import respx
 import httpx
 from httpx import AsyncClient, ASGITransport
 from main import app
+from api.v1 import fleet as fleet_api
 from core.config import settings
 from core.api_auth import get_api_role
 from models.node import MonitoredNode
@@ -25,6 +28,30 @@ from core.database import AsyncSessionLocal
 from services import investigations as investigation_service
 from services import alerts as alert_service
 from sqlalchemy import select
+from workers.pcap_pipeline import (
+    pcap_analysis_extract_artifacts,
+    pcap_analysis_extract_flows,
+    pcap_analysis_extract_iocs,
+    pcap_analysis_match_cve,
+    pcap_analysis_reconstruct_sessions,
+    pcap_analysis_score_severity,
+    pcap_analysis_validate,
+)
+
+
+def build_udp_pipeline_fixture() -> bytes:
+    """Build one valid Ethernet/IPv4/UDP packet for the complete analysis path."""
+    ethernet = bytes.fromhex("00112233445566778899aabb0800")
+    ip = struct.pack(
+        "!BBHHHBBH4s4s",
+        0x45, 0, 32, 1, 0, 64, 17, 0,
+        socket.inet_aton("192.168.1.50"), socket.inet_aton("8.8.8.8"),
+    )
+    udp = struct.pack("!HHHH", 53000, 53, 12, 0) + b"data"
+    packet = ethernet + ip + udp
+    global_header = struct.pack("<IHHIIII", 0xA1B2C3D4, 2, 4, 0, 0, 2048, 1)
+    packet_header = struct.pack("<IIII", 1_700_000_000, 100_000, len(packet), len(packet))
+    return global_header + packet_header + packet
 
 
 @pytest.fixture
@@ -98,6 +125,31 @@ async def test_healthz(client: AsyncClient):
     data = resp.json()
     assert data["status"] == "ok"
     assert data["app"] == settings.PROJECT_NAME
+
+
+@pytest.mark.asyncio
+async def test_manual_fleet_refresh_queues_the_existing_collection_task(client: AsyncClient, monkeypatch):
+    calls = []
+
+    class QueuedTask:
+        id = "manual-refresh-task"
+
+    class Task:
+        def apply_async(self, **kwargs):
+            calls.append(kwargs)
+            return QueuedTask()
+
+    monkeypatch.setattr(fleet_api, "collect_all_nodes", Task())
+
+    response = await client.post("/api/v1/fleet/refresh")
+
+    assert response.status_code == 202
+    assert response.json() == {
+        "status": "queued",
+        "task_id": "manual-refresh-task",
+        "expires_in_seconds": 55,
+    }
+    assert calls == [{"expires": 55}]
 
 
 # =====================================================================
@@ -534,7 +586,9 @@ async def test_investigation_pcap_evidence_list_and_download(
             investigation_id=investigation_id,
             node_id=existing_node.id,
             evidence_type="pcap_collection",
+            file_name="/var/lib/host/capture.pcap",
             status="queued",
+            error_message="Transfer failed at /var/lib/host/capture.pcap from http://user:secret@agent.local",
         )
         session.add_all([complete, pending])
         await session.commit()
@@ -546,7 +600,17 @@ async def test_investigation_pcap_evidence_list_and_download(
     assert listed.status_code == 200
     entries = listed.json()["items"]
     assert {entry["file_id"] for entry in entries} == {complete_id, pending_id}
-    assert next(entry for entry in entries if entry["file_id"] == complete_id)["duration_seconds"] == 300
+    complete_entry = next(entry for entry in entries if entry["file_id"] == complete_id)
+    assert complete_entry["duration_seconds"] == 300
+    assert complete_entry["transfer_status"] == "complete"
+    assert complete_entry["download_available"] is True
+    assert complete_entry["analysis_status"] == "not_started"
+    pending_entry = next(entry for entry in entries if entry["file_id"] == pending_id)
+    assert pending_entry["filename"] == "capture.pcap"
+    assert "/var/lib" not in pending_entry["error_message"]
+    assert "secret" not in pending_entry["error_message"]
+    assert pending_entry["snaplen"] is None
+    assert pending_entry["collector_sha256"] is None
 
     downloaded = await client.get(
         f"/api/v1/investigations/{investigation_id}/evidence/{complete_id}/download"
@@ -554,6 +618,13 @@ async def test_investigation_pcap_evidence_list_and_download(
     assert downloaded.status_code == 200
     assert downloaded.content == b"pcap evidence fixture"
 
+    stored.unlink()
+    unavailable_list = await client.get(f"/api/v1/investigations/{investigation_id}/evidence")
+    unavailable_entry = next(
+        entry for entry in unavailable_list.json()["items"] if entry["file_id"] == complete_id
+    )
+    assert unavailable_entry["transfer_status"] == "complete"
+    assert unavailable_entry["download_available"] is False
     not_ready = await client.get(
         f"/api/v1/investigations/{investigation_id}/evidence/{pending_id}/download"
     )
@@ -596,7 +667,13 @@ async def test_warning_alert_snapshot_is_recorded_and_transfer_is_queued(
         async def fake_snapshot(_self, trigger_type="manual"):
             assert trigger_type == "alert"
             return {
+                "schema_version": "1.0",
+                "collector_version": "test",
                 "snapshot_id": "a" * 32,
+                "created_at": timestamp.isoformat(),
+                "expires_at": (timestamp + timedelta(minutes=30)).isoformat(),
+                "coverage_seconds": 300,
+                "trigger_type": "alert",
                 "files": [{
                     "file_id": "capture_20261112T120000Z_0123456789ab.pcap",
                     "filename": "capture_20261112T120000Z_0123456789ab.pcap.zst",
@@ -606,6 +683,12 @@ async def test_warning_alert_snapshot_is_recorded_and_transfer_is_queued(
                     "capture_finished_at": timestamp.isoformat(),
                     "duration_seconds": 300,
                     "compression": "zst",
+                    "status": "ready",
+                    "interface": "any",
+                    "snaplen": 128,
+                    "packet_count": 4,
+                    "sha256": "b" * 64,
+                    "hash_status": "complete",
                 }],
             }
 
@@ -629,6 +712,79 @@ async def test_warning_alert_snapshot_is_recorded_and_transfer_is_queued(
         assert evidence.status == "queued"
         assert evidence.alert_event_id == event_id
         assert evidence.capture_snapshot_id == "a" * 32
+        assert evidence.capture_trigger_type == "alert"
+        assert evidence.capture_interface == "any"
+        assert evidence.snaplen == 128
+        assert evidence.packet_count == 4
+        assert evidence.collector_sha256 == "b" * 64
+
+
+@pytest.mark.asyncio
+async def test_manual_snapshot_and_failed_transfer_retry_are_investigation_scoped(
+    client: AsyncClient,
+    existing_node: MonitoredNode,
+    monkeypatch,
+):
+    created = await client.post(
+        "/api/v1/investigations",
+        json={"node_id": existing_node.id, "trigger_type": "manual"},
+    )
+    assert created.status_code == 202
+    investigation_id = created.json()["id"]
+    queued_ids = []
+
+    async def fake_snapshot(self, trigger_type="manual"):
+        assert trigger_type == "manual"
+        return {
+            "schema_version": "1.0",
+            "collector_version": "test",
+            "snapshot_id": "c" * 32,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat(),
+            "coverage_seconds": 30,
+            "trigger_type": "manual",
+            "files": [{
+                "file_id": "capture_20261112T120000Z_0123456789ab.pcap",
+                "filename": "capture_20261112T120000Z_0123456789ab.pcap",
+                "size_bytes": 256,
+                "original_size_bytes": 256,
+                "compression": "none",
+                "status": "ready",
+                "interface": "any",
+                "snaplen": 128,
+                "packet_count": 3,
+                "sha256": "d" * 64,
+                "hash_status": "complete",
+            }],
+        }
+
+    async def queued_transfer(evidence_id):
+        queued_ids.append(evidence_id)
+        return True
+
+    monkeypatch.setattr(investigation_service.AgentCollectorClient, "create_pcap_snapshot", fake_snapshot)
+    monkeypatch.setattr(investigation_service, "_enqueue_pcap_transfer", queued_transfer)
+    captured = await client.post(f"/api/v1/investigations/{investigation_id}/evidence/capture")
+    assert captured.status_code == 202
+    assert captured.json()["queued_files"] == 1
+
+    async with AsyncSessionLocal() as session:
+        manual_evidence = (await session.execute(
+            select(InvestigationEvidence).where(InvestigationEvidence.investigation_id == investigation_id)
+        )).scalar_one()
+        manual_id = manual_evidence.id
+        assert manual_evidence.capture_trigger_type == "manual"
+        assert manual_evidence.collector_file_id.endswith(".pcap")
+        manual_evidence.status = "failed"
+        await session.commit()
+
+    retried = await client.post(f"/api/v1/investigations/{investigation_id}/evidence/{manual_id}/retry")
+    assert retried.status_code == 202
+    assert retried.json()["status"] == "queued"
+    assert queued_ids[-1] == manual_id
+
+    out_of_scope = await client.post(f"/api/v1/investigations/{investigation_id + 1}/evidence/{manual_id}/retry")
+    assert out_of_scope.status_code == 404
 
 
 @pytest.mark.asyncio
@@ -639,6 +795,7 @@ async def test_investigation_pcap_analysis_api(
     tmp_path,
 ):
     monkeypatch.setattr(settings, "PCAP_STORAGE_DIR", tmp_path)
+    (tmp_path / "analysis.pcap").write_bytes(b"stored PCAP fixture")
     created = await client.post(
         "/api/v1/investigations",
         json={"node_id": existing_node.id, "trigger_type": "manual"},
@@ -837,6 +994,7 @@ async def test_investigation_pcap_analysis_api(
     assert len(first_json["items"]) == 2
     assert first_json["has_more"] is True
     assert "storage_key" not in first_json["items"][0]
+    assert all("total_packet_count" in row and "total_byte_count" in row for row in first_json["items"])
 
     second_page = await client.get(
         f"/api/v1/investigations/{investigation_id}/analysis/{run_id}/collections/flows",
@@ -915,4 +1073,82 @@ async def test_investigation_pcap_analysis_api(
     assert dl_resp.status_code == 200
     assert dl_resp.content == b"<h1>Artifact Body</h1>"
     assert dl_resp.headers["content-type"].startswith("text/html")
+    wrong_investigation_download = await client.get(
+        f"/api/v1/investigations/{investigation_id + 999999}/analysis/{run_id}/artifacts/{art_id}/download"
+    )
+    assert wrong_investigation_download.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_fixture_pcap_runs_through_analysis_and_ui_response(
+    client: AsyncClient,
+    existing_node: MonitoredNode,
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(settings, "PCAP_STORAGE_DIR", tmp_path)
+    created = await client.post(
+        "/api/v1/investigations",
+        json={"node_id": existing_node.id, "trigger_type": "manual"},
+    )
+    assert created.status_code == 202
+    investigation_id = created.json()["id"]
+
+    capture = build_udp_pipeline_fixture()
+    (tmp_path / "fixture.pcap").write_bytes(capture)
+    run_id = uuid4().hex
+    async with AsyncSessionLocal() as session:
+        evidence = InvestigationEvidence(
+            investigation_id=investigation_id,
+            node_id=existing_node.id,
+            evidence_type="pcap_collection",
+            file_name="fixture.pcap",
+            storage_key="fixture.pcap",
+            size_bytes=len(capture),
+            status="complete",
+        )
+        session.add(evidence)
+        await session.flush()
+        session.add(PcapAnalysisRuns(
+            run_id=run_id,
+            evidence_id=evidence.id,
+            investigation_id=investigation_id,
+            node_id=existing_node.id,
+            status="pending",
+        ))
+        await session.commit()
+        evidence_id = evidence.id
+
+    result = pcap_analysis_validate(evidence_id, run_id)
+    for stage in (
+        pcap_analysis_extract_flows,
+        pcap_analysis_reconstruct_sessions,
+        pcap_analysis_extract_artifacts,
+        pcap_analysis_extract_iocs,
+        pcap_analysis_match_cve,
+        pcap_analysis_score_severity,
+    ):
+        result = stage(result, run_id=run_id)
+    assert result["status"] == "complete"
+
+    evidence_response = await client.get(f"/api/v1/investigations/{investigation_id}/evidence")
+    assert evidence_response.status_code == 200
+    evidence_item = next(item for item in evidence_response.json()["items"] if item["file_id"] == evidence_id)
+    assert evidence_item["transfer_status"] == "complete"
+    assert evidence_item["analysis_status"] == "complete"
+    assert evidence_item["download_available"] is True
+
+    analysis_response = await client.get(f"/api/v1/investigations/{investigation_id}/analysis/{run_id}")
+    assert analysis_response.status_code == 200
+    flow = analysis_response.json()["flows"][0]
+    assert flow["src_ip"] == "192.168.1.50"
+    assert flow["dst_ip"] == "8.8.8.8"
+    assert flow["protocol"] == "udp"
+    assert flow["total_packet_count"] == 1
+
+    download = await client.get(
+        f"/api/v1/investigations/{investigation_id}/evidence/{evidence_id}/download"
+    )
+    assert download.status_code == 200
+    assert download.content == capture
 

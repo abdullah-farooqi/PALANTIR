@@ -93,6 +93,8 @@ sudo bash scripts/Automatic-Master-Server-Setup.sh
 5. **Schema & Partition Migration**: Applies PostgreSQL initializations, B-tree indexes, GIN indexes, and range-partitioned tables (`sql/init.sql`).
 6. **Frontend Dashboard Launch**: Installs UI dependencies in `frontend/` and starts the React dashboard on `http://localhost:3000`.
 
+For an existing PostgreSQL volume, `init.sql` is not rerun by Docker. Apply the additive migration in `sql/migrations/` before starting a backend version that uses the expanded PCAP evidence contract.
+
 ---
 
 ## 2. Quickstart: Monitored Target Hosts (Remote / Edge / VMs)

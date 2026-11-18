@@ -13,7 +13,7 @@ from models.log_event import LogEvent
 from models.metric import MetricSnapshot
 from models.node import MonitoredNode
 from models.threshold import SystemAlertThreshold
-from services.investigations import enqueue_investigation_async
+from services.investigations import enqueue_investigation_async, request_pcap_evidence_for_alert
 
 logger = logging.getLogger(__name__)
 
@@ -507,12 +507,19 @@ class MetricsService:
 
                 if new_status in {"WARNING", "CRITICAL"}:
                     try:
-                        await enqueue_investigation_async(
+                        investigation, dispatched = await enqueue_investigation_async(
                             session,
                             node_id=node_id,
                             trigger_type="alert",
                             trigger_id=event.id,
                         )
+                        if dispatched:
+                            await request_pcap_evidence_for_alert(
+                                session,
+                                event_id=event.id,
+                                node_id=node_id,
+                                investigation_id=investigation.id,
+                            )
                     except Exception as inv_exc:
                         logger.warning("Could not auto-enqueue investigation for native alert %s: %s", event.id, inv_exc)
 

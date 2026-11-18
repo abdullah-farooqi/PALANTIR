@@ -4,6 +4,8 @@ import NodeHeaderNav from './NodeHeaderNav';
 import { agentStatus, containerSources, listOf, storageSummary, vmSources } from '../lib/metrics';
 import { formatBytes, formatNumber, formatPercent, formatCount } from '../lib/format';
 import { api } from '../api';
+import ContainerRestartModal from './ContainerRestartModal';
+import VmStopModal from './VmStopModal';
 
 
 const SECTIONS = [
@@ -610,7 +612,7 @@ function Vms({ latest, filter, vmOverrides = {}, onActionVm }) {
   );
 }
 
-function Sockets({ latest, filter }) {
+function Sockets({ latest, filter, onPivot }) {
   const rows = listOf(latest, 'connections', 'sockets').map((s) => ({
     ...s,
     local: `${s.local_address}:${s.local_port}`,
@@ -645,11 +647,30 @@ function Sockets({ latest, filter }) {
     {
       key: 'remote',
       label: 'REMOTE ADDRESS',
-      render: (r) => (
-        <span style={{ color: r.remote === '*' ? '#728c78' : '#94a3b8', fontFamily: 'JetBrains Mono, monospace', fontSize: 11.5 }}>
-          {r.remote}
-        </span>
-      ),
+      render: (r) => {
+        const isPivotable = r.remote_address && r.remote !== '*' && !r.remote_address.startsWith('127.') && !r.remote_address.startsWith('0.0.0.0');
+        return (
+          <span
+            style={{
+              color: r.remote === '*' ? '#728c78' : isPivotable ? '#C6FF00' : '#94a3b8',
+              fontFamily: 'JetBrains Mono, monospace',
+              fontSize: 11.5,
+              cursor: isPivotable ? 'pointer' : 'default',
+              textDecoration: isPivotable ? 'underline' : 'none',
+              textUnderlineOffset: '3px',
+            }}
+            onClick={(e) => {
+              if (isPivotable && onPivot) {
+                e.stopPropagation();
+                onPivot(r.remote_address, 'IPv4');
+              }
+            }}
+            title={isPivotable ? 'Click to correlate in Pivot Forensic Drawer' : undefined}
+          >
+            {r.remote}
+          </span>
+        );
+      },
     },
     {
       key: 'state',
@@ -944,7 +965,7 @@ function emptyMsg(latest, cat, what) {
   return `No ${what} reported.`;
 }
 
-export default function InventoryTab({ node, state, section, setSection, onBack, onChangeView, onToast, onRefresh, onKilledPids }) {
+export default function InventoryTab({ node, state, section, setSection, onBack, onChangeView, onToast, onRefresh, onKilledPids, onPivot }) {
   const [filter, setFilter] = useState('');
   const [containerOverrides, setContainerOverrides] = useState(() => ({}));
   const [vmOverrides, setVmOverrides] = useState(() => ({}));
@@ -1170,14 +1191,29 @@ export default function InventoryTab({ node, state, section, setSection, onBack,
               }}
             />
           )}
-          {section === 'sockets' && <Sockets latest={latest} filter={filter} />}
+          {section === 'sockets' && <Sockets latest={latest} filter={filter} onPivot={onPivot} />}
           {section === 'storage' && <Storage latest={latest} filter={filter} />}
           {section === 'caps' && <Capabilities caps={caps} />}
         </div>
       </Box>
 
-      {/* Container Action Confirmation Modal */}
-      {pendingContainerAction && (
+      {/* Dedicated Container Restart Modal matching Stitch specification */}
+      {pendingContainerAction && pendingContainerAction.action === 'restart' && (
+        <ContainerRestartModal
+          isOpen={true}
+          onClose={() => setPendingContainerAction(null)}
+          nodeId={node.id}
+          nodeHostname={node.hostname}
+          container={pendingContainerAction.container}
+          onSuccess={() => {
+            onRefresh && onRefresh();
+          }}
+          onToast={onToast}
+        />
+      )}
+
+      {/* Container Action Confirmation Modal (for stop / start) */}
+      {pendingContainerAction && pendingContainerAction.action !== 'restart' && (
         <div
           className="modal-back"
           style={{
@@ -1299,8 +1335,23 @@ export default function InventoryTab({ node, state, section, setSection, onBack,
         </div>
       )}
 
-      {/* VM Action Confirmation Modal */}
-      {pendingVmAction && (
+      {/* Dedicated VM Stop Modal matching Stitch specification */}
+      {pendingVmAction && pendingVmAction.action === 'stop' && (
+        <VmStopModal
+          isOpen={true}
+          onClose={() => setPendingVmAction(null)}
+          nodeId={node.id}
+          nodeHostname={node.hostname}
+          vm={pendingVmAction.vm}
+          onSuccess={() => {
+            onRefresh && onRefresh();
+          }}
+          onToast={onToast}
+        />
+      )}
+
+      {/* VM Action Confirmation Modal (for restart / start) */}
+      {pendingVmAction && pendingVmAction.action !== 'stop' && (
         <div
           className="modal-back"
           style={{

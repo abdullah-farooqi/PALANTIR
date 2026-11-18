@@ -107,6 +107,15 @@ test('fleet and operational summaries use their existing backend routes', async 
   );
 });
 
+test('manual telemetry ingest queues the admin fleet refresh endpoint', async (t) => {
+  const calls = mockFetch(t, { status: 'queued', task_id: 'manual-refresh-task' });
+  const result = await api.triggerIngest();
+
+  assert.equal(result.task_id, 'manual-refresh-task');
+  assert.equal(new URL(calls[0].url, 'http://ui.local').pathname, '/api/v1/fleet/refresh');
+  assert.equal(calls[0].options.method, 'POST');
+});
+
 test('fleet telemetry and investigation analysis use their persisted API routes', async (t) => {
   const calls = mockFetch(t, { items: [] });
   await Promise.all([
@@ -127,4 +136,33 @@ test('fleet telemetry and investigation analysis use their persisted API routes'
   assert.equal(urls[2].searchParams.get('include_records'), 'false');
   assert.equal(urls[3].searchParams.get('is_allowlisted'), 'false');
   assert.equal(urls[3].searchParams.get('limit'), '25');
+});
+
+test('PCAP status, manual snapshots, retries, and downloads use authorized API routes', async (t) => {
+  const calls = mockFetch(t, { status: 'queued' });
+  await Promise.all([
+    api.getNodeCaptureStatus(17),
+    api.startNodeCapture(17),
+    api.stopNodeCapture(17),
+    api.captureInvestigationEvidence(31),
+    api.retryInvestigationEvidenceTransfer(31, 12),
+    api.getInvestigationEvidence(31),
+  ]);
+
+  const requests = calls.map(({ url, options }) => ({
+    path: new URL(url, 'http://ui.local').pathname,
+    method: options.method || 'GET',
+  }));
+  assert.deepEqual(requests, [
+    { path: '/api/v1/nodes/17/capture/status', method: 'GET' },
+    { path: '/api/v1/nodes/17/capture/start', method: 'POST' },
+    { path: '/api/v1/nodes/17/capture/stop', method: 'POST' },
+    { path: '/api/v1/investigations/31/evidence/capture', method: 'POST' },
+    { path: '/api/v1/investigations/31/evidence/12/retry', method: 'POST' },
+    { path: '/api/v1/investigations/31/evidence', method: 'GET' },
+  ]);
+  assert.equal(
+    new URL(api.investigationEvidenceDownloadUrl(31, 12), 'http://ui.local').pathname,
+    '/api/v1/investigations/31/evidence/12/download',
+  );
 });

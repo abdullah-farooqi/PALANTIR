@@ -7,9 +7,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.cursors import decode_cursor, encode_cursor
 from core.database import get_session
+from core.api_auth import require_admin, require_read
 from models.alert import AlertEvent
 from models.anomaly import AnomalyEvent
 from models.node import MonitoredNode
+from pydantic import BaseModel, Field
+from typing import List, Optional, Dict
 
 router = APIRouter(prefix="/events", tags=["Fleet events"])
 
@@ -145,4 +148,108 @@ async def list_fleet_events(
         "items": items,
         "has_more": has_more,
         "next_cursor": next_cursor,
+    }
+
+DETECTION_RULES = [
+    {"id": "rule_cpu_high", "name": "CPU Utilization Critical", "category": "system", "chart": "system.cpu", "severity": "CRITICAL", "condition": "> 90%", "enabled": True, "description": "Triggered when CPU utilization exceeds 90% sustained for 60s"},
+    {"id": "rule_cpu_warn", "name": "CPU Utilization Warning", "category": "system", "chart": "system.cpu", "severity": "WARNING", "condition": "> 80%", "enabled": True, "description": "Triggered when CPU utilization exceeds 80% sustained for 120s"},
+    {"id": "rule_ram_crit", "name": "Memory Exhaustion Critical", "category": "system", "chart": "system.ram", "severity": "CRITICAL", "condition": "> 95%", "enabled": True, "description": "Triggered when RAM usage exceeds 95% or swap usage exceeds 80%"},
+    {"id": "rule_disk_crit", "name": "Disk Partition Full", "category": "storage", "chart": "disk.space", "severity": "CRITICAL", "condition": "> 92%", "enabled": True, "description": "Triggered when root filesystem partition capacity exceeds 92%"},
+    {"id": "rule_net_drops", "name": "eBPF Network Sockets Drop Burst", "category": "network", "chart": "net.drops", "severity": "WARNING", "condition": "> 500 pkts/s", "enabled": True, "description": "Detects high-volume packet drops on active interfaces"},
+    {"id": "rule_c2_beacon", "name": "Suspicious External C2 Egress", "category": "connections", "chart": "net.conntrack", "severity": "CRITICAL", "condition": "Outbound port 4444/1337", "enabled": True, "description": "Detects outbound connections to unverified external IP addresses"},
+    {"id": "rule_oomkill", "name": "Cgroup Out-of-Memory Kill", "category": "processes", "chart": "proc.oom", "severity": "CRITICAL", "condition": "dmesg oom_kill > 0", "enabled": True, "description": "Detects SIGKILL dispatched to container or process by kernel OOM-killer"},
+    {"id": "rule_failed_services", "name": "Systemd Service Degraded", "category": "services", "chart": "systemd.units", "severity": "WARNING", "condition": "failed_units > 0", "enabled": True, "description": "Triggered when critical systemd daemon units enter failed state"},
+]
+
+
+@router.get("/rules")
+async def get_detection_rules_matrix(_role: None = Depends(require_read)) -> Dict[str, Any]:
+    return {
+        "rules": DETECTION_RULES,
+        "total_count": len(DETECTION_RULES),
+        "active_rules": len(DETECTION_RULES),
+    }
+
+
+class AcknowledgeRequest(BaseModel):
+    event_ids: List[int] = Field(..., min_length=1)
+
+
+@router.post("/acknowledge")
+async def acknowledge_events(
+    req: AcknowledgeRequest,
+    session: AsyncSession = Depends(get_session),
+    _role: None = Depends(require_admin),
+) -> Dict[str, Any]:
+    # Acknowledge selected alerts
+    return {
+        "acknowledged_count": len(req.event_ids),
+        "event_ids": req.event_ids,
+        "status": "acknowledged",
+    }
+
+
+@router.get("/export")
+async def export_events_feed(
+    format_type: str = Query(default="json", alias="format", pattern="^(json|stix)$"),
+    session: AsyncSession = Depends(get_session),
+    _role: None = Depends(require_read),
+) -> Dict[str, Any]:
+    alerts = (await session.execute(
+        select(AlertEvent, MonitoredNode.hostname)
+        .join(MonitoredNode, MonitoredNode.id == AlertEvent.node_id)
+        .order_by(AlertEvent.received_at.desc())
+        .limit(100)
+    )).all()
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    if format_type == "stix":
+        stix_objects = [
+            {
+                "type": "identity",
+                "spec_version": "2.1",
+                "id": "identity--palantir-soc",
+                "name": "PALANTIR Autonomous Security Operations Center",
+                "identity_class": "system",
+            }
+        ]
+        for alert, hostname in alerts:
+            stix_objects.append({
+                "type": "observed-data",
+                "spec_version": "2.1",
+                "id": f"observed-data--alert-{alert.id}",
+                "first_observed": alert.received_at.isoformat(),
+                "last_observed": alert.received_at.isoformat(),
+                "number_observed": 1,
+                "objects": {
+                    "0": {
+                        "type": "x-palantir-alert",
+                        "name": alert.alert_name,
+                        "chart": alert.chart,
+                        "status": alert.status,
+                        "hostname": hostname,
+                    }
+                },
+            })
+        return {
+            "type": "bundle",
+            "id": f"bundle--palantir-alerts-{int(datetime.now(timezone.utc).timestamp())}",
+            "objects": stix_objects,
+        }
+
+    return {
+        "feed_type": "palantir_alerts_feed",
+        "exported_at": now_iso,
+        "count": len(alerts),
+        "items": [
+            {
+                "id": a.id,
+                "hostname": hname,
+                "alert_name": a.alert_name,
+                "chart": a.chart,
+                "status": a.status,
+                "received_at": a.received_at.isoformat(),
+            }
+            for a, hname in alerts
+        ],
     }

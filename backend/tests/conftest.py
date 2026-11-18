@@ -39,3 +39,15 @@ def initialize_test_database():
             # If DB is not available (e.g. unit tests without DB), allow tests to proceed or fail gracefully
             pass
 
+    migration_path = Path(__file__).resolve().parents[2] / "sql" / "migrations" / "20261116_pcap_manifest_contract.sql"
+    if migration_path.exists():
+        try:
+            with sync_engine.begin() as conn:
+                for statement in migration_path.read_text().split(";"):
+                    statement = statement.strip()
+                    if statement:
+                        conn.execute(text(statement))
+        except Exception:
+            # Keep database-free unit tests runnable; DB-backed cases report the actual failure.
+            pass
+

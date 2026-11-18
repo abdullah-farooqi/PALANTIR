@@ -247,11 +247,17 @@ CREATE TABLE IF NOT EXISTS investigation_evidence (
     node_id                  INT NOT NULL REFERENCES monitored_nodes(id) ON DELETE CASCADE,
     evidence_type            VARCHAR(50) NOT NULL DEFAULT 'pcap_collection',
     capture_snapshot_id      VARCHAR(32),
+    capture_snapshot_created_at TIMESTAMPTZ,
+    capture_trigger_type     VARCHAR(16),
     collector_file_id        VARCHAR(255),
     file_name                VARCHAR(512),
     storage_key              VARCHAR(1024),
     size_bytes               BIGINT,
+    collector_size_bytes     BIGINT,
     original_size_bytes      BIGINT,
+    capture_interface        VARCHAR(256),
+    snaplen                  INT,
+    packet_count             BIGINT,
     capture_started_at       TIMESTAMPTZ,
     capture_finished_at      TIMESTAMPTZ,
     duration_seconds         INT,
@@ -259,14 +265,30 @@ CREATE TABLE IF NOT EXISTS investigation_evidence (
     uploaded_at              TIMESTAMPTZ,
     upload_started_at        TIMESTAMPTZ,
     sha256                   VARCHAR(64),
+    collector_sha256         VARCHAR(64),
+    hash_status              VARCHAR(16),
     compression              VARCHAR(16),
     status                   VARCHAR(16) NOT NULL DEFAULT 'queued'
         CHECK (status IN ('queued', 'uploading', 'complete', 'failed', 'unavailable')),
     error_message            TEXT,
     CONSTRAINT uq_inv_evidence_collector_file UNIQUE (investigation_id, collector_file_id),
-    CONSTRAINT ck_investigation_evidence_size_nonnegative CHECK (size_bytes IS NULL OR size_bytes >= 0)
+    CONSTRAINT ck_investigation_evidence_size_nonnegative CHECK (size_bytes IS NULL OR size_bytes >= 0),
+    CONSTRAINT ck_investigation_evidence_collector_size_nonnegative CHECK (collector_size_bytes IS NULL OR collector_size_bytes >= 0),
+    CONSTRAINT ck_investigation_evidence_original_size_nonnegative CHECK (original_size_bytes IS NULL OR original_size_bytes >= 0),
+    CONSTRAINT ck_investigation_evidence_packet_count_nonnegative CHECK (packet_count IS NULL OR packet_count >= 0),
+    CONSTRAINT ck_investigation_evidence_snaplen CHECK (snaplen IS NULL OR snaplen BETWEEN 1 AND 262144),
+    CONSTRAINT ck_investigation_evidence_trigger_type CHECK (capture_trigger_type IS NULL OR capture_trigger_type IN ('manual', 'alert', 'anomaly')),
+    CONSTRAINT ck_investigation_evidence_hash_status CHECK (hash_status IS NULL OR hash_status IN ('pending', 'complete', 'unavailable', 'queue_full'))
 );
 ALTER TABLE investigation_evidence ADD COLUMN IF NOT EXISTS duration_seconds INT;
+ALTER TABLE investigation_evidence ADD COLUMN IF NOT EXISTS capture_snapshot_created_at TIMESTAMPTZ;
+ALTER TABLE investigation_evidence ADD COLUMN IF NOT EXISTS capture_trigger_type VARCHAR(16);
+ALTER TABLE investigation_evidence ADD COLUMN IF NOT EXISTS collector_size_bytes BIGINT;
+ALTER TABLE investigation_evidence ADD COLUMN IF NOT EXISTS capture_interface VARCHAR(256);
+ALTER TABLE investigation_evidence ADD COLUMN IF NOT EXISTS snaplen INT;
+ALTER TABLE investigation_evidence ADD COLUMN IF NOT EXISTS packet_count BIGINT;
+ALTER TABLE investigation_evidence ADD COLUMN IF NOT EXISTS collector_sha256 VARCHAR(64);
+ALTER TABLE investigation_evidence ADD COLUMN IF NOT EXISTS hash_status VARCHAR(16);
 CREATE INDEX IF NOT EXISTS idx_investigation_evidence_inv
     ON investigation_evidence (investigation_id);
 CREATE INDEX IF NOT EXISTS idx_investigation_evidence_node
@@ -429,6 +451,14 @@ CREATE TABLE IF NOT EXISTS pcap_analysis_runs (
     error_step          VARCHAR(64),
     rollback_started_at TIMESTAMPTZ,
     rollback_completed_at TIMESTAMPTZ,
+    step_durations      JSONB NOT NULL DEFAULT '{}',
+    step_progress       JSONB DEFAULT NULL,
+    rollback_id         VARCHAR(64) DEFAULT NULL,
+    exit_code           VARCHAR(32) DEFAULT NULL,
+    purged_scratch_files INT DEFAULT 0,
+    snaplen             INT DEFAULT 65535,
+    is_truncated        BOOLEAN NOT NULL DEFAULT FALSE,
+    engine_versions     JSONB NOT NULL DEFAULT '{"suricata": "7.0.2", "zeek": "6.0.4", "ruleset": "v4.12", "engine_version": "v2.4"}',
     CONSTRAINT ck_pcap_analysis_runs_evidence_inv
         CHECK (evidence_id IS NOT NULL AND investigation_id IS NOT NULL)
 );
@@ -527,6 +557,10 @@ CREATE TABLE IF NOT EXISTS pcap_artifacts (
     content_type        VARCHAR(255),
     content_length      BIGINT CHECK (content_length IS NULL OR content_length >= 0),
     sha256              VARCHAR(64),
+    md5                 VARCHAR(32),
+    source_uri          VARCHAR(1024),
+    source_protocol     VARCHAR(32),
+    expires_at          TIMESTAMPTZ,
     storage_key         VARCHAR(1024),
     storage_prefix      VARCHAR(255),
     metadata            JSONB NOT NULL DEFAULT '{}',
@@ -631,6 +665,8 @@ CREATE TABLE IF NOT EXISTS pcap_severity_scores (
     ioc_risk_score      NUMERIC(3, 1) DEFAULT 0.0,
     anomaly_score       NUMERIC(3, 1) DEFAULT 0.0,
     factors             JSONB NOT NULL DEFAULT '{}',
+    top_risk_factors    JSONB NOT NULL DEFAULT '[]',
+    composite_weights   JSONB NOT NULL DEFAULT '{}',
     calculated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT ck_pcap_severity_overall CHECK (overall_score >= 0.0 AND overall_score <= 10.0),
     CONSTRAINT ck_pcap_severity_level CHECK (overall_severity IN ('low', 'medium', 'high', 'critical'))

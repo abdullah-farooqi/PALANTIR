@@ -6,7 +6,7 @@ from sqlalchemy import select
 from core.config import settings
 from models.anomaly import AnomalyEvent
 from models.metric import MetricSnapshot
-from services.investigations import enqueue_investigation_async
+from services.investigations import enqueue_investigation_async, request_pcap_evidence_for_investigation
 
 logger = logging.getLogger(__name__)
 
@@ -130,11 +130,18 @@ class AnomalyService:
                 if hasattr(res, "__await__"):
                     await res
             try:
-                _, dispatched = await enqueue_investigation_async(
+                investigation, dispatched = await enqueue_investigation_async(
                     session, node_id=node_id, trigger_type="anomaly", trigger_id=event.id,
                 )
                 if not dispatched:
                     logger.warning("Investigation dispatch failed for anomaly event %s", event.id)
+                else:
+                    await request_pcap_evidence_for_investigation(
+                        session,
+                        node_id=node_id,
+                        investigation_id=investigation.id,
+                        trigger_type="anomaly",
+                    )
             except Exception:
                 logger.exception("Could not enqueue an investigation for anomaly event %s", event.id)
         except Exception as exc:

@@ -50,7 +50,7 @@ function StatusDot({ tone = 'ok' }) {
 
 export function TopBar({
   view, setView, fleet, refreshMs, setRefreshMs, refreshing, onRefresh,
-  query, setQuery, node, children,
+  query, setQuery, node, onOpenCommandPalette, children,
 }) {
   const [collapsed, setCollapsed] = useState(false);
   const [mobileOpen, setMobileOpen] = useState(false);
@@ -130,11 +130,36 @@ export function TopBar({
             {selectedHostView && node && <><button onClick={() => navigate('fleet')}>Hosts</button><span className="shell-crumb-sep">/</span><strong>{node.hostname}</strong><span className="shell-crumb-sep">/</span></>}
             <strong>{getPage(view)}</strong>
           </div>
-          <label className="shell-global-search">
+          <div
+            className="shell-global-search"
+            onClick={(e) => {
+              if (onOpenCommandPalette && e.target.tagName !== 'INPUT') {
+                onOpenCommandPalette();
+              }
+            }}
+          >
             <Search size={15} aria-hidden="true" />
-            <input className="app-search-input" value={query || ''} onChange={(event) => setQuery(event.target.value)} placeholder="Search hosts" aria-label="Search hosts by name, address, or operating system" />
-            <kbd>/</kbd>
-          </label>
+            <input
+              className="app-search-input"
+              value={query || ''}
+              onChange={(event) => setQuery(event.target.value)}
+              onFocus={() => {
+                if (onOpenCommandPalette) onOpenCommandPalette();
+              }}
+              placeholder="Search hosts or commands…"
+              aria-label="Search hosts or press Ctrl+K for command palette"
+            />
+            <kbd
+              onClick={(e) => {
+                e.stopPropagation();
+                onOpenCommandPalette && onOpenCommandPalette();
+              }}
+              style={{ cursor: 'pointer' }}
+              title="Open command palette (Ctrl+K)"
+            >
+              Ctrl+K
+            </kbd>
+          </div>
           <div className="shell-topbar-right">
             <span className="shell-freshness" title={summary?.latest_metric_at ? `Latest metric collected ${summary.latest_metric_at}` : 'No metric has been collected yet'}>
               <StatusDot tone="unknown" />

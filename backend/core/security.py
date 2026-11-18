@@ -32,6 +32,23 @@ FORBIDDEN_LOOPBACK_PORTS = {
 }
 
 
+def redact_sensitive_message(value: str | None) -> str | None:
+    """Remove embedded URL credentials, auth tokens, and absolute paths from API errors."""
+    if not value:
+        return None
+    message = str(value)
+    message = re.sub(r"(?i)(https?://)[^/@\s]+(?::[^/@\s]*)?@", r"\1[redacted]@", message)
+    message = re.sub(
+        r"(?i)((?:authorization|(?:x-)?agent[_ -]?token|access[_ -]?token|token)\s*[:=]\s*)"
+        r"(?:bearer\s+)?[^&,\s]+",
+        r"\1[redacted]",
+        message,
+    )
+    message = re.sub(r"(?<![:\w/])(?:[A-Za-z]:)?/(?!/)(?:[^/\s]+/)*[^/\s]*", "[path]", message)
+    message = re.sub(r"(?i)(?<![\w])(?:[A-Z]:\\)(?:[^\\\s]+\\)*[^\\\s]*", "[path]", message)
+    return message[:1000]
+
+
 def verify_webhook_secret(secret_header: Optional[str]) -> bool:
     """
     Verifies the X-PALANTIR-Secret webhook header using constant-time comparison

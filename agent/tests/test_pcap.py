@@ -35,6 +35,15 @@ def test_bpf_filter_excludes_configured_expression_without_ssh_default():
     assert build_bpf_filter("") == ""
 
 
+def test_tcpdump_command_uses_numeric_file_size_limit(tmp_path):
+    manager = manager_for(tmp_path, max_size_mb=10)
+
+    command = manager._build_tcpdump_command(tmp_path / "capture.pcap")
+
+    assert command[command.index("-C") + 1] == "10"
+    assert "10M" not in command
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [("snaplen", 32), ("rotation_seconds", 1), ("max_files", 0), ("max_size_mb", 0), ("compression", "zip")],
@@ -97,6 +106,27 @@ def test_snapshot_pin_survives_manager_restart_and_can_be_released(tmp_path):
     assert restarted.files(snapshot_id) == []
 
 
+def test_snapshot_manifest_preserves_the_requested_trigger(tmp_path, monkeypatch):
+    manager = manager_for(tmp_path)
+
+    class SnapshotEvent:
+        def clear(self):
+            pass
+
+        def set(self):
+            pass
+
+        def wait(self, timeout=None):
+            manager._snapshot_result = {"snapshot_id": "a" * 32, "files": []}
+            return True
+
+    manager._snapshot_completed = SnapshotEvent()
+    manager._snapshot_requested = SnapshotEvent()
+    monkeypatch.setattr(manager, "status", lambda: {"running": True})
+
+    assert manager.snapshot(trigger_type="alert")["trigger_type"] == "alert"
+
+
 def test_active_snapshot_count_is_bounded(tmp_path):
     manager = manager_for(tmp_path, max_active_snapshots=1)
     expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
@@ -112,11 +142,17 @@ def test_gzip_compression_keeps_the_original_capture_as_a_downloadable_artifact(
     capture.write_bytes(payload)
     manager._register_closed_files(capture, datetime.now(timezone.utc) - timedelta(minutes=1))
     manager._compress_one(capture)
+    manager._hash_queue.join()
 
     path, media_type = manager.file_path(filename)
     assert media_type == "application/gzip"
     with gzip.open(path, "rb") as stream:
         assert stream.read() == payload
+    item = manager.files()[0]
+    assert item["size_bytes"] == path.stat().st_size
+    assert item["original_size_bytes"] == len(payload)
+    assert item["sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
+    assert item["hash_status"] == "complete"
 
 
 def test_compressing_files_advertise_the_pending_compression_format(tmp_path):

@@ -1,5 +1,4 @@
 import logging
-import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import uuid4
@@ -8,6 +7,7 @@ from sqlalchemy import select
 
 from core.config import settings
 from integrations.agent.client import AgentCollectorClient
+from integrations.agent.pcap_contract import validate_pcap_snapshot
 from models.alert import AlertEvent
 from models.anomaly import AnomalyEvent
 from models.investigation import AgentInvestigation
@@ -95,18 +95,6 @@ async def enqueue_investigation_async(
     return investigation, True
 
 
-def _parse_capture_time(value: Any) -> datetime | None:
-    if not isinstance(value, str):
-        return None
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        return None
-    return parsed.astimezone(timezone.utc)
-
-
 async def _enqueue_pcap_transfer(evidence_id: int) -> bool:
     try:
         from workers.pcap_tasks import transfer_pcap_artifact
@@ -121,104 +109,57 @@ async def _enqueue_pcap_transfer(evidence_id: int) -> bool:
         return False
 
 
-async def request_pcap_evidence_for_alert(
+async def _record_pcap_snapshot(
     session,
-    event_id: int,
+    *,
     node_id: int,
     investigation_id: int,
+    trigger_type: str,
+    snapshot: Any,
+    client: AgentCollectorClient,
+    alert_event_id: int | None = None,
 ) -> int:
-    """Pin the collector's current ring for an alert, then queue file transfers.
-
-    Snapshot creation only closes the current capture segment and returns metadata;
-    potentially large transfers happen in Celery. Failures are recorded against the
-    investigation and do not change the alert webhook result.
-    """
-    event = (await _execute(session, select(AlertEvent).where(
-        AlertEvent.id == event_id,
-        AlertEvent.node_id == node_id,
-    ))).scalar_one_or_none()
-    if event is None or event.status not in {"WARNING", "CRITICAL"}:
-        return 0
-
-    if settings.PCAP_ALERT_COOLDOWN_SECONDS > 0:
-        previous = (await _execute(session, select(AlertEvent).where(
-            AlertEvent.node_id == node_id,
-            AlertEvent.alert_name == event.alert_name,
-            AlertEvent.chart == event.chart,
-            AlertEvent.id < event.id,
-        ).order_by(AlertEvent.received_at.desc(), AlertEvent.id.desc()).limit(1))).scalar_one_or_none()
-        if (
-            previous is not None
-            and previous.status == event.status
-            and previous.received_at is not None
-            and event.received_at is not None
-            and event.received_at - previous.received_at < timedelta(seconds=settings.PCAP_ALERT_COOLDOWN_SECONDS)
-        ):
-            session.add(InvestigationEvidence(
-                investigation_id=investigation_id,
-                alert_event_id=event_id,
-                node_id=node_id,
-                evidence_type="pcap_collection",
-                captured_at=datetime.now(timezone.utc),
-                status="unavailable",
-                error_message="Capture skipped by the per-alert cooldown; this alert repeated within the active episode.",
-            ))
-            await _maybe_await(session.commit())
-            return 0
-
-    node = (await _execute(session, select(MonitoredNode).where(MonitoredNode.id == node_id))).scalar_one_or_none()
-    if node is None or not node.collector_url:
-        session.add(InvestigationEvidence(
-            investigation_id=investigation_id,
-            alert_event_id=event_id,
-            node_id=node_id,
-            evidence_type="pcap_collection",
-            captured_at=datetime.now(timezone.utc),
-            status="unavailable",
-            error_message="The affected node has no active collector URL.",
-        ))
-        await _maybe_await(session.commit())
-        return 0
-
-    client = AgentCollectorClient(node.collector_url, timeout=min(settings.PCAP_TRANSFER_TIMEOUT_SECONDS, 30.0))
+    """Validate and persist a complete manifest before scheduling any file transfer."""
+    raw_snapshot_id = snapshot.get("snapshot_id") if isinstance(snapshot, dict) else None
+    valid_snapshot_id = (
+        raw_snapshot_id
+        if isinstance(raw_snapshot_id, str) and len(raw_snapshot_id) == 32
+        and all(char in "0123456789abcdef" for char in raw_snapshot_id)
+        else None
+    )
     try:
-        snapshot = await client.create_pcap_snapshot(trigger_type="alert")
-    except Exception as exc:
-        logger.warning("Could not snapshot PCAP evidence for alert %s: %s", event_id, exc)
+        manifest = validate_pcap_snapshot(snapshot, trigger_type)
+    except Exception:
+        logger.warning("Collector returned an invalid PCAP snapshot manifest for investigation %s", investigation_id, exc_info=True)
         session.add(InvestigationEvidence(
             investigation_id=investigation_id,
-            alert_event_id=event_id,
+            alert_event_id=alert_event_id,
             node_id=node_id,
             evidence_type="pcap_collection",
-            captured_at=datetime.now(timezone.utc),
-            status="failed",
-            error_message=f"Collector snapshot failed: {str(exc)[:400]}",
-        ))
-        await _maybe_await(session.commit())
-        return 0
-
-    snapshot_id = snapshot.get("snapshot_id")
-    if not isinstance(snapshot_id, str) or not re.fullmatch(r"[0-9a-f]{32}", snapshot_id):
-        session.add(InvestigationEvidence(
-            investigation_id=investigation_id,
-            alert_event_id=event_id,
-            node_id=node_id,
-            evidence_type="pcap_collection",
+            capture_snapshot_id=valid_snapshot_id,
+            capture_trigger_type=trigger_type,
             captured_at=datetime.now(timezone.utc),
             status="failed",
             error_message="Collector returned an invalid PCAP snapshot manifest.",
         ))
         await _maybe_await(session.commit())
+        if valid_snapshot_id:
+            try:
+                await client.release_pcap_snapshot(valid_snapshot_id)
+            except Exception:
+                logger.warning("Could not release invalid PCAP snapshot %s", valid_snapshot_id, exc_info=True)
         return 0
 
-    files = snapshot.get("files") if isinstance(snapshot.get("files"), list) else []
-    if not files:
+    snapshot_id = manifest.snapshot_id
+    if not manifest.files:
         session.add(InvestigationEvidence(
             investigation_id=investigation_id,
-            alert_event_id=event_id,
+            alert_event_id=alert_event_id,
             node_id=node_id,
             evidence_type="pcap_collection",
             capture_snapshot_id=snapshot_id,
+            capture_snapshot_created_at=manifest.created_at,
+            capture_trigger_type=trigger_type,
             captured_at=datetime.now(timezone.utc),
             status="unavailable",
             error_message="The collector snapshot contained no finalized PCAP files.",
@@ -231,35 +172,38 @@ async def request_pcap_evidence_for_alert(
         return 0
 
     evidence_rows: list[InvestigationEvidence] = []
-    for item in files:
-        if not isinstance(item, dict):
-            continue
-        file_id = item.get("file_id")
-        if not isinstance(file_id, str) or not re.fullmatch(r"capture_\d{8}T\d{6}Z_[0-9a-f]{12}\.pcap\d*", file_id):
-            continue
+    for item in manifest.files:
         existing = (await _execute(session, select(InvestigationEvidence).where(
             InvestigationEvidence.investigation_id == investigation_id,
-            InvestigationEvidence.collector_file_id == file_id,
+            InvestigationEvidence.collector_file_id == item.file_id,
         ))).scalar_one_or_none()
         if existing is not None:
             continue
-        filename = item.get("filename")
-        filename = filename.rsplit("/", 1)[-1] if isinstance(filename, str) else file_id
+        filename = item.filename or item.file_id + {
+            "none": "", "gzip": ".gz", "zstd": ".zst",
+        }[item.compression]
         evidence = InvestigationEvidence(
             investigation_id=investigation_id,
-            alert_event_id=event_id,
+            alert_event_id=alert_event_id,
             node_id=node_id,
             evidence_type="pcap_collection",
             capture_snapshot_id=snapshot_id,
-            collector_file_id=file_id,
+            capture_snapshot_created_at=manifest.created_at,
+            capture_trigger_type=trigger_type,
+            collector_file_id=item.file_id,
             file_name=filename[:512],
-            size_bytes=item.get("size_bytes") if isinstance(item.get("size_bytes"), int) else None,
-            original_size_bytes=item.get("original_size_bytes") if isinstance(item.get("original_size_bytes"), int) else None,
-            capture_started_at=_parse_capture_time(item.get("capture_started_at")),
-            capture_finished_at=_parse_capture_time(item.get("capture_finished_at")),
-            duration_seconds=item.get("duration_seconds") if isinstance(item.get("duration_seconds"), int) else None,
+            collector_size_bytes=item.size_bytes,
+            original_size_bytes=item.original_size_bytes,
+            capture_interface=item.interface,
+            snaplen=item.snaplen,
+            packet_count=item.packet_count,
+            capture_started_at=item.capture_started_at,
+            capture_finished_at=item.capture_finished_at,
+            duration_seconds=item.duration_seconds,
             captured_at=datetime.now(timezone.utc),
-            compression=str(item.get("compression") or "none")[:16],
+            compression=item.compression,
+            collector_sha256=item.sha256,
+            hash_status=item.hash_status,
             status="queued",
         )
         session.add(evidence)
@@ -292,3 +236,105 @@ async def request_pcap_evidence_for_alert(
         except Exception:
             logger.warning("Could not release unqueued PCAP snapshot %s", snapshot_id, exc_info=True)
     return queued
+
+
+async def request_pcap_evidence_for_investigation(
+    session,
+    *,
+    node_id: int,
+    investigation_id: int,
+    trigger_type: str = "manual",
+    alert_event_id: int | None = None,
+) -> int:
+    """Take a collector snapshot, retain its validated manifest, and queue transfers."""
+    node = (await _execute(session, select(MonitoredNode).where(MonitoredNode.id == node_id))).scalar_one_or_none()
+    if node is None or not node.collector_url:
+        session.add(InvestigationEvidence(
+            investigation_id=investigation_id,
+            alert_event_id=alert_event_id,
+            node_id=node_id,
+            evidence_type="pcap_collection",
+            capture_trigger_type=trigger_type,
+            captured_at=datetime.now(timezone.utc),
+            status="unavailable",
+            error_message="The affected node has no active collector URL.",
+        ))
+        await _maybe_await(session.commit())
+        return 0
+
+    client = AgentCollectorClient(node.collector_url, timeout=min(settings.PCAP_TRANSFER_TIMEOUT_SECONDS, 30.0))
+    try:
+        snapshot = await client.create_pcap_snapshot(trigger_type=trigger_type)
+    except Exception as exc:
+        logger.warning("Could not snapshot PCAP evidence for investigation %s: %s", investigation_id, exc)
+        session.add(InvestigationEvidence(
+            investigation_id=investigation_id,
+            alert_event_id=alert_event_id,
+            node_id=node_id,
+            evidence_type="pcap_collection",
+            capture_trigger_type=trigger_type,
+            captured_at=datetime.now(timezone.utc),
+            status="failed",
+            error_message=f"Collector snapshot failed: {str(exc)[:400]}",
+        ))
+        await _maybe_await(session.commit())
+        return 0
+    return await _record_pcap_snapshot(
+        session,
+        node_id=node_id,
+        investigation_id=investigation_id,
+        trigger_type=trigger_type,
+        snapshot=snapshot,
+        client=client,
+        alert_event_id=alert_event_id,
+    )
+
+
+async def request_pcap_evidence_for_alert(
+    session,
+    event_id: int,
+    node_id: int,
+    investigation_id: int,
+) -> int:
+    """Pin an alert capture unless the event is outside severity or cooldown policy."""
+    event = (await _execute(session, select(AlertEvent).where(
+        AlertEvent.id == event_id,
+        AlertEvent.node_id == node_id,
+    ))).scalar_one_or_none()
+    if event is None or event.status not in {"WARNING", "CRITICAL"}:
+        return 0
+
+    if settings.PCAP_ALERT_COOLDOWN_SECONDS > 0:
+        previous = (await _execute(session, select(AlertEvent).where(
+            AlertEvent.node_id == node_id,
+            AlertEvent.alert_name == event.alert_name,
+            AlertEvent.chart == event.chart,
+            AlertEvent.id < event.id,
+        ).order_by(AlertEvent.received_at.desc(), AlertEvent.id.desc()).limit(1))).scalar_one_or_none()
+        if (
+            previous is not None
+            and previous.status == event.status
+            and previous.received_at is not None
+            and event.received_at is not None
+            and event.received_at - previous.received_at < timedelta(seconds=settings.PCAP_ALERT_COOLDOWN_SECONDS)
+        ):
+            session.add(InvestigationEvidence(
+                investigation_id=investigation_id,
+                alert_event_id=event_id,
+                node_id=node_id,
+                evidence_type="pcap_collection",
+                capture_trigger_type="alert",
+                captured_at=datetime.now(timezone.utc),
+                status="unavailable",
+                error_message="Capture skipped by the per-alert cooldown; this alert repeated within the active episode.",
+            ))
+            await _maybe_await(session.commit())
+            return 0
+
+    return await request_pcap_evidence_for_investigation(
+        session,
+        node_id=node_id,
+        investigation_id=investigation_id,
+        trigger_type="alert",
+        alert_event_id=event_id,
+    )

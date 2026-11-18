@@ -12,6 +12,7 @@ from sqlalchemy import func, select, text
 from core.config import settings
 from core.database import get_sync_session
 from integrations.agent.client import AgentCollectorClient
+from integrations.agent.pcap_contract import PcapFileManifest, validate_pcap_file
 from models.investigation_evidence import InvestigationEvidence
 from models.node import MonitoredNode
 from workers.celery_app import celery_app
@@ -19,6 +20,55 @@ from workers.celery_app import celery_app
 logger = logging.getLogger(__name__)
 _UPLOAD_LEASE = timedelta(minutes=10)
 _PCAP_STORAGE_LOCK = 739104221
+
+
+async def _get_source_manifest(
+    client: AgentCollectorClient,
+    file_id: str,
+    snapshot_id: str | None,
+) -> PcapFileManifest:
+    payload = await client.get_pcap_files(snapshot_id)
+    files = payload.get("files")
+    if not isinstance(files, list):
+        raise RuntimeError("Collector returned an invalid PCAP file manifest")
+    matches = [item for item in files if isinstance(item, dict) and item.get("file_id") == file_id]
+    if not matches and snapshot_id:
+        payload = await client.get_pcap_files()
+        files = payload.get("files")
+        if not isinstance(files, list):
+            raise RuntimeError("Collector returned an invalid PCAP file manifest")
+        matches = [item for item in files if isinstance(item, dict) and item.get("file_id") == file_id]
+    if len(matches) != 1:
+        raise RuntimeError("Collector no longer lists the requested PCAP artifact")
+    try:
+        return validate_pcap_file(matches[0], legacy=payload.get("schema_version") == 1)
+    except Exception as exc:
+        raise RuntimeError("Collector returned invalid PCAP artifact metadata") from exc
+
+
+def _verify_transfer(manifest_item: PcapFileManifest, content_type: str, size_bytes: int, path: Path) -> tuple[str, str, str]:
+    """Check transferred content against the current collector manifest."""
+    if manifest_item.status != "ready":
+        raise RuntimeError("PCAP artifact is still being compressed by the collector")
+    if manifest_item.hash_status != "complete" or not manifest_item.sha256:
+        raise RuntimeError("Collector has not produced a complete PCAP SHA-256 digest")
+    content_types = {
+        "application/zstd": ("zstd", ".pcap.zst"),
+        "application/gzip": ("gzip", ".pcap.gz"),
+        "application/vnd.tcpdump.pcap": ("none", ".pcap"),
+    }
+    actual_format = content_types.get(content_type)
+    if actual_format is None:
+        raise RuntimeError(f"Collector returned an unsupported PCAP content type: {content_type}")
+    compression, suffix = actual_format
+    if compression != manifest_item.compression:
+        raise RuntimeError("Collector content type does not match the PCAP manifest compression")
+    if size_bytes != manifest_item.size_bytes:
+        raise RuntimeError("PCAP transfer size does not match the collector manifest")
+    digest = _sha256(path)
+    if digest != manifest_item.sha256:
+        raise RuntimeError("PCAP transfer SHA-256 does not match the collector manifest")
+    return compression, suffix, digest
 
 
 def _sha256(path: Path) -> str:
@@ -121,7 +171,7 @@ def transfer_pcap_artifact(self, evidence_id: int):
         ).scalar_one()
         if row.status == "uploading":
             used_bytes -= row.size_bytes or 0
-        reserve_bytes = row.size_bytes or settings.PCAP_MAX_UPLOAD_MB * 1024 * 1024
+        reserve_bytes = row.size_bytes or row.collector_size_bytes or settings.PCAP_MAX_UPLOAD_MB * 1024 * 1024
         storage_limit = settings.PCAP_EVIDENCE_STORAGE_LIMIT_GB * 1024**3
         if used_bytes + reserve_bytes > storage_limit:
             row.status = "failed"
@@ -143,10 +193,15 @@ def transfer_pcap_artifact(self, evidence_id: int):
 
     directory = settings.PCAP_STORAGE_DIR / str(node_id) / str(investigation_id)
     partial = directory / f"evidence-{evidence_id}.partial"
+    destination: Path | None = None
     try:
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        client = AgentCollectorClient(collector_url)
+        manifest_item = asyncio.run(_get_source_manifest(client, file_id, snapshot_id))
+        if manifest_item.size_bytes > settings.PCAP_MAX_UPLOAD_MB * 1024 * 1024:
+            raise RuntimeError("PCAP file exceeds the configured upload limit")
         transfer = asyncio.run(
-            AgentCollectorClient(collector_url).download_pcap_file(
+            client.download_pcap_file(
                 file_id,
                 partial,
                 max_bytes=settings.PCAP_MAX_UPLOAD_MB * 1024 * 1024,
@@ -155,17 +210,13 @@ def transfer_pcap_artifact(self, evidence_id: int):
         )
         if transfer["size_bytes"] <= 0:
             raise RuntimeError("Collector returned an empty PCAP artifact")
-        content_types = {
-            "application/zstd": ("zst", ".pcap.zst"),
-            "application/gzip": ("gz", ".pcap.gz"),
-            "application/vnd.tcpdump.pcap": ("none", ".pcap"),
-        }
-        actual_format = content_types.get(transfer["content_type"])
-        if actual_format is None:
-            raise RuntimeError(f"Collector returned an unsupported PCAP content type: {transfer['content_type']}")
-        compression, suffix = actual_format
+        compression, suffix, digest = _verify_transfer(
+            manifest_item,
+            transfer["content_type"],
+            transfer["size_bytes"],
+            partial,
+        )
         destination = directory / f"evidence-{evidence_id}{suffix}"
-        digest = _sha256(partial)
         os.replace(partial, destination)
         storage_key = destination.relative_to(settings.PCAP_STORAGE_DIR).as_posix()
         with get_sync_session() as session:
@@ -178,9 +229,18 @@ def transfer_pcap_artifact(self, evidence_id: int):
             row.storage_key = storage_key
             row.size_bytes = transfer["size_bytes"]
             row.sha256 = digest
+            row.collector_size_bytes = manifest_item.size_bytes
+            row.original_size_bytes = manifest_item.original_size_bytes
+            row.capture_interface = manifest_item.interface
+            row.snaplen = manifest_item.snaplen
+            row.packet_count = manifest_item.packet_count
+            row.capture_started_at = manifest_item.capture_started_at
+            row.capture_finished_at = manifest_item.capture_finished_at
+            row.duration_seconds = manifest_item.duration_seconds
+            row.collector_sha256 = manifest_item.sha256
+            row.hash_status = manifest_item.hash_status
             row.compression = compression
-            source_name = Path(file_id).name
-            row.file_name = source_name + (".zst" if compression == "zst" else ".gz" if compression == "gz" else "")
+            row.file_name = manifest_item.filename or file_id + suffix
             row.status = "complete"
             row.uploaded_at = datetime.now(timezone.utc)
             row.upload_started_at = None
@@ -195,6 +255,8 @@ def transfer_pcap_artifact(self, evidence_id: int):
         return {"status": "complete", "evidence_id": evidence_id, "size_bytes": transfer["size_bytes"]}
     except Exception as exc:
         partial.unlink(missing_ok=True)
+        if destination is not None:
+            destination.unlink(missing_ok=True)
         retrying = self.request.retries < self.max_retries
         _mark_failed(evidence_id, str(exc), retrying=retrying)
         if not retrying:

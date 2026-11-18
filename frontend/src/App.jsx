@@ -18,6 +18,8 @@ import PcapTab from './components/PcapTab';
 import AgentChatbotTab from './components/AgentChatbotTab';
 import FleetGridTab from './components/FleetGridTab';
 import FleetOverviewTab from './components/FleetOverviewTab';
+import CommandPalette from './components/CommandPalette';
+import PivotForensicDrawer from './components/PivotForensicDrawer';
 
 const read = (k, d) => {
   try {
@@ -53,6 +55,8 @@ function Dashboard() {
   const [toast, setToast] = useState(null);
   const toastTimer = useRef(null);
   const [prevView, setPrevView] = useState('fleet-overview');
+  const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
+  const [pivotDrawer, setPivotDrawer] = useState({ isOpen: false, query: '', type: '' });
   const [killedPids, setKilledPids] = useState(() => new Set());
   const handleKilledPids = useCallback((pids) => {
     if (!pids) return;
@@ -101,6 +105,22 @@ function Dashboard() {
     clearTimeout(toastTimer.current);
     toastTimer.current = setTimeout(() => setToast(null), 4500);
   }, []);
+
+  const openPivot = useCallback((q, type) => {
+    if (!q) return;
+    setPivotDrawer({ isOpen: true, query: String(q), type: type || 'IPv4' });
+  }, []);
+
+  const closePivot = useCallback(() => {
+    setPivotDrawer((prev) => ({ ...prev, isOpen: false }));
+  }, []);
+
+  const handleFilterAllViews = useCallback((qStr) => {
+    setQuery(qStr);
+    setHostFilter('all');
+    navigateShell('fleet');
+    closePivot();
+  }, [navigateShell, closePivot]);
 
   // ---- data -----------------------------------------------------------------
   const fleet = useFleet(refreshMs);
@@ -156,13 +176,18 @@ function Dashboard() {
   // ---- keyboard (Forensic Instrument hotkeys) -----------------------------------
   useEffect(() => {
     function onKey(e) {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
+        e.preventDefault();
+        setCommandPaletteOpen((prev) => !prev);
+        return;
+      }
       if (e.metaKey || e.ctrlKey || e.altKey) return;
       const tag = (e.target && e.target.tagName) || '';
       if (['INPUT', 'TEXTAREA', 'SELECT'].includes(tag)) {
         if (e.key === 'Escape') e.target.blur();
         return;
       }
-      if (showAdd || pendingRemoveNode) return;
+      if (showAdd || pendingRemoveNode || commandPaletteOpen || pivotDrawer.isOpen) return;
       if (e.key === '1') navigateShell('fleet-overview');
       else if (e.key === '2') navigateShell('fleet');
       else if (e.key === '3') navigateShell('events');
@@ -188,7 +213,7 @@ function Dashboard() {
     }
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [nodes, selectedId, range, view, showAdd, pendingRemoveNode, refreshAll, navigateShell, setRange]);
+  }, [nodes, selectedId, range, view, showAdd, pendingRemoveNode, commandPaletteOpen, pivotDrawer.isOpen, refreshAll, navigateShell, setRange]);
 
   // ---- render -------------------------------------------------------------------
   let body;
@@ -221,9 +246,9 @@ function Dashboard() {
       />
     );
   } else if (view === 'fleet-overview') {
-    body = <FleetOverviewTab fleet={fleet} nodes={nodes} query={query} onSelectNode={selectNodeDetail} onChangeView={changeView} onShowHosts={showHosts} onSelectInvestigation={openInvestigation} onAddNode={() => setShowAdd(true)} canWrite={CAN_WRITE} refreshMs={refreshMs} />;
+    body = <FleetOverviewTab fleet={fleet} nodes={nodes} query={query} onSelectNode={selectNodeDetail} onChangeView={changeView} onShowHosts={showHosts} onSelectInvestigation={openInvestigation} onAddNode={() => setShowAdd(true)} canWrite={CAN_WRITE} refreshMs={refreshMs} onPivot={openPivot} />;
   } else if (view === 'pcap') {
-    body = <PcapTab onOpenInvestigations={() => navigateShell('investigations')} refreshMs={refreshMs} />;
+    body = <PcapTab onOpenInvestigations={() => navigateShell('investigations')} refreshMs={refreshMs} onPivot={openPivot} />;
   } else if (view === 'agent') {
     body = <AgentChatbotTab onToast={notify} />;
   } else if (view === 'fleet') {
@@ -238,14 +263,15 @@ function Dashboard() {
         onAddNode={() => setShowAdd(true)}
         onRemoveNode={removeNode}
         CAN_WRITE={CAN_WRITE}
+        onPivot={openPivot}
       />
     );
   } else if (view === 'events') {
-    body = <AlertsTab node={node} state={nodeData} scope={scope} setScope={setScope} onInvestigate={onInvestigate} refreshMs={refreshMs} onBack={goBack} onChangeView={changeView} />;
+    body = <AlertsTab node={node} state={nodeData} scope={scope} setScope={setScope} onInvestigate={onInvestigate} refreshMs={refreshMs} onBack={goBack} onChangeView={changeView} onPivot={openPivot} onToast={notify} />;
   } else if (view === 'logs') {
-    body = <LogsTab node={node} scope={scope} setScope={setScope} refreshMs={refreshMs} onBack={goBack} onChangeView={changeView} />;
+    body = <LogsTab node={node} scope={scope} setScope={setScope} refreshMs={refreshMs} onBack={goBack} onChangeView={changeView} onPivot={openPivot} />;
   } else if (view === 'investigations') {
-    body = <InvestigationsTab node={node} scope={scope} setScope={setScope} refreshMs={refreshMs} focusId={focusInv} onToast={notify} onBack={goBack} onChangeView={changeView} fleet={fleet} />;
+    body = <InvestigationsTab node={node} scope={scope} setScope={setScope} refreshMs={refreshMs} focusId={focusInv} onToast={notify} onBack={goBack} onChangeView={changeView} fleet={fleet} onPivot={openPivot} />;
   } else if (!node) {
     body = (
       <div style={{ textAlign: 'center', padding: '48px 16px', background: '#14171B', border: '1px dashed #262B32', borderRadius: '6px', maxWidth: 640, margin: '40px auto' }}>
@@ -262,11 +288,11 @@ function Dashboard() {
       </div>
     );
   } else if (view === 'overview') {
-    body = <OverviewTab node={node} state={nodeData} range={range} setRange={setRange} onBack={goBack} onChangeView={changeView} onToast={notify} onRefresh={nodeData.refresh} killedPids={killedPids} onKilledPids={handleKilledPids} />;
+    body = <OverviewTab node={node} state={nodeData} range={range} setRange={setRange} onBack={goBack} onChangeView={changeView} onToast={notify} onRefresh={nodeData.refresh} killedPids={killedPids} onKilledPids={handleKilledPids} onPivot={openPivot} />;
   } else if (view === 'inventory') {
-    body = <InventoryTab node={node} state={nodeData} section={section} setSection={setSection} onBack={goBack} onChangeView={changeView} onToast={notify} onRefresh={nodeData.refresh} onKilledPids={handleKilledPids} />;
+    body = <InventoryTab node={node} state={nodeData} section={section} setSection={setSection} onBack={goBack} onChangeView={changeView} onToast={notify} onRefresh={nodeData.refresh} onKilledPids={handleKilledPids} onPivot={openPivot} />;
   } else {
-    body = <OverviewTab node={node} state={nodeData} range={range} setRange={setRange} onBack={goBack} onChangeView={changeView} onToast={notify} onRefresh={nodeData.refresh} killedPids={killedPids} onKilledPids={handleKilledPids} />;
+    body = <OverviewTab node={node} state={nodeData} range={range} setRange={setRange} onBack={goBack} onChangeView={changeView} onToast={notify} onRefresh={nodeData.refresh} killedPids={killedPids} onKilledPids={handleKilledPids} onPivot={openPivot} />;
   }
 
   return (
@@ -282,6 +308,7 @@ function Dashboard() {
         node={node}
         query={query}
         setQuery={setQuery}
+        onOpenCommandPalette={() => setCommandPaletteOpen(true)}
       >
         {nodeData.error && node && nodeData.data && ['overview', 'inventory', 'events'].includes(view) && <ErrorLine warn>{nodeData.error}</ErrorLine>}
         {nodeData.error && node && !nodeData.data && ['overview', 'inventory', 'events'].includes(view) && <ErrorLine>{nodeData.error}</ErrorLine>}
@@ -289,6 +316,48 @@ function Dashboard() {
       </TopBar>
       {showAdd && <AddNodeModal onClose={() => setShowAdd(false)} onCreated={(n) => { setShowAdd(false); setSelectedId(n.id); fleet.refresh(); notify(`registered ${n.hostname}`); }} />}
       
+      <CommandPalette
+        isOpen={commandPaletteOpen}
+        onClose={() => setCommandPaletteOpen(false)}
+        nodes={nodes}
+        onSelectNode={(nodeId) => selectNodeDetail(nodeId)}
+        onChangeView={(v) => navigateShell(v)}
+        onAddNode={() => setShowAdd(true)}
+        onTriggerIngest={async () => {
+          try {
+            const result = await api.triggerIngest();
+            notify(result.task_id ? `Telemetry ingest queued (${result.task_id})` : 'Telemetry ingest queued');
+            fleet.refresh();
+          } catch (err) {
+            notify(err.message, true);
+          }
+        }}
+        onExportAlerts={async () => {
+          try {
+            const res = await api.exportEvents('stix');
+            const blob = new Blob([JSON.stringify(res, null, 2)], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `palantir-alerts-stix-${new Date().toISOString().slice(0, 10)}.json`;
+            a.click();
+            URL.revokeObjectURL(url);
+            notify('STIX 2.1 alert bundle downloaded');
+          } catch (err) {
+            notify(err.message, true);
+          }
+        }}
+      />
+
+      <PivotForensicDrawer
+        isOpen={pivotDrawer.isOpen}
+        onClose={closePivot}
+        initialQuery={pivotDrawer.query}
+        initialType={pivotDrawer.type}
+        onFilterAllViews={handleFilterAllViews}
+        onToast={notify}
+      />
+
       {/* Themed Safe Deactivation Confirmation Modal */}
       {pendingRemoveNode && (
         <div

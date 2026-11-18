@@ -7,7 +7,8 @@ from sqlalchemy import and_, exists, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from core.database import get_session
 from core.api_auth import require_admin, require_node_enrollment, require_read
-from core.security import validate_collector_url
+from core.security import redact_sensitive_message, validate_collector_url
+from integrations.agent.pcap_contract import validate_pcap_file_list
 from models.node import MonitoredNode
 from models.category_status import CategoryCollectionStatus
 from integrations.agent.client import AgentCollectorClient
@@ -384,9 +385,13 @@ async def get_node_capture_status(
     if not node.collector_url:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Node does not have an active collector")
     try:
-        return await AgentCollectorClient(node.collector_url).get_pcap_status()
+        result = await AgentCollectorClient(node.collector_url).get_pcap_status()
+        if isinstance(result, dict) and result.get("last_error") is not None:
+            result["last_error"] = redact_sensitive_message(str(result["last_error"]))
+        return result
     except Exception as exc:
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Failed to read capture status: {exc}") from exc
+        detail = redact_sensitive_message(f"Failed to read capture status: {exc}")
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=detail) from exc
 
 
 @router.get("/{node_id}/capture/files")
@@ -402,9 +407,14 @@ async def get_node_capture_files(
     if not node.collector_url:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Node does not have an active collector")
     try:
-        return await AgentCollectorClient(node.collector_url).get_pcap_files(snapshot_id)
+        payload = await AgentCollectorClient(node.collector_url).get_pcap_files(snapshot_id)
+        validated_files = [item.model_dump(mode="json") for item in validate_pcap_file_list(payload)]
+        return {"schema_version": payload.get("schema_version", 1), "files": validated_files}
     except Exception as exc:
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Failed to list capture files: {exc}") from exc
+        detail = "Collector returned an invalid PCAP file manifest" if isinstance(exc, ValueError) else (
+            redact_sensitive_message(f"Failed to list capture files: {exc}")
+        )
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=detail) from exc
 
 
 @router.post("/{node_id}/capture/start")
@@ -421,7 +431,8 @@ async def start_node_capture(
     try:
         return await AgentCollectorClient(node.collector_url).start_pcap_capture()
     except Exception as exc:
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Failed to start packet capture: {exc}") from exc
+        detail = redact_sensitive_message(f"Failed to start packet capture: {exc}")
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=detail) from exc
 
 
 @router.post("/{node_id}/capture/stop")
@@ -438,7 +449,8 @@ async def stop_node_capture(
     try:
         return await AgentCollectorClient(node.collector_url).stop_pcap_capture()
     except Exception as exc:
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Failed to stop packet capture: {exc}") from exc
+        detail = redact_sensitive_message(f"Failed to stop packet capture: {exc}")
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=detail) from exc
 
 
 @router.post("/{node_id}/containers/{container_id}/stop")

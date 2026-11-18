@@ -1,16 +1,18 @@
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.config import settings
+from core.api_auth import require_admin
 from core.database import get_session
 from models.alert import AlertEvent
 from models.anomaly import AnomalyEvent
 from models.metric import MetricSnapshot
 from models.node import MonitoredNode
 from models.service_heartbeat import ServiceHeartbeat
+from workers.metrics_tasks import collect_all_nodes
 
 router = APIRouter(prefix="/fleet", tags=["Fleet"])
 
@@ -195,4 +197,27 @@ async def get_fleet_telemetry(
             }
             for node, snapshot in rows
         ],
+    }
+
+
+@router.post("/refresh", status_code=status.HTTP_202_ACCEPTED)
+async def trigger_fleet_refresh(_role: None = Depends(require_admin)):
+    """Queue one immediate, bounded collection pass across active nodes.
+
+    The scheduled once-per-minute collection remains authoritative. This only
+    submits that existing worker task and never holds an API request open while
+    contacting remote collectors.
+    """
+    try:
+        result = collect_all_nodes.apply_async(expires=55)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Telemetry collection queue is unavailable",
+        ) from exc
+
+    return {
+        "status": "queued",
+        "task_id": getattr(result, "id", None),
+        "expires_in_seconds": 55,
     }
