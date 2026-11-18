@@ -148,6 +148,21 @@ export const api = {
     request('/investigations/allowlist', { method: 'POST', body: JSON.stringify({ pattern, ioc_type: iocType, description }) }),
   deleteIocAllowlist: (id) => request(`/investigations/allowlist/${id}`, { method: 'DELETE' }),
   exportInvestigation: (id, format = 'json') => request(`/investigations/${id}/export${qs({ format })}`),
+  exportInvestigationPdf: async (id) => {
+    const res = await fetch(`${BASE}/investigations/${id}/export${qs({ format: 'pdf' })}`, {
+      headers: { Accept: 'application/pdf' },
+    });
+    if (!res.ok) {
+      let detail = '';
+      try {
+        detail = readDetail(await res.json());
+      } catch (err) {
+        // non-JSON error body
+      }
+      throw new ApiError(friendly(res.status, detail) || `PDF export failed (${res.status})`, res.status);
+    }
+    return res.blob();
+  },
   // ---- copilot --------------------------------------------------------------
   getCopilotPresets: () => request('/copilot/presets'),
   queryCopilot: (prompt, host = null) =>

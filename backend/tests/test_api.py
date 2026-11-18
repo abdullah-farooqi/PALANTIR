@@ -950,10 +950,14 @@ async def test_investigation_pcap_analysis_api(
         art_id = art.id
 
     # 1. Trigger endpoint
-    monkeypatch.setattr("api.v1.investigations.start_pcap_analysis", lambda _ev_id: "new-test-run-id")
+    monkeypatch.setattr(
+        "api.v1.investigations.start_pcap_analysis",
+        lambda _ev_id: {"run_id": "new-test-run-id", "reused": False, "status": "pending"},
+    )
     trigger_resp = await client.post(f"/api/v1/investigations/{investigation_id}/analysis/trigger")
     assert trigger_resp.status_code == 202
     assert trigger_resp.json()["run_id"] == "new-test-run-id"
+    assert trigger_resp.json().get("reused") is False
 
     # 2. List runs endpoint
     list_resp = await client.get(f"/api/v1/investigations/{investigation_id}/analysis")

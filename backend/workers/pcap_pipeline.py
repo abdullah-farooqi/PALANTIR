@@ -13,10 +13,17 @@ import shutil
 import struct
 import subprocess
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Generator, Iterator
 from uuid import uuid4
+import json
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+import httpx
 
 try:
     from celery import chain, shared_task
@@ -35,7 +42,7 @@ except ImportError:
             fn.si = lambda *a, **k: fn
             return fn
         return decorator
-from sqlalchemy import delete, select
+from sqlalchemy import delete, or_, select
 
 from core.config import settings
 from core.database import get_sync_session
@@ -49,6 +56,7 @@ from models.pcap_analysis import (
     PcapIocAllowlist,
     PcapIocs,
     PcapSeverityScores,
+    PcapThreatIntelCache,
     TcpSessions,
 )
 from workers.celery_app import celery_app
@@ -1644,6 +1652,213 @@ def pcap_analysis_extract_iocs(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Step 7: External threat-intel enrichment (AbuseIPDB + OTX, optional)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _cache_get(session: Any, ioc_type: str, ioc_value: str, provider: str) -> dict[str, Any] | None:
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+    row = session.execute(
+        select(PcapThreatIntelCache).where(
+            PcapThreatIntelCache.ioc_type == ioc_type,
+            PcapThreatIntelCache.ioc_value == ioc_value,
+            PcapThreatIntelCache.provider == provider,
+            PcapThreatIntelCache.fetched_at >= cutoff,
+        )
+    ).scalar_one_or_none()
+    return dict(row.payload) if row and isinstance(row.payload, dict) else None
+
+
+def _cache_put(session: Any, ioc_type: str, ioc_value: str, provider: str, payload: dict[str, Any]) -> None:
+    existing = session.execute(
+        select(PcapThreatIntelCache).where(
+            PcapThreatIntelCache.ioc_type == ioc_type,
+            PcapThreatIntelCache.ioc_value == ioc_value,
+            PcapThreatIntelCache.provider == provider,
+        )
+    ).scalar_one_or_none()
+    now = datetime.now(timezone.utc)
+    if existing:
+        existing.payload = payload
+        existing.fetched_at = now
+    else:
+        session.add(
+            PcapThreatIntelCache(
+                ioc_type=ioc_type,
+                ioc_value=ioc_value,
+                provider=provider,
+                payload=payload,
+                fetched_at=now,
+            )
+        )
+
+
+def _lookup_abuseipdb(ip: str, api_key: str) -> dict[str, Any] | None:
+    try:
+        resp = httpx.get(
+            "https://api.abuseipdb.com/api/v2/check",
+            params={"ipAddress": ip, "maxAgeInDays": 90},
+            headers={"Key": api_key, "Accept": "application/json"},
+            timeout=10.0,
+        )
+        if resp.status_code != 200:
+            return None
+        data = resp.json().get("data") or {}
+        score = data.get("abuseConfidenceScore")
+        return {
+            "provider": "abuseipdb",
+            "score": score,
+            "tags": data.get("usageType") and [str(data.get("usageType"))] or [],
+            "description": f"AbuseIPDB confidence {score}",
+            "raw": {"abuseConfidenceScore": score, "totalReports": data.get("totalReports")},
+        }
+    except Exception as exc:
+        logger.warning("AbuseIPDB lookup failed for %s: %s", ip, exc)
+        return None
+
+
+def _lookup_otx(ioc_type: str, ioc_value: str, api_key: str) -> dict[str, Any] | None:
+    section = {
+        "ipv4": "IPv4",
+        "ipv6": "IPv6",
+        "domain": "domain",
+        "sha256": "file",
+    }.get(ioc_type)
+    if not section:
+        return None
+    try:
+        url = f"https://otx.alienvault.com/api/v1/indicators/{section}/{ioc_value}/general"
+        resp = httpx.get(url, headers={"X-OTX-API-KEY": api_key}, timeout=10.0)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        pulse = (data.get("pulse_info") or {}).get("count") or 0
+        return {
+            "provider": "otx",
+            "score": pulse,
+            "tags": [t.get("name") for t in ((data.get("pulse_info") or {}).get("pulses") or [])[:5] if isinstance(t, dict)],
+            "description": f"OTX pulses {pulse}",
+            "raw": {"pulse_count": pulse},
+        }
+    except Exception as exc:
+        logger.warning("OTX lookup failed for %s: %s", ioc_value, exc)
+        return None
+
+
+@celery_app.task(bind=True, name="workers.pcap_pipeline.pcap_analysis_enrich_iocs")
+def pcap_analysis_enrich_iocs(
+    self,
+    prev_result_or_evidence_id: Any,
+    run_id: str | None = None,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Enrich non-allowlisted IOCs via AbuseIPDB/OTX with 24h cache and ~10/min rate limit."""
+    if isinstance(prev_result_or_evidence_id, dict):
+        evidence_id = prev_result_or_evidence_id.get("evidence_id")
+        run_id = prev_result_or_evidence_id.get("run_id", run_id)
+    else:
+        evidence_id = int(prev_result_or_evidence_id)
+
+    if not run_id:
+        raise ValueError("Missing run_id in pcap_analysis_enrich_iocs")
+
+    abuse_key = (settings.ABUSEIPDB_API_KEY or "").strip()
+    otx_key = (settings.OTX_API_KEY or "").strip()
+    if not abuse_key and not otx_key:
+        with get_sync_session() as session:
+            run = session.execute(
+                select(PcapAnalysisRuns).where(PcapAnalysisRuns.run_id == run_id)
+            ).scalar_one_or_none()
+            if run:
+                run.current_step = "enrich_iocs"
+                session.commit()
+        return {
+            "run_id": run_id,
+            "evidence_id": evidence_id,
+            "enriched": 0,
+            "skipped": "no_api_keys",
+            "status": "complete",
+        }
+
+    rate = max(1, int(settings.PCAP_THREAT_INTEL_RATE_PER_MIN or 10))
+    min_interval = 60.0 / rate
+    last_call = 0.0
+    enriched = 0
+
+    def _throttle() -> None:
+        nonlocal last_call
+        elapsed = time.monotonic() - last_call
+        if last_call and elapsed < min_interval:
+            time.sleep(min_interval - elapsed)
+        last_call = time.monotonic()
+
+    try:
+        with get_sync_session() as session:
+            iocs = session.execute(
+                select(PcapIocs).where(
+                    PcapIocs.run_id == run_id,
+                    PcapIocs.is_allowlisted.is_(False),
+                    PcapIocs.ioc_type.in_(("ipv4", "ipv6", "domain", "sha256")),
+                )
+            ).scalars().all()
+
+            for ioc in iocs:
+                matches: list[dict[str, Any]] = []
+                providers: list[tuple[str, Any]] = []
+                if ioc.ioc_type in ("ipv4", "ipv6") and abuse_key:
+                    providers.append(("abuseipdb", lambda v=ioc.ioc_value: _lookup_abuseipdb(v, abuse_key)))
+                if otx_key and ioc.ioc_type in ("ipv4", "ipv6", "domain", "sha256"):
+                    providers.append(
+                        ("otx", lambda t=ioc.ioc_type, v=ioc.ioc_value: _lookup_otx(t, v, otx_key))
+                    )
+
+                for provider, fetcher in providers:
+                    cached = _cache_get(session, ioc.ioc_type, ioc.ioc_value, provider)
+                    if cached is not None:
+                        matches.append({**cached, "cached": True})
+                        continue
+                    _throttle()
+                    payload = fetcher()
+                    if payload is None:
+                        continue
+                    _cache_put(session, ioc.ioc_type, ioc.ioc_value, provider, payload)
+                    matches.append({**payload, "cached": False})
+
+                if matches:
+                    ioc.threat_intel_match = {
+                        "providers": matches,
+                        "description": ", ".join(
+                            m.get("description") or m.get("provider", "") for m in matches
+                        ),
+                    }
+                    enriched += 1
+
+            run = session.execute(
+                select(PcapAnalysisRuns).where(PcapAnalysisRuns.run_id == run_id)
+            ).scalar_one()
+            run.current_step = "enrich_iocs"
+            session.commit()
+
+        return {
+            "run_id": run_id,
+            "evidence_id": evidence_id,
+            "enriched": enriched,
+            "status": "complete",
+        }
+    except Exception as exc:
+        logger.warning("IOC enrichment failed for run %s: %s", run_id, exc)
+        with get_sync_session() as session:
+            run = session.execute(
+                select(PcapAnalysisRuns).where(PcapAnalysisRuns.run_id == run_id)
+            ).scalar_one_or_none()
+            if run:
+                run.status = "failed"
+                run.error_step = "enrich_iocs"
+                run.error_message = str(exc)[:1000]
+                session.commit()
+        raise
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Step 8: Passive CVE Matching & Signature Detection (Milestone 4)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -2029,6 +2244,16 @@ def pcap_analysis_score_severity(
 # Resiliency & Rollback Handler (Milestone 5)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _purge_run_child_rows(session: Any, run_id: str) -> None:
+    """Delete partial analysis rows for a failed run. Evidence file stays untouched."""
+    session.execute(delete(PcapSeverityScores).where(PcapSeverityScores.run_id == run_id))
+    session.execute(delete(PcapCveMatches).where(PcapCveMatches.run_id == run_id))
+    session.execute(delete(PcapIocs).where(PcapIocs.run_id == run_id))
+    session.execute(delete(PcapArtifacts).where(PcapArtifacts.run_id == run_id))
+    session.execute(delete(TcpSessions).where(TcpSessions.run_id == run_id))
+    session.execute(delete(PcapFlows).where(PcapFlows.run_id == run_id))
+
+
 @celery_app.task(bind=True, name="workers.pcap_pipeline.handle_chain_failure")
 def handle_chain_failure(
     self,
@@ -2037,7 +2262,7 @@ def handle_chain_failure(
     evidence_id: int | None = None,
     **kwargs: Any,
 ) -> None:
-    """Purge staged artifacts and update database state upon pipeline failure."""
+    """Purge staged artifacts and partial DB rows upon pipeline failure."""
     exc = None
     if len(args) >= 2:
         exc = args[1]
@@ -2058,12 +2283,11 @@ def handle_chain_failure(
     storage = get_storage_backend()
     staging_prefix = f"analysis-{run_id}"
 
-    # 1. Purge disk staging files
     deleted = storage.purge_prefix(staging_prefix)
     logger.info("Purged %d staged files under %s", deleted, staging_prefix)
 
-    # 2. Update run status and rollback timestamps
     with get_sync_session() as session:
+        _purge_run_child_rows(session, run_id)
         run = session.execute(
             select(PcapAnalysisRuns).where(PcapAnalysisRuns.run_id == run_id)
         ).scalar_one_or_none()
@@ -2073,9 +2297,14 @@ def handle_chain_failure(
             run.rollback_started_at = now
             run.rollback_completed_at = now
             run.rollback_id = f"rb_{run_id[:8]}"
-            run.exit_code = "137 (SIGKILL / OOM)" if ("memory" in str(exc).lower() or "137" in str(exc) or "oom" in str(exc).lower()) else "1 (PIPELINE_ERROR)"
+            run.exit_code = (
+                "137 (SIGKILL / OOM)"
+                if ("memory" in str(exc).lower() or "137" in str(exc) or "oom" in str(exc).lower())
+                else "1 (PIPELINE_ERROR)"
+            )
             run.purged_scratch_files = deleted
             run.error_message = str(exc)[:1000] if exc else "Pipeline task error"
+            run.completed_at = now
             session.commit()
 
 
@@ -2083,7 +2312,7 @@ def handle_chain_failure(
 # Dispatcher: Entry point for analysis chain
 # ─────────────────────────────────────────────────────────────────────────────
 
-def start_pcap_analysis(evidence_id: int, run_id: str | None = None) -> str:
+def start_pcap_analysis(evidence_id: int, run_id: str | None = None) -> dict[str, Any]:
     """Initialize analysis run and launch the Celery task chain through all phases."""
     with get_sync_session() as session:
         evidence = session.execute(
@@ -2103,23 +2332,40 @@ def start_pcap_analysis(evidence_id: int, run_id: str | None = None) -> str:
             if existing is not None:
                 if existing.evidence_id != evidence_id:
                     raise ValueError("Analysis run ID is already attached to different evidence")
-                return existing.run_id
-        else:
-            active = session.execute(
+                return {"run_id": existing.run_id, "reused": True, "status": existing.status}
+
+        active = session.execute(
+            select(PcapAnalysisRuns)
+            .where(
+                PcapAnalysisRuns.evidence_id == evidence_id,
+                PcapAnalysisRuns.status.in_(("pending", "running")),
+            )
+            .order_by(PcapAnalysisRuns.started_at.desc(), PcapAnalysisRuns.id.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+        if active is not None:
+            return {"run_id": active.run_id, "reused": True, "status": active.status}
+
+        fingerprint = evidence.sha256 or evidence.collector_sha256
+        if fingerprint:
+            prior = session.execute(
                 select(PcapAnalysisRuns)
+                .join(InvestigationEvidence, InvestigationEvidence.id == PcapAnalysisRuns.evidence_id)
                 .where(
-                    PcapAnalysisRuns.evidence_id == evidence_id,
-                    PcapAnalysisRuns.status.in_(("pending", "running")),
+                    PcapAnalysisRuns.status == "complete",
+                    or_(
+                        InvestigationEvidence.sha256 == fingerprint,
+                        InvestigationEvidence.collector_sha256 == fingerprint,
+                    ),
                 )
-                .order_by(PcapAnalysisRuns.started_at.desc(), PcapAnalysisRuns.id.desc())
+                .order_by(PcapAnalysisRuns.completed_at.desc().nullslast(), PcapAnalysisRuns.id.desc())
                 .limit(1)
             ).scalar_one_or_none()
-            if active is not None:
-                return active.run_id
+            if prior is not None:
+                return {"run_id": prior.run_id, "reused": True, "status": prior.status}
 
         run_id = run_id or uuid4().hex
 
-        # Create tracking record
         analysis_run = PcapAnalysisRuns(
             run_id=run_id,
             evidence_id=evidence_id,
@@ -2138,6 +2384,7 @@ def start_pcap_analysis(evidence_id: int, run_id: str | None = None) -> str:
         pcap_analysis_reconstruct_sessions.s(run_id=run_id),
         pcap_analysis_extract_artifacts.s(run_id=run_id),
         pcap_analysis_extract_iocs.s(run_id=run_id),
+        pcap_analysis_enrich_iocs.s(run_id=run_id),
         pcap_analysis_match_cve.s(run_id=run_id),
         pcap_analysis_score_severity.s(run_id=run_id),
     )
@@ -2157,4 +2404,4 @@ def start_pcap_analysis(evidence_id: int, run_id: str | None = None) -> str:
                 session.commit()
         raise RuntimeError("PCAP analysis could not be submitted to the worker queue") from exc
     logger.info("Enqueued full PCAP analysis pipeline for evidence %s with run_id %s", evidence_id, run_id)
-    return run_id
+    return {"run_id": run_id, "reused": False, "status": "pending"}

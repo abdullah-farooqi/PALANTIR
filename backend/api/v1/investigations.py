@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from pathlib import Path as FilePath
 from typing import List, Dict, Any, Optional
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, status
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import String, and_, cast, func, or_, select
 from sqlalchemy.orm import selectinload
@@ -36,6 +36,7 @@ from services.nodes import NodeService
 from services.investigations import enqueue_investigation_async
 from services.investigations import request_pcap_evidence_for_investigation
 from services.investigations import _enqueue_pcap_transfer
+from services.pcap_report_pdf import build_investigation_pdf
 
 router = APIRouter(prefix="/investigations", tags=["Investigations"])
 logger = logging.getLogger(__name__)
@@ -582,32 +583,122 @@ async def get_investigation_analysis_detail(
         cves = (await session.execute(
             select(PcapCveMatches).where(PcapCveMatches.run_id == run_id).order_by(PcapCveMatches.id.desc()).limit(100)
         )).scalars().all()
+        flow_tcp = sum(1 for f in flows if str(f.protocol).lower() == "tcp")
+        flow_udp = sum(1 for f in flows if str(f.protocol).lower() == "udp")
+        flow_icmp = sum(1 for f in flows if "icmp" in str(f.protocol).lower())
+        sessions_closed = sum(1 for s in tcp_sessions if s.state == "closed")
+        sessions_reset = sum(1 for s in tcp_sessions if s.state == "reset")
+        artifacts_http = sum(1 for a in artifacts if "http" in str(a.artifact_type))
+        artifacts_certs = sum(1 for a in artifacts if "cert" in str(a.artifact_type) or "tls" in str(a.artifact_type))
+        artifacts_other = max(0, len(artifacts) - artifacts_http - artifacts_certs)
+        artifact_bytes = sum(int(a.size_bytes or 0) for a in artifacts)
+        iocs_threats = sum(1 for i in iocs if not i.is_allowlisted and i.threat_intel_match)
+        iocs_allowlisted = sum(1 for i in iocs if i.is_allowlisted)
+        top_cves = [
+            f"{c.cve_id} ({float(c.cvss_score):.1f})" if c.cvss_score is not None else c.cve_id
+            for c in cves[:3]
+        ]
+        avg_life = None
+        durations = [s.duration_seconds for s in tcp_sessions if s.duration_seconds is not None]
+        if durations:
+            avg_life = f"{round(sum(durations) / len(durations), 1)}s"
     else:
         flows = tcp_sessions = artifacts = iocs = cves = []
+        flow_tcp = (await session.execute(
+            select(func.count(PcapFlows.id)).where(PcapFlows.run_id == run_id, PcapFlows.protocol == "tcp")
+        )).scalar_one()
+        flow_udp = (await session.execute(
+            select(func.count(PcapFlows.id)).where(PcapFlows.run_id == run_id, PcapFlows.protocol == "udp")
+        )).scalar_one()
+        flow_icmp = (await session.execute(
+            select(func.count(PcapFlows.id)).where(PcapFlows.run_id == run_id, PcapFlows.protocol.in_(("icmp", "icmpv6")))
+        )).scalar_one()
+        sessions_closed = (await session.execute(
+            select(func.count(TcpSessions.id)).where(TcpSessions.run_id == run_id, TcpSessions.state == "closed")
+        )).scalar_one()
+        sessions_reset = (await session.execute(
+            select(func.count(TcpSessions.id)).where(TcpSessions.run_id == run_id, TcpSessions.state == "reset")
+        )).scalar_one()
+        artifacts_http = (await session.execute(
+            select(func.count(PcapArtifacts.id)).where(
+                PcapArtifacts.run_id == run_id, PcapArtifacts.artifact_type.ilike("%http%")
+            )
+        )).scalar_one()
+        artifacts_certs = (await session.execute(
+            select(func.count(PcapArtifacts.id)).where(
+                PcapArtifacts.run_id == run_id,
+                or_(PcapArtifacts.artifact_type.ilike("%tls%"), PcapArtifacts.artifact_type.ilike("%cert%")),
+            )
+        )).scalar_one()
+        artifacts_other = max(0, counts["artifacts"] - artifacts_http - artifacts_certs)
+        artifact_bytes = (await session.execute(
+            select(func.coalesce(func.sum(PcapArtifacts.size_bytes), 0)).where(PcapArtifacts.run_id == run_id)
+        )).scalar_one()
+        iocs_threats = (await session.execute(
+            select(func.count(PcapIocs.id)).where(
+                PcapIocs.run_id == run_id,
+                PcapIocs.is_allowlisted.is_(False),
+                PcapIocs.threat_intel_match.is_not(None),
+            )
+        )).scalar_one()
+        iocs_allowlisted = (await session.execute(
+            select(func.count(PcapIocs.id)).where(PcapIocs.run_id == run_id, PcapIocs.is_allowlisted.is_(True))
+        )).scalar_one()
+        top_cve_rows = (await session.execute(
+            select(PcapCveMatches.cve_id, PcapCveMatches.cvss_score)
+            .where(PcapCveMatches.run_id == run_id)
+            .order_by(PcapCveMatches.cvss_score.desc().nullslast(), PcapCveMatches.id.desc())
+            .limit(3)
+        )).all()
+        top_cves = [
+            f"{cve_id} ({float(cvss):.1f})" if cvss is not None else cve_id
+            for cve_id, cvss in top_cve_rows
+        ]
+        avg_life_val = (await session.execute(
+            select(func.avg(TcpSessions.duration_seconds)).where(
+                TcpSessions.run_id == run_id, TcpSessions.duration_seconds.is_not(None)
+            )
+        )).scalar_one()
+        avg_life = f"{round(float(avg_life_val), 1)}s" if avg_life_val is not None else None
 
-    flow_tcp = sum(1 for f in flows if str(f.protocol).lower() == "tcp") if flows else int(counts["flows"] * 0.84)
-    flow_udp = sum(1 for f in flows if str(f.protocol).lower() == "udp") if flows else int(counts["flows"] * 0.14)
-    flow_icmp = sum(1 for f in flows if "icmp" in str(f.protocol).lower()) if flows else max(0, counts["flows"] - flow_tcp - flow_udp)
+    duration_seconds = None
+    if run.completed_at and run.started_at:
+        duration_seconds = round((run.completed_at - run.started_at).total_seconds(), 1)
 
-    sessions_closed = sum(1 for s in tcp_sessions if s.state == "closed") if tcp_sessions else int(counts["sessions"] * 0.96)
-    sessions_reset = sum(1 for s in tcp_sessions if s.state == "reset") if tcp_sessions else max(0, counts["sessions"] - sessions_closed)
+    evidence_sha = (evidence.sha256 or evidence.collector_sha256) if evidence else None
+    engines = getattr(run, "engine_versions", None) or {}
+    if not isinstance(engines, dict):
+        engines = {}
 
-    artifacts_http = sum(1 for a in artifacts if "http" in str(a.artifact_type)) if artifacts else int(counts["artifacts"] * 0.65)
-    artifacts_certs = sum(1 for a in artifacts if "cert" in str(a.artifact_type) or "tls" in str(a.artifact_type)) if artifacts else int(counts["artifacts"] * 0.25)
-    artifacts_elf = max(0, counts["artifacts"] - artifacts_http - artifacts_certs)
+    rollback_info = None
+    if run.status in ("rolled_back", "failed"):
+        rb_duration = None
+        if run.rollback_started_at and run.rollback_completed_at:
+            rb_duration = round((run.rollback_completed_at - run.rollback_started_at).total_seconds(), 1)
+        rollback_info = {
+            "rollback_id": getattr(run, "rollback_id", None),
+            "exit_code": getattr(run, "exit_code", None),
+            "error_step": run.error_step,
+            "error_message": _safe_evidence_error(run.error_message),
+            "rolled_back_at": run.rollback_completed_at.isoformat() if run.rollback_completed_at else None,
+            "rollback_duration_seconds": rb_duration,
+            "purged_scratch_files": getattr(run, "purged_scratch_files", None),
+        }
 
-    iocs_threats = sum(1 for i in iocs if not i.is_allowlisted and i.threat_intel_match) if iocs else min(counts["iocs"], 6)
-    iocs_allowlisted = sum(1 for i in iocs if i.is_allowlisted) if iocs else max(0, counts["iocs"] - iocs_threats)
-
-    step_durations = getattr(run, "step_durations", None)
-    if not step_durations and run.status == "complete":
-        step_durations = {
-            "validate": 1.2,
-            "extract_flows": 4.8,
-            "reassemble_sessions": 14.1,
-            "extract_iocs": 6.3,
-            "match_cve": 8.7,
-            "score_severity": 3.9,
+    severity = None
+    if score_row is not None:
+        overall = _nullable_float(score_row.overall_score)
+        severity = {
+            "overall_score": overall,
+            "overall_severity": score_row.overall_severity,
+            "hero_score": int(round(overall * 10)) if overall is not None else None,
+            "cvss_base_max": _nullable_float(score_row.cvss_base_max),
+            "ioc_risk_score": _nullable_float(score_row.ioc_risk_score),
+            "anomaly_score": _nullable_float(score_row.anomaly_score),
+            "factors": score_row.factors or {},
+            "composite_breakdown": getattr(score_row, "composite_weights", None) or {},
+            "top_risk_factors": getattr(score_row, "top_risk_factors", None) or [],
+            "calculated_at": score_row.calculated_at.isoformat() if score_row.calculated_at else None,
         }
 
     return {
@@ -619,108 +710,55 @@ async def get_investigation_analysis_detail(
         "current_step": run.current_step,
         "started_at": run.started_at.isoformat() if run.started_at else None,
         "completed_at": run.completed_at.isoformat() if run.completed_at else None,
-        "duration_seconds": round((run.completed_at - run.started_at).total_seconds(), 1) if (run.completed_at and run.started_at) else 39.0,
+        "duration_seconds": duration_seconds,
         "error_message": _safe_evidence_error(run.error_message),
         "counts": counts,
         "scope": {
-            "filename": (evidence.file_name if evidence else None) or "capture.pcap.gz",
-            "size_bytes": (evidence.size_bytes if evidence else None) or 13002342,
-            "size_formatted": _format_bytes(evidence.size_bytes) if (evidence and evidence.size_bytes) else "12.4 MB",
-            "capture_duration_seconds": (evidence.duration_seconds if evidence and evidence.duration_seconds else 60),
-            "md5": getattr(evidence, "md5", None) or "c4ca4238a0b923820dcc509a6f75849b",
-            "sha256": getattr(evidence, "sha256", None) or "d8a2628b8a5c3f1c9e884d8a2628b8a5c3f1c9e884",
-            "storage_zone": "us-east-sec-vault-01",
-            "snaplen": getattr(run, "snaplen", None) or (evidence.snaplen if evidence else 128) or 128,
-            "is_truncated": getattr(run, "is_truncated", False) or False,
+            "filename": evidence.file_name if evidence else None,
+            "size_bytes": evidence.size_bytes if evidence else None,
+            "size_formatted": _format_bytes(evidence.size_bytes) if (evidence and evidence.size_bytes is not None) else None,
+            "capture_duration_seconds": evidence.duration_seconds if evidence else None,
+            "md5": None,
+            "sha256": evidence_sha,
+            "snaplen": getattr(run, "snaplen", None) or (evidence.snaplen if evidence else None),
+            "is_truncated": bool(getattr(run, "is_truncated", False)),
         },
-        "engines": getattr(run, "engine_versions", None) or {
-            "display_string": "Suricata 7.0.2 + Zeek 6.0",
-            "engine_version": "v2.4",
-            "assessment_mode": "Bayesian Multi-vector",
-            "ruleset": "Suricata ruleset v4.12",
-            "signature_rev": "2026.05.18-01",
-            "parser_status": "Strict",
-        },
+        "engines": engines,
         "metrics_summary": {
             "flows": {
                 "total": counts["flows"],
                 "tcp": flow_tcp,
                 "udp": flow_udp,
                 "icmp": flow_icmp,
-                "peak_rate": "29.5 MB/s",
             },
             "sessions": {
                 "total": counts["sessions"],
                 "closed": sessions_closed,
                 "reset": sessions_reset,
-                "avg_life": "4.2s",
+                "avg_life": avg_life,
             },
             "artifacts": {
                 "total": counts["artifacts"],
                 "http": artifacts_http,
                 "certs": artifacts_certs,
-                "elf": artifacts_elf,
-                "total_bytes_formatted": "8.4 MB",
+                "other": artifacts_other,
+                "total_bytes_formatted": _format_bytes(int(artifact_bytes or 0)),
             },
             "iocs": {
                 "total": counts["iocs"],
                 "threats": iocs_threats,
                 "allowlisted": iocs_allowlisted,
-                "highlight": "96% conf (C2 IP)",
             },
             "cve_matches": {
                 "total": counts["cve_matches"],
-                "top_cves": ["CVE-2023-44487 (9.8)", "CVE-2021-44228 (10.0)"],
-                "engines": "Suricata + Zeek",
+                "top_cves": top_cves,
             },
         },
-        "step_durations": step_durations or {},
-        "step_progress": getattr(run, "step_progress", None) or (
-            {"step": run.current_step or "reassemble_sessions", "pct": 64, "streams_indexed": 412, "streams_total": 640, "elapsed_seconds": 14.1}
-            if run.status == "running" else None
-        ),
-        "queue_info": {
-            "position": 2,
-            "total_in_pool": 2,
-            "worker": "worker-node-04 (busy)",
-            "estimated_start_seconds": 45,
-            "priority": "Normal",
-        } if run.status == "pending" else None,
-        "rollback_info": {
-            "rollback_id": getattr(run, "rollback_id", None) or f"rb_{run.run_id[:8]}",
-            "exit_code": getattr(run, "exit_code", None) or "137 (SIGKILL / OOM)",
-            "error_step": run.error_step or "03_reassemble_sessions.py:418",
-            "error_message": _safe_evidence_error(run.error_message) or "ERR_PCAP_BUFFER_OVERRUN: Ring buffer exhausted at offset 0x3F4; TCP segment reassembly timed out after 30,000ms",
-            "rolled_back_at": run.rollback_completed_at.isoformat() if run.rollback_completed_at else None,
-            "rollback_duration_seconds": 1.4,
-            "purged_scratch_files": getattr(run, "purged_scratch_files", 18) or 18,
-        } if run.status in ("rolled_back", "failed") else None,
-        "severity": {
-            "overall_score": _nullable_float(score_row.overall_score),
-            "overall_severity": score_row.overall_severity,
-            "hero_score": int(round((float(score_row.overall_score or 7.8)) * 10)) if score_row else 78,
-            "confidence_pct": 88,
-            "cvss_base_max": _nullable_float(score_row.cvss_base_max),
-            "ioc_risk_score": _nullable_float(score_row.ioc_risk_score),
-            "anomaly_score": _nullable_float(score_row.anomaly_score),
-            "factors": score_row.factors,
-            "composite_breakdown": getattr(score_row, "composite_weights", None) or {
-                "cvss": {"weight_pct": 45, "points": round((float(score_row.cvss_base_max or 7.8)) * 4.5, 1)},
-                "iocs": {"weight_pct": 35, "points": round((float(score_row.ioc_risk_score or 7.8)) * 3.5, 1)},
-                "anomalies": {"weight_pct": 20, "points": round((float(score_row.anomaly_score or 7.8)) * 2.0, 1)},
-            } if score_row else {
-                "cvss": {"weight_pct": 45, "points": 35.1},
-                "iocs": {"weight_pct": 35, "points": 27.3},
-                "anomalies": {"weight_pct": 20, "points": 15.6},
-            },
-            "top_risk_factors": getattr(score_row, "top_risk_factors", None) or [
-                {"severity": "critical", "title": "Log4Shell signature matched in HTTP request payload", "points": 32, "target_tab": "cve_matches"},
-                {"severity": "high", "title": "3 un-allowlisted external IPs on port 4444 (C2 beaconing suspect)", "points": 24, "target_tab": "iocs"},
-                {"severity": "medium", "title": "HTTP/2 Rapid Reset framing flood rate anomaly (+410% vs baseline)", "points": 14, "target_tab": "flows"},
-                {"severity": "low", "title": "Capture truncated at snaplen 128 reduced payload inspection confidence", "points": 8, "target_tab": "sessions"},
-            ] if score_row else [],
-            "calculated_at": score_row.calculated_at.isoformat() if score_row.calculated_at else None,
-        } if score_row else None,
+        "step_durations": getattr(run, "step_durations", None) or {},
+        "step_progress": getattr(run, "step_progress", None),
+        "queue_info": {"status": "pending"} if run.status == "pending" else None,
+        "rollback_info": rollback_info,
+        "severity": severity,
         "flows": [
             {
                 "id": f.id,
@@ -777,7 +815,7 @@ async def get_investigation_analysis_detail(
                 "content_length": a.content_length,
                 "size_bytes": a.size_bytes,
                 "sha256": a.sha256,
-                "md5": getattr(a, "md5", None) or "e2fc714c4727ee9395f324cd2e7f331f",
+                "md5": getattr(a, "md5", None),
                 "source_uri": getattr(a, "source_uri", None) or (a.metadata_json.get("uri") if isinstance(a.metadata_json, dict) else None),
                 "source_protocol": getattr(a, "source_protocol", None) or a.artifact_type,
                 "expires_at": a.expires_at.isoformat() if getattr(a, "expires_at", None) else None,
@@ -1043,12 +1081,13 @@ async def trigger_pcap_analysis_endpoint(
             detail="PCAP evidence must be available in storage before analysis can start",
         )
 
-    run_id = start_pcap_analysis(ev.id)
+    result = start_pcap_analysis(ev.id)
     return {
-        "status": "pending",
-        "run_id": run_id,
+        "status": result.get("status") or "pending",
+        "run_id": result["run_id"],
         "evidence_id": ev.id,
         "investigation_id": investigation_id,
+        "reused": bool(result.get("reused")),
     }
 
 
@@ -1352,17 +1391,17 @@ async def get_forensic_pivot_data(
         threat_level = "CRITICAL"
         confidence = "99%"
     elif inferred_type == "SHA-256":
-        classification = "Malicious Payload Dropper Script / Shell Archive"
-        threat_level = "CRITICAL"
-        confidence = "99%"
+        classification = "Artifact hash"
+        threat_level = "INFO"
+        confidence = None
     elif is_ip:
-        classification = "Public IP · Cobalt Strike C2 Infrastructure"
-        threat_level = "CRITICAL"
-        confidence = "95%"
+        classification = "Public IP"
+        threat_level = "INFO"
+        confidence = None
     else:
         classification = f"Network Entity · {inferred_type}"
         threat_level = "INFO"
-        confidence = "90%"
+        confidence = None
 
     # Format Correlated Flows for Drawer
     formatted_flows = []
@@ -1384,45 +1423,9 @@ async def get_forensic_pivot_data(
             "threat_label": "Threat" if is_threat else "Info",
         })
 
-    # If no flows existed in db yet (mock testing or isolated pivot), produce standard high-fidelity flow correlations matching the Stitch design
-    if not formatted_flows and (is_ip or inferred_type in ("IPv4 (External)", "FQDN")):
-        formatted_flows = [
-            {
-                "id": "#1,048",
-                "timestamp": "14:02:14.102",
-                "endpoints": f"10.0.4.21:44812 → {clean_query}:443",
-                "src": "10.0.4.21:44812",
-                "dst": f"{clean_query}:443",
-                "volume": "4.8 MB (412 pkts)",
-                "state": "ESTABLISHED",
-                "is_threat": True,
-                "threat_label": "Threat",
-            },
-            {
-                "id": "#1,051",
-                "timestamp": "14:02:44.816",
-                "endpoints": f"10.0.4.21:44816 → {clean_query}:4444",
-                "src": "10.0.4.21:44816",
-                "dst": f"{clean_query}:4444",
-                "volume": "12 KB (18 pkts)",
-                "state": "RESET (RST_RCVD)",
-                "is_threat": True,
-                "threat_label": "Threat",
-            },
-            {
-                "id": "#1,063",
-                "timestamp": "14:02:51.042",
-                "endpoints": f"10.0.4.21:44820 → {clean_query}:80",
-                "src": "10.0.4.21:44820",
-                "dst": f"{clean_query}:80",
-                "volume": "1.2 KB (6 pkts)",
-                "state": "CLOSED",
-                "is_threat": False,
-                "threat_label": "Info",
-            },
-        ]
-
-    reverse_dns = f"c2.blackhat-ops[.]net (AS13335 · Cloudflare/Proxy)" if not is_private_ip and is_ip else f"{node_names[0] if node_names else 'internal-gw'}.infra.internal"
+    reverse_dns = None
+    if matched_flows:
+        reverse_dns = f"{node_names[0]}.infra.internal" if node_names else None
 
     return {
         "query": clean_query,
@@ -1431,10 +1434,10 @@ async def get_forensic_pivot_data(
         "classification": classification,
         "threat_level": threat_level,
         "confidence": confidence,
-        "first_seen": (matched_flows[0].first_seen.isoformat() if matched_flows and matched_flows[0].first_seen else now.isoformat()),
-        "last_seen": (matched_flows[-1].last_seen.isoformat() if matched_flows and matched_flows[-1].last_seen else now.isoformat()),
+        "first_seen": (matched_flows[0].first_seen.isoformat() if matched_flows and matched_flows[0].first_seen else None),
+        "last_seen": (matched_flows[-1].last_seen.isoformat() if matched_flows and matched_flows[-1].last_seen else None),
         "reverse_dns": reverse_dns,
-        "hits": len(matched_flows) or 14,
+        "hits": len(matched_flows),
         "is_allowlisted": bool(allow_entry),
         "flows": formatted_flows,
         "sessions": [
@@ -1471,10 +1474,10 @@ async def get_forensic_pivot_data(
 @router.get("/{investigation_id}/export")
 async def export_investigation_report(
     investigation_id: int = Path(..., ge=1),
-    format_type: str = Query(default="json", alias="format", pattern="^(json|stix)$"),
+    format_type: str = Query(default="json", alias="format", pattern="^(json|stix|pdf)$"),
     session: AsyncSession = Depends(get_session),
     _role: None = Depends(require_read),
-) -> Dict[str, Any]:
+):
     inv = (await session.execute(
         select(AgentInvestigation).options(selectinload(AgentInvestigation.node)).where(AgentInvestigation.id == investigation_id)
     )).scalar_one_or_none()
@@ -1493,11 +1496,19 @@ async def export_investigation_report(
     flows = (await session.execute(select(PcapFlows).where(PcapFlows.run_id.in_(run_ids)))).scalars().all() if run_ids else []
     iocs = (await session.execute(select(PcapIocs).where(PcapIocs.run_id.in_(run_ids)))).scalars().all() if run_ids else []
     cves = (await session.execute(select(PcapCveMatches).where(PcapCveMatches.run_id.in_(run_ids)))).scalars().all() if run_ids else []
+    artifacts = (await session.execute(select(PcapArtifacts).where(PcapArtifacts.run_id.in_(run_ids)))).scalars().all() if run_ids else []
+    score_row = None
+    if run_ids:
+        score_row = (await session.execute(
+            select(PcapSeverityScores)
+            .where(PcapSeverityScores.run_id.in_(run_ids))
+            .order_by(PcapSeverityScores.calculated_at.desc().nullslast(), PcapSeverityScores.id.desc())
+            .limit(1)
+        )).scalar_one_or_none()
 
     now_iso = datetime.now(timezone.utc).isoformat()
 
     if format_type == "stix":
-        # Generate STIX 2.1 Bundle
         stix_objects = [
             {
                 "type": "identity",
@@ -1539,7 +1550,7 @@ async def export_investigation_report(
             "objects": stix_objects,
         }
 
-    return {
+    bundle = {
         "report_type": "palantir_investigation_bundle",
         "exported_at": now_iso,
         "investigation": {
@@ -1556,6 +1567,31 @@ async def export_investigation_report(
         "flows_count": len(flows),
         "iocs_count": len(iocs),
         "cves_count": len(cves),
+        "severity": {
+            "overall_score": _nullable_float(score_row.overall_score) if score_row else None,
+            "overall_severity": score_row.overall_severity if score_row else None,
+            "top_risk_factors": getattr(score_row, "top_risk_factors", None) or [] if score_row else [],
+        } if score_row else None,
         "iocs": [{"type": i.ioc_type, "value": i.ioc_value, "allowlisted": i.is_allowlisted} for i in iocs],
-        "cve_matches": [{"cve_id": c.cve_id, "cvss": c.cvss_score, "severity": c.severity} for c in cves],
+        "cve_matches": [
+            {"cve_id": c.cve_id, "cvss": float(c.cvss_score) if c.cvss_score is not None else None, "severity": c.severity}
+            for c in cves
+        ],
+        "artifacts": [
+            {"type": a.artifact_type, "sha256": a.sha256, "size_bytes": a.size_bytes}
+            for a in artifacts
+            if a.sha256
+        ],
     }
+
+    if format_type == "pdf":
+        pdf_bytes = build_investigation_pdf(bundle)
+        return Response(
+            content=pdf_bytes,
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": f'attachment; filename="investigation-{inv.id}.pdf"',
+            },
+        )
+
+    return bundle

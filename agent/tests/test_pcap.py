@@ -179,9 +179,69 @@ def test_finalized_compression_is_detected_after_configuration_changes(tmp_path)
 
     restarted = manager_for(tmp_path, compression="none")
     item = restarted.files()[0]
-    assert item["compression"] == "gz"
+    assert item["compression"] == "gzip"
     assert item["filename"].endswith(".gz")
     assert restarted.file_path(filename)[0].suffix == ".gz"
+
+
+def test_await_files_transfer_ready_waits_for_complete_digest(tmp_path):
+    manager = manager_for(tmp_path)
+    filename = "capture_20261112T120000Z_0123456789ab.pcap"
+    capture = tmp_path / filename
+    payload = b"pcap fixture packet data plus bytes"
+    capture.write_bytes(payload)
+    manager._register_closed_files(capture, datetime.now(timezone.utc) - timedelta(minutes=1))
+
+    ready = manager._await_files_transfer_ready([filename], timeout=5.0)
+
+    assert len(ready) == 1
+    assert ready[0]["status"] == "ready"
+    assert ready[0]["hash_status"] == "complete"
+    assert ready[0]["sha256"] == hashlib.sha256(payload).hexdigest()
+    assert ready[0]["compression"] == "none"
+
+
+def test_compress_failure_requeues_raw_file_hash(tmp_path, monkeypatch):
+    manager = manager_for(tmp_path, compression="gzip")
+    filename = "capture_20261112T120000Z_0123456789ab.pcap"
+    capture = tmp_path / filename
+    payload = b"pcap fixture bytes" * 8
+    capture.write_bytes(payload)
+
+    def boom(*_args, **_kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(gzip, "GzipFile", boom)
+    manager._write_json_atomic(
+        manager._metadata_path(filename),
+        {
+            "file_id": filename,
+            "capture_started_at": (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(),
+            "capture_finished_at": datetime.now(timezone.utc).isoformat(),
+            "duration_seconds": 60,
+            "original_size_bytes": len(payload),
+            "interface": "any",
+            "snaplen": 128,
+            "packet_count": None,
+            "sha256": None,
+            "hash_status": "pending",
+        },
+    )
+    manager._compress_one(capture)
+    manager._hash_queue.join()
+
+    item = manager.files()[0]
+    assert capture.exists()
+    assert item["compression"] == "none"
+    assert item["status"] == "ready"
+    assert item["hash_status"] == "complete"
+    assert item["sha256"] == hashlib.sha256(payload).hexdigest()
+
+
+def test_normalize_compression_label_maps_suffix_aliases():
+    assert PCapManager._normalize_compression_label("gz") == "gzip"
+    assert PCapManager._normalize_compression_label("zst") == "zstd"
+    assert PCapManager._normalize_compression_label(None) == "none"
 
 
 def test_packet_timestamps_are_read_from_rotated_pcap_files(tmp_path):

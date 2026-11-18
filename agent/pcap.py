@@ -22,6 +22,7 @@ from uuid import uuid4
 
 
 _FILE_ID = re.compile(r"^capture_\d{8}T\d{6}Z_[0-9a-f]{12}\.pcap\d*$")
+_COMPRESSION_ALIASES = {"none": "none", "gz": "gzip", "gzip": "gzip", "zst": "zstd", "zstd": "zstd"}
 
 
 class PCapError(RuntimeError):
@@ -30,6 +31,16 @@ class PCapError(RuntimeError):
 
 class PCapFileNotReady(PCapError):
     """A capture exists but has not finished compression yet."""
+
+
+def normalize_compression(value: str | None) -> str:
+    """Map collector suffix/config aliases to the contract vocabulary."""
+    if not value:
+        return "none"
+    try:
+        return _COMPRESSION_ALIASES[value]
+    except KeyError as exc:
+        raise ValueError(f"unsupported PCAP compression: {value}") from exc
 
 
 def build_bpf_filter(exclude_expression: str) -> str:
@@ -232,7 +243,7 @@ class PCapManager:
             self._current_started_at = None
         self._prune()
 
-    def snapshot(self, timeout: float = 12.0, trigger_type: str = "manual") -> dict[str, Any]:
+    def snapshot(self, timeout: float = 25.0, trigger_type: str = "manual") -> dict[str, Any]:
         """Close the active segment and return a pinned manifest of retained files."""
         if trigger_type not in {"manual", "alert", "anomaly"}:
             raise PCapError("Unknown PCAP snapshot trigger type")
@@ -248,7 +259,9 @@ class PCapManager:
                     alert_until = self._alert_until
                 if alert_until is not None:
                     time.sleep(max(0.0, alert_until - time.monotonic()))
-                timeout = max(timeout, self.alert_window_seconds + 10.0)
+                timeout = max(timeout, self.alert_window_seconds + 20.0)
+            # Allow time to rotate, compress, and finish SHA-256 before handoff.
+            timeout = max(timeout, 25.0)
             self._snapshot_completed.clear()
             self._snapshot_result = None
             self._snapshot_requested.set()
@@ -294,10 +307,17 @@ class PCapManager:
                 with self._lock:
                     is_compressing = file_id in self._compressing
                 selected_path = final_path if final_path.exists() else raw_path
-                expected_compression = self.compression if is_compressing else (
-                    selected_path.suffix.removeprefix(".") if selected_path != raw_path else "none"
-                )
-                expected_name = final_path.name if is_compressing else selected_path.name
+                if is_compressing:
+                    expected_compression = self._normalize_compression_label(self.compression)
+                    expected_name = final_path.name
+                elif selected_path != raw_path:
+                    expected_compression = self._normalize_compression_label(
+                        selected_path.suffix.removeprefix(".")
+                    )
+                    expected_name = selected_path.name
+                else:
+                    expected_compression = "none"
+                    expected_name = selected_path.name
                 original_size = metadata.get("original_size_bytes")
                 if isinstance(original_size, bool) or not isinstance(original_size, int) or original_size < 0:
                     original_size = None
@@ -307,6 +327,14 @@ class PCapManager:
                 packet_count = metadata.get("packet_count")
                 if isinstance(packet_count, bool) or not isinstance(packet_count, int) or packet_count < 0:
                     packet_count = None
+                sha256 = metadata.get("sha256")
+                if not isinstance(sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", sha256):
+                    sha256 = None
+                hash_status = metadata.get("hash_status", "pending")
+                if hash_status not in {"pending", "complete", "unavailable", "queue_full"}:
+                    hash_status = "pending"
+                if hash_status == "complete" and sha256 is None:
+                    hash_status = "pending"
                 results.append({
                     "file_id": file_id,
                     "filename": expected_name,
@@ -320,8 +348,8 @@ class PCapManager:
                     "interface": metadata.get("interface") if isinstance(metadata.get("interface"), str) else None,
                     "snaplen": snaplen,
                     "packet_count": packet_count,
-                    "sha256": metadata.get("sha256"),
-                    "hash_status": metadata.get("hash_status", "pending"),
+                    "sha256": sha256,
+                    "hash_status": hash_status,
                 })
             except (OSError, ValueError, TypeError):
                 continue
@@ -487,12 +515,17 @@ class PCapManager:
                 file_ids = [item["file_id"] for item in recent]
                 expires_at = datetime.now(timezone.utc) + timedelta(seconds=self.snapshot_ttl_seconds)
                 if self._pin(snapshot_id, file_ids, expires_at):
+                    # Backend transfer requires ready + complete SHA-256; wait before handoff.
+                    ready_files = self._await_files_transfer_ready(
+                        file_ids,
+                        timeout=min(15.0, max(5.0, float(self.rotation_seconds))),
+                    )
                     self._snapshot_result = {
                         "snapshot_id": snapshot_id,
                         "created_at": datetime.now(timezone.utc).isoformat(),
                         "expires_at": expires_at.isoformat(),
-                        "coverage_seconds": self._coverage_seconds(self.files(snapshot_id)),
-                        "files": self.files(snapshot_id),
+                        "coverage_seconds": self._coverage_seconds(ready_files),
+                        "files": ready_files,
                     }
                 else:
                     self._snapshot_result = None
@@ -723,6 +756,9 @@ class PCapManager:
             temporary.unlink(missing_ok=True)
             with self._lock:
                 self._last_error = f"PCAP compression failed for {file_id}: {exc}"
+            # Keep the raw capture transferrable if compression failed.
+            if path.is_file():
+                self._queue_hash(path, file_id)
         finally:
             with self._lock:
                 self._compressing.discard(file_id)
@@ -945,6 +981,54 @@ class PCapManager:
 
     def _metadata_path(self, file_id: str) -> Path:
         return self.storage_dir / f"{file_id}.json"
+
+    @staticmethod
+    def _normalize_compression_label(value: str | None) -> str:
+        if not value:
+            return "none"
+        return _COMPRESSION_ALIASES.get(value, "none")
+
+    def _await_files_transfer_ready(self, file_ids: list[str], timeout: float = 15.0) -> list[dict[str, Any]]:
+        """Block until pinned files are ready with a complete digest, or timeout."""
+        wanted = set(file_ids)
+        if not wanted:
+            return []
+        deadline = time.monotonic() + max(0.1, timeout)
+        last: list[dict[str, Any]] = []
+        requeued: set[str] = set()
+        while time.monotonic() < deadline:
+            last = [item for item in self.files() if item.get("file_id") in wanted]
+            by_id = {item["file_id"]: item for item in last}
+            if all(
+                (item := by_id.get(file_id)) is not None
+                and item.get("status") == "ready"
+                and item.get("hash_status") == "complete"
+                and item.get("sha256")
+                for file_id in wanted
+            ):
+                return [by_id[file_id] for file_id in file_ids if file_id in by_id]
+            # Re-queue digests that stalled once compression finished.
+            for file_id in wanted:
+                if file_id in requeued:
+                    continue
+                item = by_id.get(file_id)
+                if item is None or item.get("status") != "ready":
+                    continue
+                if item.get("hash_status") in {"pending", "queue_full"} and not item.get("sha256"):
+                    raw_path, final_path = self._artifact_paths(file_id)
+                    path = final_path if final_path.is_file() else raw_path
+                    if path.is_file():
+                        self._queue_hash(path, file_id)
+                        requeued.add(file_id)
+            time.sleep(0.05)
+        # Prefer ready+hashed files; keep remaining entries so the caller still sees state.
+        ready = [
+            item for item in last
+            if item.get("status") == "ready" and item.get("hash_status") == "complete" and item.get("sha256")
+        ]
+        if ready:
+            return ready
+        return last
 
     @staticmethod
     def _write_json_atomic(path: Path, data: dict[str, Any]) -> None:

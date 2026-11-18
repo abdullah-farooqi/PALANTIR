@@ -5,6 +5,8 @@ export default function AnalysisToast({ toasts, onDismiss }) {
 
   return (
     <div
+      aria-live="polite"
+      aria-relevant="additions"
       style={{
         position: 'fixed',
         bottom: 24,

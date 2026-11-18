@@ -312,19 +312,18 @@ export default function InvestigationAnalysis({ investigation, refreshMs, onToas
             type="button"
             onClick={async () => {
               try {
-                const res = await api.exportInvestigation(investigation.id, 'stix');
-                const blob = new Blob([JSON.stringify(res, null, 2)], { type: 'application/json' });
+                const blob = await api.exportInvestigationPdf(investigation.id);
                 const url = URL.createObjectURL(blob);
                 const a = document.createElement('a');
                 a.href = url;
-                a.download = `palantir-inv-${investigation.id}-stix.json`;
+                a.download = `palantir-inv-${investigation.id}.pdf`;
                 a.click();
                 URL.revokeObjectURL(url);
-                onToast?.(`Exported investigation #${investigation.id} as STIX 2.1`);
-                addToast('STIX bundle exported', `Investigation #${investigation.id} serialized as STIX 2.1`, 'success');
+                onToast?.(`Exported investigation #${investigation.id} PDF`);
+                addToast('PDF exported', `Investigation #${investigation.id} report downloaded`, 'success');
               } catch (err) {
-                onToast?.(err.message || 'Failed to export investigation', true);
-                addToast('STIX export failed', err.message, 'error');
+                onToast?.(err.message || 'Failed to export PDF', true);
+                addToast('PDF export failed', err.message, 'error');
               }
             }}
             style={{
@@ -339,11 +338,12 @@ export default function InvestigationAnalysis({ investigation, refreshMs, onToas
               fontSize: 11,
               fontWeight: 700,
               cursor: 'pointer',
+              minHeight: 32,
             }}
-            title="Export investigation case as STIX 2.1 bundle"
+            title="Export investigation forensic PDF"
           >
             <FileDown size={13} />
-            <span>Export STIX</span>
+            <span>Export PDF</span>
           </button>
 
           {CAN_WRITE && completeEvidence.length > 0 && (
@@ -795,23 +795,22 @@ export default function InvestigationAnalysis({ investigation, refreshMs, onToas
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 10, padding: 12, background: '#14171B', border: '1px solid #262B32', borderRadius: 8, marginBottom: 12 }}>
                 <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
                   <div style={{ background: '#0D0E10', border: '1px solid #343537', borderRadius: 6, padding: '4px 10px', display: 'flex', alignItems: 'center', gap: 6 }}>
-                    <span style={{ fontSize: 12, fontWeight: 700, color: '#FFFFFF' }}>29 IOCs</span>
+                    <span style={{ fontSize: 12, fontWeight: 700, color: '#FFFFFF' }}>{detail?.metrics_summary?.iocs?.total ?? selectedRun?.ioc_count ?? 0} IOCs</span>
                     <span style={{ fontSize: 9, color: '#8D9479', textTransform: 'uppercase' }}>DETECTED</span>
                   </div>
                   <div style={{ background: 'rgba(229, 72, 77, 0.2)', border: '1px solid rgba(229, 72, 77, 0.5)', borderRadius: 6, padding: '4px 10px', display: 'flex', alignItems: 'center', gap: 6, color: '#FFB4AB' }}>
                     <Flag size={12} style={{ color: '#E5484D' }} />
-                    <span style={{ fontSize: 12, fontWeight: 700 }}>6 threats</span>
-                    <span style={{ fontSize: 9, background: 'rgba(229, 72, 77, 0.3)', padding: '1px 4px', borderRadius: 2 }}>ACTION REQ</span>
+                    <span style={{ fontSize: 12, fontWeight: 700 }}>{detail?.metrics_summary?.iocs?.threats ?? 0} threats</span>
                   </div>
                   <div style={{ background: '#0D0E10', border: '1px solid #343537', borderRadius: 6, padding: '4px 10px', display: 'flex', alignItems: 'center', gap: 6 }}>
-                    <span style={{ fontSize: 12, fontWeight: 700, color: '#C6FF00' }}>23 allowlisted</span>
+                    <span style={{ fontSize: 12, fontWeight: 700, color: '#C6FF00' }}>{detail?.metrics_summary?.iocs?.allowlisted ?? 0} allowlisted</span>
                     <span style={{ fontSize: 9, color: '#8D9479', textTransform: 'uppercase' }}>SUPPRESSED</span>
                   </div>
                 </div>
 
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 11, color: '#8D9479', fontFamily: "'JetBrains Mono', monospace" }}>
                   <Lock size={13} />
-                  <span>Allowlist rules managed on server (read-only)</span>
+                  <span>Allowlist rules managed on server</span>
                 </div>
               </div>
 
@@ -832,7 +831,7 @@ export default function InvestigationAnalysis({ investigation, refreshMs, onToas
                       cursor: 'pointer',
                     }}
                   >
-                    Threats (6)
+                    Threats ({detail?.metrics_summary?.iocs?.threats ?? 0})
                   </button>
                   <button
                     type="button"
@@ -848,7 +847,7 @@ export default function InvestigationAnalysis({ investigation, refreshMs, onToas
                       cursor: 'pointer',
                     }}
                   >
-                    Allowlisted (23)
+                    Allowlisted ({detail?.metrics_summary?.iocs?.allowlisted ?? 0})
                   </button>
                   <button
                     type="button"
@@ -920,16 +919,21 @@ export default function InvestigationAnalysis({ investigation, refreshMs, onToas
                           </td>
                           <td>
                             <span style={{ padding: '2px 6px', borderRadius: 3, background: ioc.is_allowlisted ? 'rgba(198, 255, 0, 0.1)' : 'rgba(229, 72, 77, 0.2)', color: ioc.is_allowlisted ? '#C6FF00' : '#FFB4AB', fontSize: 9, fontWeight: 700 }}>
-                              {ioc.is_allowlisted ? 'ALLOWLISTED' : 'THREAT ACTIVE'}
+                              {ioc.is_allowlisted ? 'ALLOWLISTED' : (isThreat ? 'THREAT ACTIVE' : 'OPEN')}
                             </span>
                           </td>
                           <td>
                             <span style={{ color: isThreat ? '#FFB4AB' : '#8B93A0' }}>
-                              {isThreat ? 'Matched: AbuseIPDB & OTX' : 'No public feed hit'}
+                              {isThreat
+                                ? (ioc.threat_intel_match?.description
+                                  || (Array.isArray(ioc.threat_intel_match?.providers)
+                                    ? ioc.threat_intel_match.providers.map((p) => p.provider).filter(Boolean).join(' & ')
+                                    : 'Threat intel match'))
+                                : 'No public feed hit'}
                             </span>
                           </td>
                           <td>
-                            <span style={{ color: '#C6FF00', fontWeight: 600 }}>96%</span>
+                            <span style={{ color: '#8B93A0', fontWeight: 600 }}>—</span>
                           </td>
                           <td>{stamp(ioc.created_at)}</td>
                           <td style={{ textAlign: 'right' }}>

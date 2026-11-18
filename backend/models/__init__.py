@@ -17,6 +17,7 @@ from .pcap_analysis import (
     PcapIocAllowlist,
     PcapIocs,
     PcapSeverityScores,
+    PcapThreatIntelCache,
     TcpSessions,
 )
 
@@ -40,4 +41,5 @@ __all__ = [
     "PcapIocAllowlist",
     "PcapCveMatches",
     "PcapSeverityScores",
+    "PcapThreatIntelCache",
 ]

@@ -2,8 +2,8 @@ import { useState } from 'react';
 import { CloudDownload, Copy, Check, Lock, Play, PowerOff, ShieldAlert, Sparkles, Terminal } from 'lucide-react';
 
 export function StateNotAnalysed({ evidence, onTrigger, canWrite }) {
-  const targetName = evidence?.filename || evidence?.file_name || 'capture.pcap.gz';
-  const sha256 = evidence?.sha256 || 'd8a2628b8a5c3f1c9e884d8a2628b8a5c3f1c9e884';
+  const targetName = evidence?.filename || evidence?.file_name || 'capture.pcap';
+  const sha256 = evidence?.sha256 || evidence?.collector_sha256 || '';
 
   return (
     <div
@@ -66,11 +66,11 @@ export function StateNotAnalysed({ evidence, onTrigger, canWrite }) {
         <div style={{ width: '100%', background: '#0D0E10', border: '1px solid #262B32', borderRadius: 6, padding: 12, textAlign: 'left', fontFamily: "'JetBrains Mono', monospace", fontSize: 11, display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 18 }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', color: '#8B93A0' }}>
             <span>Target Hash (SHA256):</span>
-            <span style={{ color: '#FFFFFF' }}>{sha256.slice(0, 16)}…</span>
+            <span style={{ color: '#FFFFFF' }}>{sha256 ? `${sha256.slice(0, 16)}…` : '—'}</span>
           </div>
           <div style={{ display: 'flex', justifyContent: 'space-between', color: '#8B93A0' }}>
-            <span>Storage Zone:</span>
-            <span style={{ color: '#C6FF00' }}>us-east-sec-vault-01</span>
+            <span>Evidence ID:</span>
+            <span style={{ color: '#C6FF00' }}>{evidence?.file_id || evidence?.id || '—'}</span>
           </div>
         </div>
       </div>
@@ -105,7 +105,8 @@ export function StateNotAnalysed({ evidence, onTrigger, canWrite }) {
   );
 }
 
-export function StateInFlightTransfer({ transferProgress = 64 }) {
+export function StateInFlightTransfer({ transferProgress = 0, label = 'Transfer in progress' }) {
+  const pct = Math.max(0, Math.min(100, Number(transferProgress) || 0));
   return (
     <div
       style={{
@@ -151,25 +152,20 @@ export function StateInFlightTransfer({ transferProgress = 64 }) {
         </div>
 
         <h3 style={{ fontSize: 16, fontWeight: 600, color: '#FFFFFF', margin: '0 0 8px 0' }}>
-          Packet capture is still transferring ({transferProgress}%)
+          Packet capture is still transferring ({pct}%)
         </h3>
         <p style={{ fontSize: 13, color: '#BFC7D5', maxWidth: 440, lineHeight: 1.5, margin: '0 0 16px 0' }}>
-          Receiving buffer from eBPF ring buffer on collector node. Capture will verify MD5 checksum before enabling analysis pipeline.
+          {label}. Analysis starts after the capture is fully stored and verified.
         </p>
 
         <div style={{ width: '100%', marginBottom: 12, textAlign: 'left' }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, fontFamily: "'JetBrains Mono', monospace", marginBottom: 6 }}>
-            <span style={{ color: '#8B93A0' }}>7.9 MB / 12.4 MB (eBPF RING-0)</span>
-            <span style={{ color: '#C6FF00', fontWeight: 600 }}>{transferProgress}%</span>
+            <span style={{ color: '#8B93A0' }}>Transfer progress</span>
+            <span style={{ color: '#C6FF00', fontWeight: 600 }}>{pct}%</span>
           </div>
           <div style={{ width: '100%', height: 6, background: '#0D0E10', borderRadius: 3, overflow: 'hidden', border: '1px solid #262B32' }}>
-            <div style={{ width: `${transferProgress}%`, height: '100%', background: '#C6FF00' }} />
+            <div style={{ width: `${pct}%`, height: '100%', background: '#C6FF00' }} />
           </div>
-        </div>
-
-        <div style={{ width: '100%', display: 'flex', justifyContent: 'space-between', fontSize: 10, color: '#8D9479', fontFamily: "'JetBrains Mono', monospace" }}>
-          <span>THROUGHPUT: 3.2 MB/s</span>
-          <span>ETA: ~1.4 SECONDS</span>
         </div>
       </div>
 

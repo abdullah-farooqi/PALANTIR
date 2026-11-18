@@ -468,6 +468,28 @@ class PcapCveMatches(Base):
     artifact = relationship("PcapArtifacts", foreign_keys=[artifact_id])
 
 
+class PcapThreatIntelCache(Base):
+    """24h cache for external threat-intel lookups during PCAP IOC enrichment."""
+
+    __tablename__ = "pcap_threat_intel_cache"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    ioc_type = Column(String(32), nullable=False)
+    ioc_value = Column(String(512), nullable=False)
+    provider = Column(String(32), nullable=False)
+    payload = Column(JSONB, nullable=False, default=dict)
+    fetched_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+    __table_args__ = (
+        UniqueConstraint("ioc_type", "ioc_value", "provider", name="uq_pcap_threat_intel_cache"),
+        Index("idx_pcap_threat_intel_fetched", "fetched_at"),
+    )
+
+
 class PcapSeverityScores(Base):
     """Composite security severity assessment for a PCAP analysis run."""
 

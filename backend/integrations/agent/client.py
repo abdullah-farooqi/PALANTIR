@@ -157,17 +157,22 @@ class AgentCollectorClient:
 
     async def get_pcap_files(self, snapshot_id: str | None = None) -> dict[str, Any]:
         params = {"snapshot_id": snapshot_id} if snapshot_id else None
-        return await self._get("/api/v1/capture/files", params=params)
+        try:
+            return await self._get("/v1/pcap/files", params=params)
+        except RuntimeError as exc:
+            if not self._canonical_route_missing(exc):
+                raise
+            return await self._get("/api/v1/capture/files", params=params)
 
     async def create_pcap_snapshot(self, trigger_type: str = "manual") -> dict[str, Any]:
         if trigger_type not in {"manual", "alert", "anomaly"}:
             raise ValueError("Invalid PCAP trigger type")
         try:
-            return await self._post("/v1/pcap/snapshot", params={"trigger_type": trigger_type}, timeout=min(self.timeout, 30.0))
+            return await self._post("/v1/pcap/snapshot", params={"trigger_type": trigger_type}, timeout=max(self.timeout, 45.0))
         except RuntimeError as exc:
             if not self._canonical_route_missing(exc):
                 raise
-            return await self._post("/api/v1/capture/snapshot", timeout=min(self.timeout, 20.0))
+            return await self._post("/api/v1/capture/snapshot", timeout=max(self.timeout, 30.0))
 
     async def start_pcap_capture(self) -> dict[str, Any]:
         return await self._post("/api/v1/capture/start")
@@ -178,7 +183,12 @@ class AgentCollectorClient:
     async def release_pcap_snapshot(self, snapshot_id: str) -> dict[str, Any]:
         if not re.fullmatch(r"[0-9a-f]{32}", snapshot_id):
             raise ValueError("Invalid PCAP snapshot ID")
-        return await self._post(f"/api/v1/capture/snapshots/{snapshot_id}/release")
+        try:
+            return await self._post(f"/v1/pcap/snapshots/{snapshot_id}/release")
+        except RuntimeError as exc:
+            if not self._canonical_route_missing(exc):
+                raise
+            return await self._post(f"/api/v1/capture/snapshots/{snapshot_id}/release")
 
     async def download_pcap_file(
         self,
@@ -193,7 +203,11 @@ class AgentCollectorClient:
             raise ValueError("Invalid PCAP file ID")
         destination = Path(destination)
         destination.parent.mkdir(parents=True, exist_ok=True)
-        url = f"{self.base_url}/api/v1/capture/files/{quote(file_id, safe='')}/content"
+        encoded = quote(file_id, safe="")
+        paths = (
+            f"{self.base_url}/v1/pcap/files/{encoded}/content",
+            f"{self.base_url}/api/v1/capture/files/{encoded}/content",
+        )
         transfer_timeout = httpx.Timeout(
             connect=5.0,
             read=timeout or settings.PCAP_TRANSFER_TIMEOUT_SECONDS,
@@ -202,20 +216,35 @@ class AgentCollectorClient:
         )
         total = 0
         content_type = "application/octet-stream"
+        last_error: Exception | None = None
         try:
             async with httpx.AsyncClient(timeout=transfer_timeout) as client:
-                async with client.stream("GET", url, headers=self._headers()) as response:
-                    response.raise_for_status()
-                    content_type = response.headers.get("content-type", content_type).split(";", 1)[0]
-                    declared_size = response.headers.get("content-length")
-                    if declared_size and int(declared_size) > max_bytes:
-                        raise RuntimeError("PCAP file exceeds the configured upload limit")
-                    with destination.open("wb") as stream:
-                        async for chunk in response.aiter_bytes(chunk_size=64 * 1024):
-                            total += len(chunk)
-                            if total > max_bytes:
+                for index, url in enumerate(paths):
+                    try:
+                        async with client.stream("GET", url, headers=self._headers()) as response:
+                            if response.status_code == 404 and index == 0:
+                                await response.aread()
+                                continue
+                            response.raise_for_status()
+                            content_type = response.headers.get("content-type", content_type).split(";", 1)[0]
+                            declared_size = response.headers.get("content-length")
+                            if declared_size and int(declared_size) > max_bytes:
                                 raise RuntimeError("PCAP file exceeds the configured upload limit")
-                            stream.write(chunk)
+                            with destination.open("wb") as stream:
+                                async for chunk in response.aiter_bytes(chunk_size=64 * 1024):
+                                    total += len(chunk)
+                                    if total > max_bytes:
+                                        raise RuntimeError("PCAP file exceeds the configured upload limit")
+                                    stream.write(chunk)
+                            last_error = None
+                            break
+                    except httpx.HTTPStatusError as exc:
+                        if index == 0 and exc.response.status_code == 404:
+                            last_error = exc
+                            continue
+                        raise
+                if last_error is not None and total == 0:
+                    raise last_error
         except (httpx.HTTPError, OSError, ValueError, RuntimeError) as exc:
             destination.unlink(missing_ok=True)
             raise RuntimeError(f"PCAP file download failed: {exc}") from exc

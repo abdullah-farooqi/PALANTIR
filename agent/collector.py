@@ -2769,12 +2769,20 @@ def capture_files(
     return {"schema_version": 1, "files": _PCAP_MANAGER.files(snapshot_id)}
 
 
-@app.get("/api/v1/capture/files/{file_id}/content")
-def capture_file_content(
-    file_id: str,
+@app.get("/v1/pcap/files")
+def canonical_capture_files(
+    snapshot_id: str | None = Query(default=None, pattern=r"^[0-9a-f]{32}$"),
     x_palantir_agent_token: str | None = Header(default=None),
-) -> FileResponse:
+) -> dict[str, Any]:
     _guard_pcap(x_palantir_agent_token)
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "collector_version": APP_VERSION,
+        "files": _PCAP_MANAGER.files(snapshot_id),
+    }
+
+
+def _pcap_file_response(file_id: str) -> FileResponse:
     try:
         path, media_type = _PCAP_MANAGER.file_path(file_id)
     except PCapFileNotReady as exc:
@@ -2789,6 +2797,24 @@ def capture_file_content(
     )
 
 
+@app.get("/api/v1/capture/files/{file_id}/content")
+def capture_file_content(
+    file_id: str,
+    x_palantir_agent_token: str | None = Header(default=None),
+) -> FileResponse:
+    _guard_pcap(x_palantir_agent_token)
+    return _pcap_file_response(file_id)
+
+
+@app.get("/v1/pcap/files/{file_id}/content")
+def canonical_capture_file_content(
+    file_id: str,
+    x_palantir_agent_token: str | None = Header(default=None),
+) -> FileResponse:
+    _guard_pcap(x_palantir_agent_token)
+    return _pcap_file_response(file_id)
+
+
 @app.post("/api/v1/capture/snapshots/{snapshot_id}/release")
 def capture_snapshot_release(
     snapshot_id: str,
@@ -2798,6 +2824,22 @@ def capture_snapshot_release(
     if not _PCAP_MANAGER.release_snapshot(snapshot_id):
         raise HTTPException(status_code=404, detail="PCAP snapshot not found")
     return {"released": True, "snapshot_id": snapshot_id}
+
+
+@app.post("/v1/pcap/snapshots/{snapshot_id}/release")
+def canonical_capture_snapshot_release(
+    snapshot_id: str,
+    x_palantir_agent_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    _guard_pcap(x_palantir_agent_token)
+    if not _PCAP_MANAGER.release_snapshot(snapshot_id):
+        raise HTTPException(status_code=404, detail={"code": "snapshot_not_found", "message": "PCAP snapshot not found"})
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "collector_version": APP_VERSION,
+        "released": True,
+        "snapshot_id": snapshot_id,
+    }
 
 
 @app.get("/api/v1/samples/cpu")

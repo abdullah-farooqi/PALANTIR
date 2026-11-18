@@ -11,28 +11,12 @@ export default function AnalysisOverviewHero({
   const engines = detail?.engines || {};
   const metrics = detail?.metrics_summary || {};
   const severity = detail?.severity || {};
-  const durations = detail?.step_durations || {
-    validate: 1.2,
-    extract_flows: 4.8,
-    reassemble_sessions: 14.1,
-    extract_iocs: 6.3,
-    match_cve: 8.7,
-    score_severity: 3.9,
-  };
+  const durations = detail?.step_durations || {};
 
-  const heroScore = severity?.hero_score ?? (severity?.overall_score ? Math.round(severity.overall_score * 10) : 78);
-  const compositeBreakdown = severity?.composite_breakdown || {
-    cvss: { weight_pct: 45, points: 35.1 },
-    iocs: { weight_pct: 35, points: 27.3 },
-    anomalies: { weight_pct: 20, points: 15.6 },
-  };
-
-  const topRiskFactors = severity?.top_risk_factors || [
-    { severity: 'critical', title: 'Log4Shell signature matched in HTTP request payload', points: 32, target_tab: 'cve_matches' },
-    { severity: 'high', title: '3 un-allowlisted external IPs on port 4444 (C2 beaconing suspect)', points: 24, target_tab: 'iocs' },
-    { severity: 'medium', title: 'HTTP/2 Rapid Reset framing flood rate anomaly (+410% vs baseline)', points: 14, target_tab: 'flows' },
-    { severity: 'low', title: 'Capture truncated at snaplen 128 reduced payload inspection confidence', points: 8, target_tab: 'sessions' },
-  ];
+  const heroScore = severity?.hero_score ?? (severity?.overall_score != null ? Math.round(Number(severity.overall_score) * 10) : null);
+  const compositeBreakdown = severity?.composite_breakdown || {};
+  const topRiskFactors = Array.isArray(severity?.top_risk_factors) ? severity.top_risk_factors : [];
+  const severityLabel = (severity?.overall_severity || 'unknown').toUpperCase();
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16, fontFamily: "'Space Grotesk', sans-serif" }}>
@@ -53,15 +37,15 @@ export default function AnalysisOverviewHero({
         }}
       >
         <span style={{ color: '#FFFFFF', fontWeight: 600, textTransform: 'uppercase' }}>Forensic Scope:</span>
-        <span style={{ color: '#C6FF00', fontWeight: 600 }}>{scope.filename || 'capture.pcap.gz'}</span>
+        <span style={{ color: '#C6FF00', fontWeight: 600 }}>{scope.filename || '—'}</span>
         <span style={{ color: '#343537' }}>·</span>
-        <span style={{ color: '#E3E2E5' }}>{scope.size_formatted || '12.4 MB'}</span>
+        <span style={{ color: '#E3E2E5' }}>{scope.size_formatted || '—'}</span>
         <span style={{ color: '#343537' }}>·</span>
-        <span style={{ color: '#E3E2E5' }}>{scope.capture_duration_seconds || 60}s capture</span>
+        <span style={{ color: '#E3E2E5' }}>{scope.capture_duration_seconds != null ? `${scope.capture_duration_seconds}s capture` : 'duration —'}</span>
         <span style={{ color: '#343537' }}>·</span>
-        <span style={{ color: '#8D9479' }}>MD5: <span style={{ color: '#BFC7D5', userSelect: 'all' }}>{scope.md5 || 'c4ca4238a0b923820dcc509a6f75849b'}</span></span>
+        <span style={{ color: '#8D9479' }}>SHA256: <span style={{ color: '#BFC7D5', userSelect: 'all' }}>{scope.sha256 || '—'}</span></span>
         <span style={{ color: '#343537' }}>·</span>
-        <span style={{ color: '#8D9479' }}>Snaplen: <span style={{ color: '#F5A524' }}>{scope.snaplen || 128}B</span></span>
+        <span style={{ color: '#8D9479' }}>Snaplen: <span style={{ color: '#F5A524' }}>{scope.snaplen != null ? `${scope.snaplen}B` : '—'}</span></span>
       </div>
 
       {/* Top Row: Risk Assessment Split ~60% Left, Pipeline ~40% Right */}
@@ -77,7 +61,7 @@ export default function AnalysisOverviewHero({
                 </h3>
               </div>
               <span style={{ fontSize: 10, fontFamily: "'JetBrains Mono', monospace", background: '#0D0E10', border: '1px solid #262B32', borderRadius: 4, padding: '2px 8px', color: '#8D9479' }}>
-                Run #{run?.run_id ? run.run_id.slice(0, 8) : '3'} Engine {engines.engine_version || 'v2.4'}
+                Run #{run?.run_id ? run.run_id.slice(0, 8) : '—'} {engines.engine_version || engines.display_string || ''}
               </span>
             </div>
 
@@ -85,15 +69,15 @@ export default function AnalysisOverviewHero({
             <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', marginBottom: 14 }}>
               <div style={{ display: 'flex', alignItems: 'baseline', gap: 12 }}>
                 <span style={{ fontSize: 44, fontWeight: 800, color: '#FFFFFF', fontFamily: "'JetBrains Mono', monospace", lineHeight: 1 }}>
-                  {heroScore}
+                  {heroScore != null ? heroScore : '—'}
                 </span>
                 <div style={{ display: 'flex', flexDirection: 'column' }}>
                   <div style={{ display: 'inline-flex', alignItems: 'center', gap: 5, padding: '2px 8px', borderRadius: 4, background: 'rgba(229, 72, 77, 0.2)', border: '1px solid rgba(229, 72, 77, 0.5)', color: '#FFB4AB', fontSize: 11, fontWeight: 700 }}>
                     <ShieldAlert size={13} style={{ color: '#E5484D' }} />
-                    <span>HIGH RISK</span>
+                    <span>{severityLabel}</span>
                   </div>
                   <span style={{ fontSize: 11, color: '#8D9479', fontFamily: "'JetBrains Mono', monospace", marginTop: 4 }}>
-                    Score {heroScore} / 100 · High confidence (88%)
+                    {heroScore != null ? `Score ${heroScore} / 100` : 'No severity score yet'}
                   </span>
                 </div>
               </div>
@@ -103,7 +87,7 @@ export default function AnalysisOverviewHero({
                   Assessment Mode
                 </span>
                 <span style={{ fontSize: 12, fontWeight: 600, color: '#C6FF00' }}>
-                  {engines.assessment_mode || 'Bayesian Multi-vector'}
+                  {engines.assessment_mode || 'Composite'}
                 </span>
               </div>
             </div>
@@ -111,26 +95,26 @@ export default function AnalysisOverviewHero({
             {/* Composite Stacked Bar */}
             <div style={{ marginBottom: 18 }}>
               <div style={{ width: '100%', height: 8, borderRadius: 4, overflow: 'hidden', display: 'flex', background: '#0D0E10', border: '1px solid #262B32', marginBottom: 8 }}>
-                <div style={{ width: `${compositeBreakdown.cvss?.weight_pct || 45}%`, height: '100%', background: '#E5484D' }} title="CVSS" />
-                <div style={{ width: `${compositeBreakdown.iocs?.weight_pct || 35}%`, height: '100%', background: '#F5A524' }} title="IOCs" />
-                <div style={{ width: `${compositeBreakdown.anomalies?.weight_pct || 20}%`, height: '100%', background: '#8D9479' }} title="Anomalies" />
+                <div style={{ width: `${compositeBreakdown.cvss?.weight_pct || 0}%`, height: '100%', background: '#E5484D' }} title="CVSS" />
+                <div style={{ width: `${compositeBreakdown.iocs?.weight_pct || 0}%`, height: '100%', background: '#F5A524' }} title="IOCs" />
+                <div style={{ width: `${compositeBreakdown.anomalies?.weight_pct || 0}%`, height: '100%', background: '#8D9479' }} title="Anomalies" />
               </div>
 
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 8, fontSize: 10, fontFamily: "'JetBrains Mono', monospace" }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                   <span style={{ width: 8, height: 8, borderRadius: 2, background: '#E5484D' }} />
-                  <span style={{ color: '#8B93A0' }}>CVSS 45% wt:</span>
-                  <span style={{ color: '#FFFFFF', fontWeight: 600 }}>{compositeBreakdown.cvss?.points ?? 35.1} pts</span>
+                  <span style={{ color: '#8B93A0' }}>CVSS {compositeBreakdown.cvss?.weight_pct ?? '—'}% wt:</span>
+                  <span style={{ color: '#FFFFFF', fontWeight: 600 }}>{compositeBreakdown.cvss?.points ?? '—'} pts</span>
                 </div>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                   <span style={{ width: 8, height: 8, borderRadius: 2, background: '#F5A524' }} />
-                  <span style={{ color: '#8B93A0' }}>IOCs 35% wt:</span>
-                  <span style={{ color: '#FFFFFF', fontWeight: 600 }}>{compositeBreakdown.iocs?.points ?? 27.3} pts</span>
+                  <span style={{ color: '#8B93A0' }}>IOCs {compositeBreakdown.iocs?.weight_pct ?? '—'}% wt:</span>
+                  <span style={{ color: '#FFFFFF', fontWeight: 600 }}>{compositeBreakdown.iocs?.points ?? '—'} pts</span>
                 </div>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                   <span style={{ width: 8, height: 8, borderRadius: 2, background: '#8D9479' }} />
-                  <span style={{ color: '#8B93A0' }}>Anomalies 20%:</span>
-                  <span style={{ color: '#FFFFFF', fontWeight: 600 }}>{compositeBreakdown.anomalies?.points ?? 15.6} pts</span>
+                  <span style={{ color: '#8B93A0' }}>Anomalies {compositeBreakdown.anomalies?.weight_pct ?? '—'}%:</span>
+                  <span style={{ color: '#FFFFFF', fontWeight: 600 }}>{compositeBreakdown.anomalies?.points ?? '—'} pts</span>
                 </div>
               </div>
             </div>
@@ -147,10 +131,14 @@ export default function AnalysisOverviewHero({
               </div>
 
               <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                {topRiskFactors.length === 0 && (
+                  <div style={{ padding: '8px 12px', background: '#0D0E10', border: '1px solid #262B32', borderRadius: 4, color: '#8D9479', fontSize: 12 }}>
+                    No risk factors recorded for this run.
+                  </div>
+                )}
                 {topRiskFactors.map((factor, idx) => {
                   const isCrit = factor.severity === 'critical';
                   const isHigh = factor.severity === 'high';
-                  const isMed = factor.severity === 'medium';
                   const toneBg = isCrit ? 'rgba(229, 72, 77, 0.2)' : isHigh ? 'rgba(245, 165, 36, 0.15)' : 'rgba(141, 148, 121, 0.15)';
                   const toneColor = isCrit ? '#FFB4AB' : isHigh ? '#F5A524' : '#C3CAAC';
 
@@ -208,7 +196,7 @@ export default function AnalysisOverviewHero({
           </div>
         </div>
 
-        {/* Right: Pipeline Stepper (All 6 Steps Passed) */}
+        {/* Right: Pipeline Stepper */}
         <div style={{ background: '#14171B', border: '1px solid #262B32', borderRadius: 8, padding: 18, display: 'flex', flexDirection: 'column', justifyContent: 'space-between' }}>
           <div>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderBottom: '1px solid #262B32', paddingBottom: 10, marginBottom: 16 }}>
@@ -216,18 +204,18 @@ export default function AnalysisOverviewHero({
                 Analysis Pipeline
               </h3>
               <span style={{ fontSize: 10, fontWeight: 700, background: 'rgba(198, 255, 0, 0.1)', border: '1px solid rgba(198, 255, 0, 0.3)', color: '#C6FF00', padding: '2px 8px', borderRadius: 4, fontFamily: "'JetBrains Mono', monospace" }}>
-                6/6 STEPS PASSED
+                {(run?.status || detail?.status || '—').toUpperCase()}
               </span>
             </div>
 
             <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
               {[
-                { title: '1. Validate capture', sub: 'MD5 verified, PCAP header valid', dur: `${durations.validate || 1.2}s` },
-                { title: '2. Extract flows', sub: `${metrics.flows?.total || 1284} flows indexed`, dur: `${durations.extract_flows || 4.8}s` },
-                { title: '3. Reassemble sessions & artifacts', sub: `${metrics.sessions?.total || 412} TCP streams reassembled`, dur: `${durations.reassemble_sessions || 14.1}s` },
-                { title: '4. Extract IOCs', sub: `${metrics.iocs?.total || 29} indicators resolved`, dur: `${durations.extract_iocs || 6.3}s` },
-                { title: '5. Match CVE signatures', sub: engines.ruleset || 'Suricata ruleset v4.12', dur: `${durations.match_cve || 8.7}s` },
-                { title: '6. Score severity', sub: 'Multi-vector Bayesian composite', dur: `${durations.score_severity || 3.9}s` },
+                { title: '1. Validate capture', sub: 'PCAP header validation', dur: durations.validate != null ? `${durations.validate}s` : '—' },
+                { title: '2. Extract flows', sub: `${metrics.flows?.total ?? 0} flows indexed`, dur: durations.extract_flows != null ? `${durations.extract_flows}s` : '—' },
+                { title: '3. Reassemble sessions & artifacts', sub: `${metrics.sessions?.total ?? 0} TCP streams`, dur: durations.reassemble_sessions != null ? `${durations.reassemble_sessions}s` : '—' },
+                { title: '4. Extract / enrich IOCs', sub: `${metrics.iocs?.total ?? 0} indicators`, dur: durations.extract_iocs != null ? `${durations.extract_iocs}s` : '—' },
+                { title: '5. Match CVE signatures', sub: engines.ruleset || 'Signature scan', dur: durations.match_cve != null ? `${durations.match_cve}s` : '—' },
+                { title: '6. Score severity', sub: 'Composite risk score', dur: durations.score_severity != null ? `${durations.score_severity}s` : '—' },
               ].map((step, idx) => (
                 <div key={idx} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
@@ -249,7 +237,7 @@ export default function AnalysisOverviewHero({
 
           <div style={{ borderTop: '1px solid #262B32', paddingTop: 10, marginTop: 14, display: 'flex', justifyContent: 'space-between', fontSize: 10, color: '#8D9479', fontFamily: "'JetBrains Mono', monospace" }}>
             <span>Pipeline execution finalized</span>
-            <span style={{ color: '#FFFFFF' }}>Total runtime: <strong style={{ color: '#C6FF00' }}>39.0s</strong></span>
+            <span style={{ color: '#FFFFFF' }}>Total runtime: <strong style={{ color: '#C6FF00' }}>{detail?.duration_seconds != null ? `${detail.duration_seconds}s` : '—'}</strong></span>
           </div>
         </div>
       </div>
@@ -257,9 +245,11 @@ export default function AnalysisOverviewHero({
       {/* Row 2: Five Metric Quick-Jump Cards */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 12 }}>
         {/* Tile 1: Flows */}
-        <div
+        <button
+          type="button"
           onClick={() => onNavigateTab?.('flows')}
-          style={{ background: '#14171B', border: '1px solid #262B32', borderRadius: 8, padding: 14, display: 'flex', flexDirection: 'column', justifyContent: 'space-between', cursor: 'pointer', transition: 'border-color 0.2s' }}
+          aria-label="View flows"
+          style={{ background: '#14171B', border: '1px solid #262B32', borderRadius: 8, padding: 14, display: 'flex', flexDirection: 'column', justifyContent: 'space-between', cursor: 'pointer', textAlign: 'left', color: 'inherit', minHeight: 44 }}
         >
           <div>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
@@ -267,22 +257,24 @@ export default function AnalysisOverviewHero({
               <Network size={16} style={{ color: '#8D9479' }} />
             </div>
             <div style={{ fontSize: 24, fontWeight: 800, color: '#FFFFFF', fontFamily: "'JetBrains Mono', monospace", margin: '4px 0' }}>
-              {formatNumber(metrics.flows?.total || 1284, 0)}
+              {formatNumber(metrics.flows?.total ?? 0, 0)}
             </div>
             <div style={{ fontSize: 10, color: '#8B93A0', fontFamily: "'JetBrains Mono', monospace" }}>
-              {metrics.flows?.tcp || 1078} TCP · {metrics.flows?.udp || 180} UDP · {metrics.flows?.icmp || 26} ICMP
+              {metrics.flows?.tcp ?? 0} TCP · {metrics.flows?.udp ?? 0} UDP · {metrics.flows?.icmp ?? 0} ICMP
             </div>
           </div>
           <div style={{ borderTop: '1px solid #1F2022', paddingTop: 8, marginTop: 12, display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: 10 }}>
-            <span style={{ color: '#8D9479', fontFamily: "'JetBrains Mono', monospace" }}>Peak: {metrics.flows?.peak_rate || '29.5 MB/s'}</span>
+            <span style={{ color: '#8D9479', fontFamily: "'JetBrains Mono', monospace" }}>Protocol split</span>
             <span style={{ color: '#C6FF00', fontWeight: 600, display: 'flex', alignItems: 'center', gap: 2 }}>View <ArrowRight size={10} /></span>
           </div>
-        </div>
+        </button>
 
         {/* Tile 2: Sessions */}
-        <div
+        <button
+          type="button"
           onClick={() => onNavigateTab?.('sessions')}
-          style={{ background: '#14171B', border: '1px solid #262B32', borderRadius: 8, padding: 14, display: 'flex', flexDirection: 'column', justifyContent: 'space-between', cursor: 'pointer', transition: 'border-color 0.2s' }}
+          aria-label="View sessions"
+          style={{ background: '#14171B', border: '1px solid #262B32', borderRadius: 8, padding: 14, display: 'flex', flexDirection: 'column', justifyContent: 'space-between', cursor: 'pointer', textAlign: 'left', color: 'inherit', minHeight: 44 }}
         >
           <div>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
@@ -290,22 +282,24 @@ export default function AnalysisOverviewHero({
               <RefreshCw size={15} style={{ color: '#8D9479' }} />
             </div>
             <div style={{ fontSize: 24, fontWeight: 800, color: '#FFFFFF', fontFamily: "'JetBrains Mono', monospace", margin: '4px 0' }}>
-              {formatNumber(metrics.sessions?.total || 412, 0)}
+              {formatNumber(metrics.sessions?.total ?? 0, 0)}
             </div>
             <div style={{ fontSize: 10, color: '#8B93A0', fontFamily: "'JetBrains Mono', monospace" }}>
-              {metrics.sessions?.closed || 398} closed · {metrics.sessions?.reset || 14} reset (RST)
+              {metrics.sessions?.closed ?? 0} closed · {metrics.sessions?.reset ?? 0} reset (RST)
             </div>
           </div>
           <div style={{ borderTop: '1px solid #1F2022', paddingTop: 8, marginTop: 12, display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: 10 }}>
-            <span style={{ color: '#8D9479', fontFamily: "'JetBrains Mono', monospace" }}>Avg life: {metrics.sessions?.avg_life || '4.2s'}</span>
+            <span style={{ color: '#8D9479', fontFamily: "'JetBrains Mono', monospace" }}>Avg life: {metrics.sessions?.avg_life || '—'}</span>
             <span style={{ color: '#C6FF00', fontWeight: 600, display: 'flex', alignItems: 'center', gap: 2 }}>View <ArrowRight size={10} /></span>
           </div>
-        </div>
+        </button>
 
         {/* Tile 3: Artifacts */}
-        <div
+        <button
+          type="button"
           onClick={() => onNavigateTab?.('artifacts')}
-          style={{ background: '#14171B', border: '1px solid #262B32', borderRadius: 8, padding: 14, display: 'flex', flexDirection: 'column', justifyContent: 'space-between', cursor: 'pointer', transition: 'border-color 0.2s' }}
+          aria-label="View artifacts"
+          style={{ background: '#14171B', border: '1px solid #262B32', borderRadius: 8, padding: 14, display: 'flex', flexDirection: 'column', justifyContent: 'space-between', cursor: 'pointer', textAlign: 'left', color: 'inherit', minHeight: 44 }}
         >
           <div>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
@@ -313,22 +307,24 @@ export default function AnalysisOverviewHero({
               <FolderArchive size={16} style={{ color: '#8D9479' }} />
             </div>
             <div style={{ fontSize: 24, fontWeight: 800, color: '#FFFFFF', fontFamily: "'JetBrains Mono', monospace", margin: '4px 0' }}>
-              {formatNumber(metrics.artifacts?.total || 37, 0)}
+              {formatNumber(metrics.artifacts?.total ?? 0, 0)}
             </div>
             <div style={{ fontSize: 10, color: '#8B93A0', fontFamily: "'JetBrains Mono', monospace" }}>
-              {metrics.artifacts?.http || 24} HTTP · {metrics.artifacts?.certs || 9} certs · {metrics.artifacts?.elf || 4} ELF
+              {metrics.artifacts?.http ?? 0} HTTP · {metrics.artifacts?.certs ?? 0} certs · {metrics.artifacts?.other ?? 0} other
             </div>
           </div>
           <div style={{ borderTop: '1px solid #1F2022', paddingTop: 8, marginTop: 12, display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: 10 }}>
-            <span style={{ color: '#8D9479', fontFamily: "'JetBrains Mono', monospace" }}>Total: {metrics.artifacts?.total_bytes_formatted || '8.4 MB'}</span>
+            <span style={{ color: '#8D9479', fontFamily: "'JetBrains Mono', monospace" }}>Total: {metrics.artifacts?.total_bytes_formatted || '—'}</span>
             <span style={{ color: '#C6FF00', fontWeight: 600, display: 'flex', alignItems: 'center', gap: 2 }}>View <ArrowRight size={10} /></span>
           </div>
-        </div>
+        </button>
 
         {/* Tile 4: IOCs */}
-        <div
+        <button
+          type="button"
           onClick={() => onNavigateTab?.('iocs')}
-          style={{ background: '#14171B', border: '1px solid #262B32', borderRadius: 8, padding: 14, display: 'flex', flexDirection: 'column', justifyContent: 'space-between', cursor: 'pointer', transition: 'border-color 0.2s' }}
+          aria-label="View IOCs"
+          style={{ background: '#14171B', border: '1px solid #262B32', borderRadius: 8, padding: 14, display: 'flex', flexDirection: 'column', justifyContent: 'space-between', cursor: 'pointer', textAlign: 'left', color: 'inherit', minHeight: 44 }}
         >
           <div>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
@@ -336,25 +332,27 @@ export default function AnalysisOverviewHero({
               <ShieldAlert size={16} style={{ color: '#E5484D' }} />
             </div>
             <div style={{ fontSize: 24, fontWeight: 800, color: '#FFFFFF', fontFamily: "'JetBrains Mono', monospace", margin: '4px 0', display: 'flex', alignItems: 'center', gap: 8 }}>
-              <span>{formatNumber(metrics.iocs?.total || 29, 0)}</span>
+              <span>{formatNumber(metrics.iocs?.total ?? 0, 0)}</span>
               <span style={{ fontSize: 10, padding: '2px 6px', borderRadius: 4, background: 'rgba(229, 72, 77, 0.2)', border: '1px solid rgba(229, 72, 77, 0.5)', color: '#FFB4AB' }}>
-                {metrics.iocs?.threats || 6} threats
+                {metrics.iocs?.threats ?? 0} threats
               </span>
             </div>
             <div style={{ fontSize: 10, color: '#8B93A0', fontFamily: "'JetBrains Mono', monospace" }}>
-              {metrics.iocs?.allowlisted || 23} allowlisted
+              {metrics.iocs?.allowlisted ?? 0} allowlisted
             </div>
           </div>
           <div style={{ borderTop: '1px solid #1F2022', paddingTop: 8, marginTop: 12, display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: 10 }}>
-            <span style={{ color: '#E5484D', fontFamily: "'JetBrains Mono', monospace" }}>{metrics.iocs?.highlight || '96% conf (C2 IP)'}</span>
+            <span style={{ color: '#E5484D', fontFamily: "'JetBrains Mono', monospace" }}>{(metrics.iocs?.threats ?? 0) > 0 ? 'Threat intel hits' : 'No intel hits'}</span>
             <span style={{ color: '#C6FF00', fontWeight: 600, display: 'flex', alignItems: 'center', gap: 2 }}>View <ArrowRight size={10} /></span>
           </div>
-        </div>
+        </button>
 
         {/* Tile 5: CVE Matches */}
-        <div
+        <button
+          type="button"
           onClick={() => onNavigateTab?.('cve_matches')}
-          style={{ background: '#14171B', border: '1px solid #262B32', borderRadius: 8, padding: 14, display: 'flex', flexDirection: 'column', justifyContent: 'space-between', cursor: 'pointer', transition: 'border-color 0.2s' }}
+          aria-label="View CVE matches"
+          style={{ background: '#14171B', border: '1px solid #262B32', borderRadius: 8, padding: 14, display: 'flex', flexDirection: 'column', justifyContent: 'space-between', cursor: 'pointer', textAlign: 'left', color: 'inherit', minHeight: 44 }}
         >
           <div>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
@@ -362,20 +360,24 @@ export default function AnalysisOverviewHero({
               <TriangleAlert size={16} style={{ color: '#E5484D' }} />
             </div>
             <div style={{ fontSize: 24, fontWeight: 800, color: '#E5484D', fontFamily: "'JetBrains Mono', monospace", margin: '4px 0', display: 'flex', alignItems: 'center', gap: 8 }}>
-              <span>{formatNumber(metrics.cve_matches?.total || 2, 0)}</span>
-              <span style={{ fontSize: 10, padding: '2px 6px', borderRadius: 4, background: 'rgba(229, 72, 77, 0.2)', border: '1px solid rgba(229, 72, 77, 0.5)', color: '#FFB4AB' }}>
-                Confirmed
-              </span>
+              <span>{formatNumber(metrics.cve_matches?.total ?? 0, 0)}</span>
+              {(metrics.cve_matches?.total ?? 0) > 0 && (
+                <span style={{ fontSize: 10, padding: '2px 6px', borderRadius: 4, background: 'rgba(229, 72, 77, 0.2)', border: '1px solid rgba(229, 72, 77, 0.5)', color: '#FFB4AB' }}>
+                  Confirmed
+                </span>
+              )}
             </div>
             <div style={{ fontSize: 10, color: '#8B93A0', fontFamily: "'JetBrains Mono', monospace", lineHeight: 1.3 }}>
-              CVE-2023-44487 (9.8)<br />CVE-2021-44228 (10.0)
+              {(metrics.cve_matches?.top_cves || []).length
+                ? (metrics.cve_matches.top_cves.slice(0, 2).map((c) => <span key={c}>{c}<br /></span>))
+                : 'No CVE matches'}
             </div>
           </div>
           <div style={{ borderTop: '1px solid #1F2022', paddingTop: 8, marginTop: 12, display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: 10 }}>
-            <span style={{ color: '#8D9479', fontFamily: "'JetBrains Mono', monospace" }}>Suricata + Zeek</span>
+            <span style={{ color: '#8D9479', fontFamily: "'JetBrains Mono', monospace" }}>Signature scan</span>
             <span style={{ color: '#C6FF00', fontWeight: 600, display: 'flex', alignItems: 'center', gap: 2 }}>View <ArrowRight size={10} /></span>
           </div>
-        </div>
+        </button>
       </div>
 
       {/* Bottom Engine Disclaimer Banner */}

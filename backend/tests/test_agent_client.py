@@ -90,3 +90,35 @@ def test_client_sends_alert_trigger_on_canonical_pcap_snapshot():
 
     assert requested == [("/v1/pcap/snapshot", {"trigger_type": "alert"})]
     assert result["snapshot_id"] == "a" * 32
+
+
+def test_client_prefers_canonical_pcap_files_route():
+    client = AgentCollectorClient("http://agent")
+    requested = []
+
+    async def fake_get(path, params=None, timeout=None):
+        requested.append((path, params))
+        return {"schema_version": "1.0", "files": []}
+
+    client._get = fake_get
+    result = asyncio.run(client.get_pcap_files(snapshot_id="b" * 32))
+
+    assert requested == [("/v1/pcap/files", {"snapshot_id": "b" * 32})]
+    assert result["schema_version"] == "1.0"
+
+
+def test_client_falls_back_to_legacy_pcap_files_route():
+    client = AgentCollectorClient("http://agent")
+    requested = []
+
+    async def fake_get(path, params=None, timeout=None):
+        requested.append(path)
+        if path.startswith("/v1/"):
+            raise RuntimeError("404 not found")
+        return {"schema_version": 1, "files": []}
+
+    client._get = fake_get
+    result = asyncio.run(client.get_pcap_files())
+
+    assert requested == ["/v1/pcap/files", "/api/v1/capture/files"]
+    assert result["schema_version"] == 1

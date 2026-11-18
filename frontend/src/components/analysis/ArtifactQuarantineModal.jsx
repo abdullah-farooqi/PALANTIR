@@ -16,8 +16,8 @@ export default function ArtifactQuarantineModal({
 
   if (!isOpen || !artifact) return null;
 
-  const sha256 = artifact.sha256 || 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
-  const md5 = artifact.md5 || 'c4ca4238a0b923820dcc509a6f75849b';
+  const sha256 = artifact.sha256 || '—';
+  const md5 = artifact.md5 || '—';
   const fileName = artifact.fileName || artifact.metadata?.filename || `artifact_${artifact.id}.bin`;
   const sizeFormatted = artifact.size_bytes ? formatBytes(artifact.size_bytes) : '18.4 KB';
   const contentType = artifact.content_type || 'application/octet-stream';

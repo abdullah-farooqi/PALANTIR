@@ -317,9 +317,12 @@ def test_start_pcap_analysis_enqueues_chain(tmp_path, monkeypatch):
         session.commit()
         ev_id = ev.id
 
-    run_id = start_pcap_analysis(ev_id)
+    result = start_pcap_analysis(ev_id)
+    assert isinstance(result, dict)
+    run_id = result["run_id"]
     assert isinstance(run_id, str)
     assert len(run_id) == 32
+    assert result.get("reused") is False
 
     with get_sync_session() as session:
         run = session.execute(

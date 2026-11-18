@@ -1,16 +1,25 @@
 import re
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
-from fastapi import APIRouter, Depends, HTTPException
+from typing import Any, Dict, Optional
+
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import cast, func, or_, select, String
 from sqlalchemy.ext.asyncio import AsyncSession
-from core.database import get_session
+
 from core.api_auth import require_read
+from core.database import get_session
 from models.alert import AlertEvent
 from models.investigation import AgentInvestigation
-from models.metric import MetricSnapshot
 from models.node import MonitoredNode
+from models.pcap_analysis import (
+    PcapAnalysisRuns,
+    PcapArtifacts,
+    PcapCveMatches,
+    PcapFlows,
+    PcapIocs,
+    PcapSeverityScores,
+)
 
 router = APIRouter(prefix="/copilot", tags=["Copilot Preview"])
 
@@ -28,22 +37,22 @@ PRESET_PROMPTS = [
         "prompt": "Summarize active alerts across the fleet and rank by urgency.",
     },
     {
-        "id": "why_cpu_high",
-        "label": "2. Why is db-02 CPU high?",
+        "id": "pcap_findings",
+        "label": "2. What PCAP findings look worst?",
         "hotkey": "Alt+2",
-        "prompt": "Why is db-02 CPU high? Check the last 15 minutes of eBPF process telemetry and recent kernel conntrack events.",
+        "prompt": "What PCAP findings look worst on this host?",
     },
     {
-        "id": "inspect_socket_drops",
-        "label": "3. Inspect eBPF network socket drops on web-01",
+        "id": "ioc_threats",
+        "label": "3. List threat-intel IOCs",
         "hotkey": "Alt+3",
-        "prompt": "Inspect eBPF network socket drops on web-01 and isolate the top sending endpoints.",
+        "prompt": "List non-allowlisted IOCs with threat intel matches.",
     },
     {
-        "id": "correlate_oomkills",
-        "label": "4. Correlate OOMKills with last 1h deploy logs",
+        "id": "cve_matches",
+        "label": "4. Show CVE matches from captures",
         "hotkey": "Alt+4",
-        "prompt": "Correlate OOMKills with last 1h deploy logs and verify cgroup memory pressure.",
+        "prompt": "Show CVE matches from recent PCAP analysis.",
     },
 ]
 
@@ -52,10 +61,26 @@ PRESET_PROMPTS = [
 async def get_copilot_presets(_role: None = Depends(require_read)) -> Dict[str, Any]:
     return {
         "presets": PRESET_PROMPTS,
-        "model": "palantir-telemetry-eval-v1 (Offline Mock Mode) · Sandbox Isolation",
-        "state": "SYNTHETIC EVALUATION",
-        "version": "v0.4-PREVIEW",
+        "model": "palantir-analysis-sql-v1",
+        "state": "LIVE",
+        "version": "v1.0",
     }
+
+
+async def _resolve_node(session: AsyncSession, host: str | None) -> MonitoredNode | None:
+    if host:
+        node = (
+            await session.execute(
+                select(MonitoredNode).where(MonitoredNode.hostname.ilike(host)).limit(1)
+            )
+        ).scalar_one_or_none()
+        if node:
+            return node
+    return (
+        await session.execute(
+            select(MonitoredNode).where(MonitoredNode.active.is_(True)).order_by(MonitoredNode.id).limit(1)
+        )
+    ).scalar_one_or_none()
 
 
 @router.post("/query")
@@ -66,151 +91,230 @@ async def execute_copilot_query(
 ) -> Dict[str, Any]:
     prompt = req.prompt.strip()
     now = datetime.now(timezone.utc)
+    lower = prompt.lower()
+    node = await _resolve_node(session, req.host)
+    target_node = node.hostname if node else (req.host or "unknown")
 
-    # Fetch live nodes to ground responses in actual fleet state
-    nodes_res = await session.execute(select(MonitoredNode).where(MonitoredNode.active.is_(True)).limit(10))
-    nodes = nodes_res.scalars().all()
-    node_names = [n.hostname for n in nodes]
-    target_node = req.host or (node_names[0] if node_names else "web-01")
+    run_q = select(PcapAnalysisRuns).where(PcapAnalysisRuns.status == "complete")
+    if node:
+        run_q = run_q.where(PcapAnalysisRuns.node_id == node.id)
+    run_q = run_q.order_by(PcapAnalysisRuns.completed_at.desc().nullslast(), PcapAnalysisRuns.id.desc()).limit(5)
+    runs = (await session.execute(run_q)).scalars().all()
+    run_ids = [r.run_id for r in runs]
 
-    # Fetch recent active alerts
-    alerts_res = await session.execute(
-        select(AlertEvent)
-        .where(AlertEvent.status.in_(("WARNING", "CRITICAL")))
-        .order_by(AlertEvent.received_at.desc())
-        .limit(10)
-    )
-    active_alerts = alerts_res.scalars().all()
-
-    # Route logic based on prompt content
-    lower_prompt = prompt.lower()
-
-    if "summarize active alert" in lower_prompt or "summarize alerts" in lower_prompt or "1." in prompt:
-        crit_count = sum(1 for a in active_alerts if a.status == "CRITICAL")
-        warn_count = sum(1 for a in active_alerts if a.status == "WARNING")
-        alert_details = [f"{a.alert_name} on host node #{a.node_id} ({a.status})" for a in active_alerts[:4]]
-        detail_str = "; ".join(alert_details) if alert_details else "No unresolved critical threshold breaches detected"
-
-        narrative = (
-            f"Active fleet triage identified {len(active_alerts)} unacknowledged alerts ({crit_count} Critical, {warn_count} Warning). "
-            f"Key impacted resources include: {detail_str}. "
-            "Telemetry indicates memory and CPU contention within containerized namespaces. Automatic PCAP capture buffers are 100% indexed."
+    alerts = (
+        await session.execute(
+            select(AlertEvent)
+            .where(AlertEvent.status.in_(("WARNING", "CRITICAL")))
+            .order_by(AlertEvent.received_at.desc())
+            .limit(10)
         )
-        process_profile = [
-            {"name": "postgres: autovacuum worker", "pid": 44102, "cpu_pct": 71.2, "rss": "14.2 GB", "socket_backlog": "None", "bar_pct": 71.2},
-            {"name": "vector-aggregator[912]", "pid": 912, "cpu_pct": 18.4, "rss": "840 MB", "socket_backlog": "2,410 pkts", "bar_pct": 18.4},
-        ]
-        obs = "No OS kernel panic detected. Memory pressure remains below critical threshold across fleet nodes."
-        obs_badge = "SYS_OK" if crit_count == 0 else "SYS_WARN"
-        sources = [
-            "eBPF process_exec ring buffer (fleet aggregate)",
-            "Prometheus node_cpu_seconds_total",
-            "journald /var/log/syslog alert triggers",
-            "Active investigation forensic archive",
-        ]
+    ).scalars().all()
 
-    elif "why is" in lower_prompt and "cpu high" in lower_prompt or "cpu" in lower_prompt or "2." in prompt:
-        matched_node = "db-02" if "db-02" in lower_prompt else target_node
-        narrative = (
-            f"Based on real-time snapshot telemetry for {matched_node} (10.0.4.52), CPU utilization peaked at 96.4% "
-            "across 8 cores. The primary driver is an unbounded PostgreSQL vacuuming thread (pid 44102: autovacuum worker) "
-            "competing with synchronous replication socket writes to db-replica-02. Conntrack table fill reached 89%, inducing "
-            "selective ephemeral socket buffer thrashing."
-        )
-        process_profile = [
-            {"name": "postgres: autovacuum worker", "pid": 44102, "cpu_pct": 71.2, "rss": "14.2 GB", "socket_backlog": "0 pkts", "bar_pct": 71.2},
-            {"name": "vector-aggregator[912]", "pid": 912, "cpu_pct": 18.4, "rss": "840 MB", "socket_backlog": "2,410 pkts", "bar_pct": 18.4},
-        ]
-        obs = "No OS kernel panic detected. Memory pressure remains below critical threshold (74% RSS)."
-        obs_badge = "SYS_OK"
-        sources = [
-            f"eBPF process_exec ring buffer ({matched_node})",
-            "Prometheus node_cpu_seconds_total",
-            "journald /var/log/postgresql.log (offset 0x88F)",
-            "Inv #8f3a-9971a forensic archive",
-        ]
+    process_profile: list[dict[str, Any]] = []
+    sources = ["pcap_analysis_runs", "pcap_iocs", "pcap_cve_matches", "pcap_flows"]
 
-    elif "socket drop" in lower_prompt or "network" in lower_prompt or "3." in prompt:
-        matched_node = "web-01" if "web-01" in lower_prompt else target_node
+    if "summarize active alert" in lower or "summarize alerts" in lower:
+        crit = sum(1 for a in alerts if a.status == "CRITICAL")
+        warn = sum(1 for a in alerts if a.status == "WARNING")
+        details = [f"{a.alert_name} node#{a.node_id} ({a.status})" for a in alerts[:5]]
         narrative = (
-            f"In-kernel eBPF trace on {matched_node} shows 4,812 dropped TCP packets over interface eth0 in the last 15 minutes. "
-            "Drops are concentrated on ephemeral port range (40000-45000) destined for remote C2 indicator 203.0.113.8:443. "
-            "TCP backlog queue overflowed due to slow ACK drain from suspected Cobalt Strike beaconing activity."
+            f"{len(alerts)} active alerts ({crit} critical, {warn} warning). "
+            + ("; ".join(details) if details else "None currently open.")
         )
-        process_profile = [
-            {"name": "envoy-proxy [worker 0]", "pid": 11482, "cpu_pct": 34.1, "rss": "1.2 GB", "socket_backlog": "4,812 pkts", "bar_pct": 34.1},
-            {"name": "python3 /opt/agent/collector.py", "pid": 2841, "cpu_pct": 4.2, "rss": "180 MB", "socket_backlog": "0 pkts", "bar_pct": 4.2},
-        ]
-        obs = "eBPF socket drops correlate with suspicious remote egress. Recommend initiating forensic PCAP isolation."
-        obs_badge = "NET_WARN"
-        sources = [
-            f"eBPF socket_drop tracepoint ({matched_node})",
-            "Kernel ring buffer tcp_drop_reason",
-            "PCAP Flow Extraction #1048",
-        ]
+        obs = "Alert table query"
+        obs_badge = "SYS_WARN" if crit else "SYS_OK"
+        sources = ["alert_events"]
 
-    elif "oomkill" in lower_prompt or "oom" in lower_prompt or "4." in prompt:
-        narrative = (
-            "Kernel audit logs reveal 2 OOMKill invocations in the last 60 minutes affecting container namespace c-9f82410a. "
-            "Memory cgroup limit (4096 MB) was exceeded by a Node.js SSR worker thread. Deploy commit 4a8f9c introduced an unconstrained "
-            "in-memory response cache that inflated RSS by 3.2 GB during peak traffic."
-        )
-        process_profile = [
-            {"name": "node /app/server.js", "pid": 58914, "cpu_pct": 42.0, "rss": "4.1 GB (OOM_KILLED)", "socket_backlog": "112 pkts", "bar_pct": 98.5},
-            {"name": "containerd-shim-runc", "pid": 58890, "cpu_pct": 1.1, "rss": "42 MB", "socket_backlog": "0 pkts", "bar_pct": 2.5},
-        ]
-        obs = "Cgroup hard limit reached. Automatic pod restart completed successfully in 1.4s."
-        obs_badge = "OOM_ALERT"
-        sources = [
-            "/var/log/messages oom-killer invocation log",
-            "Systemd slice memory.current counter",
-            "Container runtime cgroup v2 stats",
-        ]
+    elif "ioc" in lower or "threat intel" in lower or "indicator" in lower:
+        if not run_ids:
+            narrative = f"No completed PCAP analysis runs for {target_node}."
+            obs = "No runs"
+            obs_badge = "SYS_OK"
+        else:
+            iocs = (
+                await session.execute(
+                    select(PcapIocs)
+                    .where(
+                        PcapIocs.run_id.in_(run_ids),
+                        PcapIocs.is_allowlisted.is_(False),
+                        PcapIocs.threat_intel_match.is_not(None),
+                    )
+                    .order_by(PcapIocs.id.desc())
+                    .limit(20)
+                )
+            ).scalars().all()
+            if not iocs:
+                narrative = f"No threat-intel IOC hits in the latest {len(run_ids)} runs on {target_node}."
+                obs = "IOCs clean or enrichment skipped"
+                obs_badge = "SYS_OK"
+            else:
+                bits = [f"{i.ioc_type}:{i.ioc_value}" for i in iocs[:8]]
+                narrative = f"{len(iocs)} non-allowlisted IOCs with threat intel on {target_node}: " + "; ".join(bits)
+                obs = "pcap_iocs.threat_intel_match"
+                obs_badge = "NET_WARN"
+                process_profile = [
+                    {
+                        "name": f"{i.ioc_type}:{i.ioc_value}",
+                        "pid": i.id,
+                        "cpu_pct": 0,
+                        "rss": (i.threat_intel_match or {}).get("description", "")[:40] if isinstance(i.threat_intel_match, dict) else "",
+                        "socket_backlog": "threat",
+                        "bar_pct": 50,
+                    }
+                    for i in iocs[:5]
+                ]
+
+    elif "cve" in lower or "vulnerab" in lower:
+        if not run_ids:
+            narrative = f"No completed PCAP analysis runs for {target_node}."
+            obs = "No runs"
+            obs_badge = "SYS_OK"
+        else:
+            cves = (
+                await session.execute(
+                    select(PcapCveMatches)
+                    .where(PcapCveMatches.run_id.in_(run_ids))
+                    .order_by(PcapCveMatches.cvss_score.desc().nullslast(), PcapCveMatches.id.desc())
+                    .limit(20)
+                )
+            ).scalars().all()
+            if not cves:
+                narrative = f"No CVE signature matches in latest runs on {target_node}."
+                obs = "pcap_cve_matches empty"
+                obs_badge = "SYS_OK"
+            else:
+                bits = [f"{c.cve_id} ({c.severity}, cvss={c.cvss_score})" for c in cves[:8]]
+                narrative = f"{len(cves)} CVE matches on {target_node}: " + "; ".join(bits)
+                obs = "pcap_cve_matches"
+                obs_badge = "NET_WARN" if any(c.severity in ("high", "critical") for c in cves) else "SYS_OK"
+
+    elif "pcap" in lower or "finding" in lower or "worst" in lower or "tuesday" in lower or "server" in lower:
+        if not run_ids:
+            narrative = f"No completed PCAP analysis for {target_node}."
+            obs = "No runs"
+            obs_badge = "SYS_OK"
+        else:
+            scores = (
+                await session.execute(
+                    select(PcapSeverityScores)
+                    .where(PcapSeverityScores.run_id.in_(run_ids))
+                    .order_by(PcapSeverityScores.overall_score.desc(), PcapSeverityScores.id.desc())
+                )
+            ).scalars().all()
+            ioc_threats = (
+                await session.execute(
+                    select(func.count(PcapIocs.id)).where(
+                        PcapIocs.run_id.in_(run_ids),
+                        PcapIocs.is_allowlisted.is_(False),
+                        PcapIocs.threat_intel_match.is_not(None),
+                    )
+                )
+            ).scalar_one()
+            cve_count = (
+                await session.execute(
+                    select(func.count(PcapCveMatches.id)).where(PcapCveMatches.run_id.in_(run_ids))
+                )
+            ).scalar_one()
+            flow_count = (
+                await session.execute(
+                    select(func.count(PcapFlows.id)).where(PcapFlows.run_id.in_(run_ids))
+                )
+            ).scalar_one()
+            top = scores[0] if scores else None
+            factors = (getattr(top, "top_risk_factors", None) or []) if top else []
+            factor_txt = "; ".join(
+                f.get("title", "") for f in factors[:3] if isinstance(f, dict)
+            )
+            narrative = (
+                f"Latest {len(run_ids)} complete runs on {target_node}: "
+                f"flows={flow_count}, threat_iocs={ioc_threats}, cves={cve_count}. "
+                + (
+                    f"Highest risk score {top.overall_score} ({top.overall_severity}). {factor_txt}"
+                    if top
+                    else "No severity score rows yet."
+                )
+            )
+            obs = "severity + IOC + CVE aggregates"
+            obs_badge = "NET_WARN" if top and str(top.overall_severity) in ("high", "critical") else "SYS_OK"
 
     else:
-        # Free-form query synthesis
-        narrative = (
-            f"Evaluated telemetry for query: \"{prompt}\" across {len(nodes)} active fleet hosts. "
-            f"Target host {target_node} exhibits stable core performance with baseline resource utilization. "
-            "No anomalous syscall patterns or unhandled threshold violations observed in the current sampling window."
-        )
-        process_profile = [
-            {"name": "systemd-journald", "pid": 412, "cpu_pct": 2.4, "rss": "85 MB", "socket_backlog": "0 pkts", "bar_pct": 5.0},
-            {"name": "palantir-collector", "pid": 1024, "cpu_pct": 3.1, "rss": "120 MB", "socket_backlog": "0 pkts", "bar_pct": 6.2},
-        ]
-        obs = "System telemetry steady. All daemon probes reporting nominally."
-        obs_badge = "SYS_OK"
-        sources = [
-            f"Host Collector telemetry ({target_node})",
-            "Platform health monitor",
-            "Fleet metric snapshot series",
-        ]
+        # Free-form: search IOC value / flow IP / artifact hash tokens from the prompt
+        token = None
+        for part in re.split(r"\s+", prompt):
+            if len(part) >= 4 and re.search(r"[.:/\-]", part):
+                token = part.strip(".,;\"'")
+                break
+        if token and run_ids:
+            iocs = (
+                await session.execute(
+                    select(PcapIocs)
+                    .where(PcapIocs.run_id.in_(run_ids), PcapIocs.ioc_value.ilike(f"%{token}%"))
+                    .limit(10)
+                )
+            ).scalars().all()
+            flows = (
+                await session.execute(
+                    select(PcapFlows)
+                    .where(
+                        PcapFlows.run_id.in_(run_ids),
+                        or_(
+                            cast(PcapFlows.src_ip, String).ilike(f"%{token}%"),
+                            cast(PcapFlows.dst_ip, String).ilike(f"%{token}%"),
+                        ),
+                    )
+                    .limit(10)
+                )
+            ).scalars().all()
+            arts = (
+                await session.execute(
+                    select(PcapArtifacts)
+                    .where(
+                        PcapArtifacts.run_id.in_(run_ids),
+                        or_(
+                            PcapArtifacts.sha256.ilike(f"%{token}%"),
+                            PcapArtifacts.source_uri.ilike(f"%{token}%"),
+                        ),
+                    )
+                    .limit(10)
+                )
+            ).scalars().all()
+            narrative = (
+                f"Search for '{token}' on {target_node}: "
+                f"{len(iocs)} IOCs, {len(flows)} flows, {len(arts)} artifacts."
+            )
+            obs = "token search across analysis tables"
+            obs_badge = "SYS_OK" if not iocs and not flows else "NET_WARN"
+        else:
+            inv_count = (
+                await session.execute(select(func.count(AgentInvestigation.id)))
+            ).scalar_one()
+            narrative = (
+                f"Queried analysis store for '{prompt}'. "
+                f"{len(run_ids)} recent complete PCAP runs on {target_node}; "
+                f"{inv_count} investigations total. Ask about IOCs, CVEs, or findings for specifics."
+            )
+            obs = "generic analysis index"
+            obs_badge = "SYS_OK"
 
     return {
         "prompt": prompt,
         "timestamp": now.isoformat(),
         "target_host": target_node,
-        "model": "palantir-telemetry-eval-v1 (Offline Mock Mode) · Sandbox Isolation",
+        "model": "palantir-analysis-sql-v1",
         "narrative": narrative,
         "process_profile": process_profile,
         "diagnostic_observation": obs,
         "diagnostic_badge": obs_badge,
         "evidence_sources": sources,
         "action_workflows": {
-            "status": "planned_capability",
-            "note": "Approval pipeline disabled in evaluation build. Mutations require human sign-off with mandatory SIEM audit logging.",
-            "actions": [
-                {"id": "approve", "label": "Approve Remediation", "disabled": True},
-                {"id": "reject", "label": "Reject", "disabled": True},
-                {"id": "undo", "label": "Undo", "disabled": True},
-            ],
+            "status": "read_only",
+            "note": "Copilot answers from persisted PCAP analysis tables. Mutations require explicit investigation actions.",
+            "actions": [],
         },
         "fleet_context": {
             "target_node": target_node,
-            "kernel_os": "6.5.0-35-generic",
-            "distribution": "Ubuntu 22.04.4 LTS",
-            "telemetry_window": "Last 15 minutes",
-            "active_daemon": "palantir-ebpf-v2.14",
-            "simulation_hash": "0x9fbc18d24ae",
+            "complete_runs": len(run_ids),
+            "telemetry_window": "latest complete analysis runs",
         },
     }

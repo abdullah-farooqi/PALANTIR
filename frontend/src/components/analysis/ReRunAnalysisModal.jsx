@@ -17,7 +17,7 @@ export default function ReRunAnalysisModal({
   if (!isOpen) return null;
 
   const targetFilename = scope?.filename || 'capture.pcap.gz';
-  const targetSizeFormatted = scope?.size_formatted || '12.4 MB';
+  const targetSizeFormatted = scope?.size_formatted || '—';
 
   return (
     <div
